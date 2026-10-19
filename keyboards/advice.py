@@ -4,22 +4,20 @@ from services.recommendations import get_articles, get_products
 
 
 def get_recommendations_hub_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="📖 Инструкции по уходу", callback_data="rec:articles")],
-            [InlineKeyboardButton(text="🛍 Проверенные товары на Ozon", callback_data="rec:products")],
-        ]
-    )
-
-
-def get_articles_keyboard() -> InlineKeyboardMarkup:
     articles = get_articles()
     rows = []
+
+    # Display articles directly in hub for instant 1-click access
     for slug, item in articles.items():
         rows.append(
             [InlineKeyboardButton(text=item["title"], callback_data=f"art:{slug}")]
         )
-    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="rec:hub")])
+
+    # Big button to Ozon products
+    rows.append(
+        [InlineKeyboardButton(text="🛍 Проверенные товары на Ozon", callback_data="rec:products")]
+    )
+
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -30,7 +28,7 @@ def get_products_keyboard() -> InlineKeyboardMarkup:
         rows.append(
             [InlineKeyboardButton(text=item["title"], callback_data=f"prod:{slug}")]
         )
-    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="rec:hub")])
+    rows.append([InlineKeyboardButton(text="⬅️ Назад к советам", callback_data="rec:hub")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -38,7 +36,7 @@ def get_article_detail_keyboard(slug: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="🛍 Товары на Ozon", callback_data="rec:products")],
-            [InlineKeyboardButton(text="⬅️ Назад к инструкциям", callback_data="rec:articles")],
+            [InlineKeyboardButton(text="⬅️ Назад к советам", callback_data="rec:hub")],
         ]
     )
 
