@@ -13,11 +13,22 @@ def get_recommendations_hub_keyboard() -> InlineKeyboardMarkup:
             [InlineKeyboardButton(text=item["title"], callback_data=f"art:{slug}")]
         )
 
-    # Big button to Ozon products
+    # Button to Ozon products
     rows.append(
         [InlineKeyboardButton(text="🛍 Проверенные товары на Ozon", callback_data="rec:products")]
     )
 
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def get_articles_keyboard() -> InlineKeyboardMarkup:
+    articles = get_articles()
+    rows = []
+    for slug, item in articles.items():
+        rows.append(
+            [InlineKeyboardButton(text=item["title"], callback_data=f"art:{slug}")]
+        )
+    rows.append([InlineKeyboardButton(text="⬅️ Назад к советам", callback_data="rec:hub")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
