@@ -22,6 +22,7 @@ async def start(message: Message, command: CommandObject):
         telegram_id=user.id,
         username=user.username,
         first_name=user.first_name,
+        last_name=user.last_name,
     )
 
     text = "Привет! Выбери нужный раздел:"

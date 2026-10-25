@@ -1,6 +1,6 @@
 from aiogram import F, Router
 from aiogram.filters import Command
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, Message
+from aiogram.types import Message
 
 from config import (
     SALON_ADDRESS,
@@ -8,24 +8,9 @@ from config import (
     SALON_LONGITUDE,
     WORK_HOURS,
 )
+from keyboards.navigation import get_navigation_keyboard
 
 router = Router()
-
-
-def get_navigation_keyboard() -> InlineKeyboardMarkup:
-    yandex_maps_url = (
-        f"https://yandex.ru/maps/?pt={SALON_LONGITUDE},{SALON_LATITUDE}&z=17&l=map"
-    )
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="🗺 Открыть в Яндекс Картах",
-                    url=yandex_maps_url,
-                )
-            ]
-        ]
-    )
 
 
 @router.message(Command("location", "address", "map"))

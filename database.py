@@ -35,10 +35,16 @@ def init_db() -> None:
                 telegram_id INTEGER NOT NULL UNIQUE,
                 username TEXT,
                 first_name TEXT,
+                last_name TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
             """
         )
+
+        cursor = conn.execute("PRAGMA table_info(users)")
+        columns = [row["name"] for row in cursor.fetchall()]
+        if "last_name" not in columns:
+            conn.execute("ALTER TABLE users ADD COLUMN last_name TEXT")
 
         conn.execute(
             """
@@ -72,6 +78,9 @@ def init_db() -> None:
             """
         )
 
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_users_telegram_id ON users(telegram_id)"
+        )
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_referrals_referrer ON referrals(referrer_user_id)"
         )

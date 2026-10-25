@@ -5,7 +5,12 @@ from config import REFERRAL_REWARD_AMOUNT, REFERRAL_REWARD_TEXT
 from database import get_connection
 
 
-def save_user(telegram_id: int, username: str | None, first_name: str | None) -> tuple[int, bool]:
+def save_user(
+    telegram_id: int,
+    username: str | None,
+    first_name: str | None,
+    last_name: str | None = None,
+) -> tuple[int, bool]:
     with get_connection() as conn:
         existing = conn.execute(
             """
@@ -21,19 +26,19 @@ def save_user(telegram_id: int, username: str | None, first_name: str | None) ->
         if is_new:
             conn.execute(
                 """
-                INSERT INTO users (telegram_id, username, first_name)
-                VALUES (?, ?, ?)
+                INSERT INTO users (telegram_id, username, first_name, last_name)
+                VALUES (?, ?, ?, ?)
                 """,
-                (telegram_id, username, first_name),
+                (telegram_id, username, first_name, last_name),
             )
         else:
             conn.execute(
                 """
                 UPDATE users
-                SET username = ?, first_name = ?
+                SET username = ?, first_name = ?, last_name = ?
                 WHERE telegram_id = ?
                 """,
-                (username, first_name, telegram_id),
+                (username, first_name, last_name, telegram_id),
             )
 
         row = conn.execute(
@@ -201,9 +206,11 @@ def get_pending_referrals(limit: int = 15, offset: int = 0) -> tuple[list[dict],
                 r.id,
                 invited.telegram_id AS invited_telegram_id,
                 invited.first_name AS invited_first_name,
+                invited.last_name AS invited_last_name,
                 invited.username AS invited_username,
                 referrer.telegram_id AS referrer_telegram_id,
                 referrer.first_name AS referrer_first_name,
+                referrer.last_name AS referrer_last_name,
                 referrer.username AS referrer_username,
                 r.created_at
             FROM referrals r
@@ -295,6 +302,7 @@ def get_active_rewards(limit: int = 15, offset: int = 0) -> tuple[list[dict], in
                 rewards.created_at,
                 users.telegram_id,
                 users.first_name,
+                users.last_name,
                 users.username
             FROM rewards
             JOIN users ON users.id = rewards.user_id

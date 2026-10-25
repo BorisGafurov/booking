@@ -34,8 +34,10 @@ def admin_menu_keyboard() -> InlineKeyboardMarkup:
 def pending_referrals_keyboard(referrals: list[dict], offset: int, total: int) -> InlineKeyboardMarkup:
     rows = []
     for item in referrals:
-        invited_name = (item["invited_first_name"] or "Без имени")[:15]
-        referrer_name = (item["referrer_first_name"] or "Без имени")[:15]
+        invited_full = f"{item['invited_first_name'] or ''} {item.get('invited_last_name') or ''}".strip() or "Без имени"
+        referrer_full = f"{item['referrer_first_name'] or ''} {item.get('referrer_last_name') or ''}".strip() or "Без имени"
+        invited_name = invited_full[:15]
+        referrer_name = referrer_full[:15]
         text = f"✅ #{item['id']} · {invited_name} ← {referrer_name}"
         rows.append(
             [InlineKeyboardButton(text=text, callback_data=f"ref_visit:{item['id']}:{offset}")]
@@ -62,8 +64,9 @@ def pending_referrals_keyboard(referrals: list[dict], offset: int, total: int) -
 def active_rewards_keyboard(rewards: list[dict], offset: int, total: int) -> InlineKeyboardMarkup:
     rows = []
     for item in rewards:
-        first_name = (item["first_name"] or "Без имени")[:18]
-        text = f"✂️ Списать #{item['id']} · {first_name} · {item['amount']} ₽"
+        full_name = f"{item['first_name'] or ''} {item.get('last_name') or ''}".strip() or "Без имени"
+        name_str = full_name[:18]
+        text = f"✂️ Списать #{item['id']} · {name_str} · {item['amount']} ₽"
         rows.append(
             [InlineKeyboardButton(text=text, callback_data=f"reward_use:{item['id']}:{offset}")]
         )
@@ -105,7 +108,7 @@ async def referrals(message: Message):
 
     user = message.from_user
     # Ensure current user is registered in DB so their ref link works immediately
-    save_user(user.id, user.username, user.first_name)
+    save_user(user.id, user.username, user.first_name, user.last_name)
 
     referral_link = await build_referral_link(message.bot, user.id)
     stats = get_referral_stats(user.id)
