@@ -372,6 +372,12 @@ class TestBookingBot(unittest.IsolatedAsyncioTestCase):
         disconnect_masters_session()
         self.assertIsNone(get_active_masters_session())
 
+    def test_broadcast_recipients(self):
+        from services.referrals import get_broadcast_recipients, save_user
+        save_user(telegram_id=999888, username="test_bc")
+        recipients = get_broadcast_recipients("telegram")
+        self.assertIn(999888, recipients)
+
 
 if __name__ == "__main__":
     unittest.main()

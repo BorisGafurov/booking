@@ -491,3 +491,30 @@ def link_user_phone(user_identifier: int, phone: str, platform: str | None = Non
         else:
             conn.execute("UPDATE users SET phone = %s WHERE id = %s", (clean_phone, user_db_id))
             return True, "Номер телефона сохранён."
+
+
+def get_broadcast_recipients(platform: str) -> list[int]:
+    """
+    Get all unique user IDs for a given platform ('telegram', 'vk', 'max')
+    who have interacted with the bot.
+    """
+    col = {"telegram": "telegram_id", "vk": "vk_id", "max": "max_user_id"}.get(platform)
+    if not col:
+        return []
+
+    with get_connection() as conn:
+        rows1 = conn.execute(
+            f"SELECT DISTINCT {col} FROM users WHERE {col} IS NOT NULL AND {col} != 0"
+        ).fetchall()
+        user_ids = {dict(row)[col] for row in rows1 if dict(row).get(col)}
+
+        rows2 = conn.execute(
+            "SELECT DISTINCT platform_user_id FROM appointments WHERE platform = %s AND platform_user_id != 0",
+            (platform,),
+        ).fetchall()
+        for r in rows2:
+            val = dict(r).get("platform_user_id")
+            if val:
+                user_ids.add(val)
+
+        return sorted(user_ids)

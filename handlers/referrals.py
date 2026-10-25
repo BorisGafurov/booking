@@ -1,3 +1,4 @@
+import asyncio
 import html
 import logging
 from aiogram import F, Router
@@ -17,6 +18,7 @@ from services.masters_sync import (
 from services.referrals import (
     build_referral_link,
     get_active_rewards,
+    get_broadcast_recipients,
     get_pending_referrals,
     get_referral_stats,
     get_user_phone,
@@ -30,6 +32,7 @@ logger = logging.getLogger(__name__)
 router = Router()
 
 PAGE_SIZE = 10
+admin_broadcast_drafts: dict[int, dict] = {}
 
 
 def admin_menu_keyboard() -> InlineKeyboardMarkup:
@@ -38,6 +41,7 @@ def admin_menu_keyboard() -> InlineKeyboardMarkup:
             [InlineKeyboardButton(text="⏳ Ожидают подтверждения", callback_data="admin:pending:0")],
             [InlineKeyboardButton(text="💰 Активные бонусы", callback_data="admin:rewards:0")],
             [InlineKeyboardButton(text="🔄 Синхронизация Masters", callback_data="admin:masters")],
+            [InlineKeyboardButton(text="📢 Сделать рассылку", callback_data="admin:broadcast")],
         ]
     )
 
@@ -467,5 +471,137 @@ async def handle_master_phone_input(message: Message):
         "👉 <b>Напишите 4 цифры из СМС в ответном сообщении:</b>",
         parse_mode="HTML",
     )
+
+
+@router.callback_query(F.data == "admin:broadcast")
+async def admin_broadcast_start(callback: CallbackQuery):
+    if not callback.from_user or not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа.", show_alert=True)
+        return
+
+    admin_id = callback.from_user.id
+    admin_broadcast_drafts[admin_id] = {"step": "awaiting_text"}
+
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="⬅️ Отмена", callback_data="admin:broadcast:cancel")]
+        ]
+    )
+    text = (
+        "📢 <b>Рассылка сообщений клиентам (Telegram)</b>\n\n"
+        "Напишите и отправьте в чат текст, который хотите разослать всем клиентам.\n"
+        "<i>(Можно использовать смайлы и форматирование: жирный, курсив и т.д.)</i>\n\n"
+        "После отправки бот покажет предпросмотр и попросит подтвердить рассылку перед отправкой."
+    )
+    if callback.message:
+        await callback.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+    await callback.answer()
+
+
+@router.callback_query(F.data == "admin:broadcast:cancel")
+async def admin_broadcast_cancel(callback: CallbackQuery):
+    if not callback.from_user or not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа.", show_alert=True)
+        return
+    admin_broadcast_drafts.pop(callback.from_user.id, None)
+    await callback.answer("Рассылка отменена.")
+    await admin_menu(callback)
+
+
+@router.message(
+    lambda msg: bool(
+        msg.from_user
+        and is_admin(msg.from_user.id)
+        and admin_broadcast_drafts.get(msg.from_user.id, {}).get("step") == "awaiting_text"
+        and msg.text
+        and not msg.text.startswith("/")
+    )
+)
+async def admin_broadcast_receive_text(message: Message):
+    admin_id = message.from_user.id
+    broadcast_text = message.text.strip()
+    recipients = get_broadcast_recipients("telegram")
+    count = len(recipients)
+
+    admin_broadcast_drafts[admin_id] = {
+        "step": "confirm",
+        "text": broadcast_text,
+    }
+
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=f"✅ Отправить рассылку ({count})", callback_data="admin:broadcast:send")],
+            [InlineKeyboardButton(text="✏️ Изменить текст", callback_data="admin:broadcast")],
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="admin:broadcast:cancel")],
+        ]
+    )
+
+    preview = (
+        "📢 <b>Предпросмотр рассылки:</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        f"{broadcast_text}\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"👥 <b>Получателей в Telegram:</b> {count} чел.\n\n"
+        "Отправить это сообщение всем клиентам?"
+    )
+    await message.answer(preview, reply_markup=kb, parse_mode="HTML")
+
+
+@router.callback_query(F.data == "admin:broadcast:send")
+async def admin_broadcast_send(callback: CallbackQuery):
+    if not callback.from_user or not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа.", show_alert=True)
+        return
+
+    admin_id = callback.from_user.id
+    draft = admin_broadcast_drafts.pop(admin_id, None)
+    if not draft or not draft.get("text"):
+        await callback.answer("Черновик рассылки не найден.", show_alert=True)
+        return
+
+    text = draft["text"]
+    recipients = get_broadcast_recipients("telegram")
+    total = len(recipients)
+
+    if callback.message:
+        await callback.message.edit_text(f"⏳ <b>Отправка рассылки...</b>\n0 из {total}", parse_mode="HTML")
+    await callback.answer()
+
+    client_kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="✂️ Записаться онлайн", callback_data="menu:booking")]
+        ]
+    )
+
+    success_count = 0
+    fail_count = 0
+
+    for uid in recipients:
+        try:
+            await callback.bot.send_message(
+                chat_id=uid,
+                text=text,
+                reply_markup=client_kb,
+                parse_mode="HTML",
+            )
+            success_count += 1
+        except Exception as e:
+            logger.warning("Failed broadcast to %s: %s", uid, e)
+            fail_count += 1
+        await asyncio.sleep(0.05)
+
+    report = (
+        "✅ <b>Рассылка успешно завершена!</b>\n\n"
+        f"📬 <b>Доставлено:</b> {success_count}\n"
+        f"⚠️ <b>Не доставлено (бот заблокирован):</b> {fail_count}\n"
+        f"👥 <b>Всего получателей:</b> {total}"
+    )
+    back_kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="⬅️ Меню админки", callback_data="admin:menu")]
+        ]
+    )
+    if callback.message:
+        await callback.message.edit_text(report, reply_markup=back_kb, parse_mode="HTML")
 
 
