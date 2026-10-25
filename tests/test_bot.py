@@ -292,6 +292,86 @@ class TestBookingBot(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(stats_vk_after["started"], 1)
         self.assertEqual(stats_tg_after["started"], stats_vk_after["started"])
 
+    def test_appointment_lifecycle_and_reminders(self):
+        import datetime
+        from services.appointments import (
+            create_or_update_appointment,
+            cancel_appointment,
+            get_appointment,
+            get_user_upcoming_appointments,
+            get_due_2h_reminders,
+            mark_reminder_sent,
+            get_current_saratov_time,
+        )
+
+        now = get_current_saratov_time()
+        in_1h = now + datetime.timedelta(hours=1)
+
+        appt_id = create_or_update_appointment(
+            phone="+79998887766",
+            appointment_time=in_1h,
+            services="Мужская стрижка",
+            total_price=1200,
+            client_name="Клиент Тест",
+            platform="telegram",
+            platform_user_id=123456,
+        )
+        self.assertIsNotNone(appt_id)
+
+        appt = get_appointment(appt_id)
+        self.assertIsNotNone(appt)
+        self.assertEqual(appt["status"], "confirmed")
+        self.assertEqual(appt["client_name"], "Клиент Тест")
+
+        # Due 2h reminders should find this appointment
+        due_2h = get_due_2h_reminders()
+        self.assertTrue(any(a["id"] == appt_id for a in due_2h))
+
+        # Mark sent
+        mark_reminder_sent(appt_id, "2h")
+        due_2h_after = get_due_2h_reminders()
+        self.assertFalse(any(a["id"] == appt_id for a in due_2h_after))
+
+        # Cancel appointment
+        ok, msg, cancelled = cancel_appointment(appt_id)
+        self.assertTrue(ok)
+        self.assertEqual(cancelled["status"], "cancelled")
+
+        # Upcoming appointments should now be empty
+        upcoming = get_user_upcoming_appointments(platform="telegram", platform_user_id=123456)
+        self.assertEqual(len(upcoming), 0)
+
+    def test_masters_session_and_phone_formatting(self):
+        from services.masters_sync import (
+            format_master_phone,
+            get_active_masters_session,
+            disconnect_masters_session,
+        )
+        from database import get_connection
+
+        self.assertEqual(format_master_phone("+79991234567"), "(999) 123-45-67")
+        self.assertEqual(format_master_phone("89991234567"), "(999) 123-45-67")
+
+        with get_connection() as conn:
+            conn.execute("DELETE FROM masters_session")
+            conn.commit()
+
+        self.assertIsNone(get_active_masters_session())
+
+        with get_connection() as conn:
+            conn.execute(
+                "INSERT INTO masters_session (cookie_phpsessid, master_phone, is_active) VALUES (%s, %s, %s)",
+                ("test_session_token", "+79991234567", True if conn.is_pg else 1),
+            )
+            conn.commit()
+
+        session = get_active_masters_session()
+        self.assertIsNotNone(session)
+        self.assertEqual(session["master_phone"], "+79991234567")
+
+        disconnect_masters_session()
+        self.assertIsNone(get_active_masters_session())
+
 
 if __name__ == "__main__":
     unittest.main()

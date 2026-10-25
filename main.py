@@ -14,6 +14,7 @@ from handlers.navigation import router as navigation_router
 from handlers.referrals import router as referrals_router
 from handlers.start import router as start_router
 from keyboards.menu import get_main_menu
+from services.reminder_worker import run_reminder_worker
 
 logging.basicConfig(
     level=logging.INFO,
@@ -53,8 +54,12 @@ async def main():
     default_properties = DefaultBotProperties(parse_mode=ParseMode.HTML)
     async with Bot(token=BOT_TOKEN, default=default_properties) as bot:
         await bot.delete_webhook(drop_pending_updates=False)
+        worker_task = asyncio.create_task(run_reminder_worker(bot, "telegram"))
         logger.info("Бот успешно запущен. Нажми Ctrl+C для остановки.")
-        await dp.start_polling(bot)
+        try:
+            await dp.start_polling(bot)
+        finally:
+            worker_task.cancel()
 
 
 if __name__ == "__main__":

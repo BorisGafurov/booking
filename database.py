@@ -74,7 +74,10 @@ class DBConnection:
             query = query.replace("SERIAL PRIMARY KEY", "INTEGER PRIMARY KEY AUTOINCREMENT")
             query = query.replace("BIGINT", "INTEGER")
             query = query.replace("VARCHAR(128)", "TEXT")
+            query = query.replace("VARCHAR(64)", "TEXT")
             query = query.replace("VARCHAR(32)", "TEXT")
+            query = query.replace("BOOLEAN NOT NULL DEFAULT FALSE", "INTEGER NOT NULL DEFAULT 0")
+            query = query.replace("BOOLEAN NOT NULL DEFAULT TRUE", "INTEGER NOT NULL DEFAULT 1")
             query = query.replace("TIMESTAMP WITH TIME ZONE", "TIMESTAMP")
             query = query.replace("TIMESTAMP WITHOUT TIME ZONE", "TIMESTAMP")
         return self.raw_conn.execute(query, params)
@@ -162,6 +165,34 @@ def init_db() -> None:
                     used_at TIMESTAMP WITH TIME ZONE
                 );
 
+                CREATE TABLE IF NOT EXISTS appointments (
+                    id SERIAL PRIMARY KEY,
+                    user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+                    platform VARCHAR(32) NOT NULL DEFAULT 'telegram',
+                    platform_user_id BIGINT NOT NULL DEFAULT 0,
+                    client_name VARCHAR(128),
+                    phone VARCHAR(32) NOT NULL,
+                    services TEXT NOT NULL,
+                    total_price INTEGER NOT NULL DEFAULT 0,
+                    appointment_time TIMESTAMP WITH TIME ZONE NOT NULL,
+                    status VARCHAR(32) NOT NULL DEFAULT 'confirmed',
+                    reminder_evening_sent BOOLEAN NOT NULL DEFAULT FALSE,
+                    reminder_2h_sent BOOLEAN NOT NULL DEFAULT FALSE,
+                    retention_18d_sent BOOLEAN NOT NULL DEFAULT FALSE,
+                    masters_id VARCHAR(64) UNIQUE,
+                    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+                );
+
+                CREATE TABLE IF NOT EXISTS masters_session (
+                    id SERIAL PRIMARY KEY,
+                    master_phone VARCHAR(32),
+                    cookie_phpsessid TEXT,
+                    cookie_csrf TEXT,
+                    logged_in_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+                    is_active BOOLEAN NOT NULL DEFAULT TRUE
+                );
+
                 CREATE INDEX IF NOT EXISTS idx_users_telegram_id ON users(telegram_id);
                 CREATE INDEX IF NOT EXISTS idx_users_vk_id ON users(vk_id);
                 CREATE INDEX IF NOT EXISTS idx_users_max_user_id ON users(max_user_id);
@@ -170,6 +201,9 @@ def init_db() -> None:
                 CREATE INDEX IF NOT EXISTS idx_referrals_invited ON referrals(invited_user_id);
                 CREATE INDEX IF NOT EXISTS idx_rewards_user ON rewards(user_id);
                 CREATE INDEX IF NOT EXISTS idx_rewards_status ON rewards(status);
+                CREATE INDEX IF NOT EXISTS idx_appointments_time ON appointments(appointment_time);
+                CREATE INDEX IF NOT EXISTS idx_appointments_phone ON appointments(phone);
+                CREATE INDEX IF NOT EXISTS idx_appointments_status ON appointments(status);
                 """
             )
         else:
@@ -228,6 +262,42 @@ def init_db() -> None:
                 """
             )
 
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS appointments (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+                    platform TEXT NOT NULL DEFAULT 'telegram',
+                    platform_user_id INTEGER NOT NULL DEFAULT 0,
+                    client_name TEXT,
+                    phone TEXT NOT NULL,
+                    services TEXT NOT NULL,
+                    total_price INTEGER NOT NULL DEFAULT 0,
+                    appointment_time TIMESTAMP NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'confirmed',
+                    reminder_evening_sent INTEGER NOT NULL DEFAULT 0,
+                    reminder_2h_sent INTEGER NOT NULL DEFAULT 0,
+                    retention_18d_sent INTEGER NOT NULL DEFAULT 0,
+                    masters_id TEXT UNIQUE,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS masters_session (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    master_phone TEXT,
+                    cookie_phpsessid TEXT,
+                    cookie_csrf TEXT,
+                    logged_in_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    is_active INTEGER NOT NULL DEFAULT 1
+                )
+                """
+            )
+
             conn.execute("CREATE INDEX IF NOT EXISTS idx_users_telegram_id ON users(telegram_id)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_users_vk_id ON users(vk_id)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_users_max_user_id ON users(max_user_id)")
@@ -236,3 +306,6 @@ def init_db() -> None:
             conn.execute("CREATE INDEX IF NOT EXISTS idx_referrals_invited ON referrals(invited_user_id)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_rewards_user ON rewards(user_id)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_rewards_status ON rewards(status)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_appointments_time ON appointments(appointment_time)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_appointments_phone ON appointments(phone)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_appointments_status ON appointments(status)")

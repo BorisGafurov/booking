@@ -3,9 +3,14 @@ import logging
 from aiogram import F, Router
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command
-from aiogram.types import CallbackQuery, Message
+from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 from config import ADMIN_IDS, BOOKING_URL
+from services.appointments import (
+    SARATOV_TZ,
+    cancel_appointment,
+    create_or_update_appointment,
+)
 from keyboards.booking import (
     get_booking_keyboard,
     get_days_keyboard,
@@ -289,7 +294,15 @@ async def back_to_menu(message: Message):
     await message.answer("Главное меню:", reply_markup=get_main_menu(is_admin_user))
 
 
-@router.message(lambda msg: bool(msg.text and msg.text.strip().isdigit() and len(msg.text.strip()) == 4))
+@router.message(
+    lambda msg: bool(
+        msg.from_user
+        and msg.from_user.id in user_pending_booking
+        and msg.text
+        and msg.text.strip().isdigit()
+        and len(msg.text.strip()) == 4
+    )
+)
 async def handle_sms_code(message: Message):
     if not message.from_user or not message.text:
         return
@@ -315,8 +328,31 @@ async def handle_sms_code(message: Message):
     # Successfully booked!
     user_pending_booking.pop(user_id, None)
     calc = session_data["calc"]
-    dt = datetime.datetime.fromtimestamp(session_data["timestamp"])
+    dt = datetime.datetime.fromtimestamp(session_data["timestamp"], tz=SARATOV_TZ)
     phone = session_data["phone"]
+    client_name = message.from_user.full_name or "Клиент"
+
+    appt_id = create_or_update_appointment(
+        phone=phone,
+        appointment_time=dt,
+        services=", ".join(calc["names"]),
+        total_price=calc["total_price"],
+        client_name=client_name,
+        platform="telegram",
+        platform_user_id=user_id,
+        masters_id=session_data.get("appointment_id"),
+    )
+
+    cancel_markup = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="❌ Отменить запись",
+                    callback_data=f"appt:cancel:{appt_id}",
+                )
+            ]
+        ]
+    )
 
     await message.answer(
         f"🎉 <b>Запись успешно подтверждена!</b>\n\n"
@@ -324,14 +360,14 @@ async def handle_sms_code(message: Message):
         f"💰 <b>Стоимость:</b> {calc['total_price']} ₽ ({calc['duration_text']})\n"
         f"📅 <b>Дата и время:</b> {dt.strftime('%d.%m.%Y в %H:%M')}\n"
         f"📍 <b>Адрес:</b> Саратов, ул. имени Е.И. Пугачёва, 110\n\n"
-        "Ждём вас! Запись зафиксирована в рабочем календаре мастера.",
+        "Ждём вас! Мы пришлём напоминание накануне вечером и за 2 часа до визита.",
+        reply_markup=cancel_markup,
         parse_mode="HTML",
     )
 
     # Notify master
     for admin_id in ADMIN_IDS:
         try:
-            client_name = message.from_user.full_name or "Клиент"
             await message.bot.send_message(
                 chat_id=admin_id,
                 text=(
@@ -346,6 +382,56 @@ async def handle_sms_code(message: Message):
             )
         except Exception as e:
             logger.error("Failed to notify admin %s: %s", admin_id, e)
+
+
+@router.callback_query(F.data.startswith("appt:cancel:"))
+async def handle_cancel_appointment(callback: CallbackQuery):
+    if not callback.from_user or not callback.data:
+        return
+
+    parts = callback.data.split(":")
+    if len(parts) < 3 or not parts[2].isdigit():
+        await callback.answer("Некорректная запись")
+        return
+
+    appt_id = int(parts[2])
+    success, msg, appt = cancel_appointment(appt_id)
+
+    if not success:
+        await callback.answer(msg, show_alert=True)
+        return
+
+    try:
+        if callback.message:
+            await callback.message.edit_text(
+                "❌ <b>Запись успешно отменена</b>\n\n"
+                "Будем рады видеть вас в другой раз! Чтобы выбрать новую дату, нажмите «✂️ Записаться».",
+                parse_mode="HTML",
+            )
+    except TelegramBadRequest:
+        pass
+
+    await callback.answer("Запись отменена.")
+
+    # Notify master
+    if appt:
+        dt_str = str(appt.get("appointment_time", ""))
+        for admin_id in ADMIN_IDS:
+            try:
+                await callback.bot.send_message(
+                    chat_id=admin_id,
+                    text=(
+                        "⚠️ <b>Клиент отменил запись!</b>\n\n"
+                        f"👤 <b>Клиент:</b> {appt.get('client_name') or 'Клиент'}\n"
+                        f"📱 <b>Телефон:</b> {appt.get('phone')}\n"
+                        f"✂️ <b>Услуги:</b> {appt.get('services')}\n"
+                        f"📅 <b>Время:</b> {dt_str}\n"
+                        "Слот снова свободен для других клиентов."
+                    ),
+                    parse_mode="HTML",
+                )
+            except Exception as e:
+                logger.error("Failed to notify admin %s: %s", admin_id, e)
 
 
 @router.message(lambda msg: bool(msg.text and is_phone_number(msg.text)))
