@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 test_dir = tempfile.mkdtemp()
 os.environ["DATA_DIR"] = test_dir
+os.environ["DATABASE_URL"] = ""
 
 import database
 from database import get_connection, init_db
