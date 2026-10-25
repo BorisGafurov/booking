@@ -252,6 +252,46 @@ class TestBookingBot(unittest.IsolatedAsyncioTestCase):
         mock_message.answer.assert_called_once()
         mock_bot.send_message.assert_called_once()
 
+    def test_phone_linking_and_account_merging(self):
+        from services.referrals import (
+            _save_user_unified,
+            get_referral_stats,
+            get_user_phone,
+            is_phone_number,
+            link_user_phone,
+            normalize_phone,
+            register_referral,
+            save_user,
+        )
+
+        self.assertTrue(is_phone_number("+79991234567"))
+        self.assertTrue(is_phone_number("89991234567"))
+        self.assertEqual(normalize_phone("89991234567"), "+79991234567")
+
+        save_user(telegram_id=101, first_name="BorisTG")
+        _save_user_unified(vk_id=202, first_name="BorisVK")
+
+        save_user(telegram_id=303, first_name="Friend")
+        ok, _, _ = register_referral(303, 202)
+        self.assertTrue(ok)
+
+        stats_tg = get_referral_stats(101, "telegram")
+        stats_vk = get_referral_stats(202, "vk")
+        self.assertEqual(stats_tg["started"], 0)
+        self.assertEqual(stats_vk["started"], 1)
+
+        link_user_phone(202, "+79991112233", platform="vk")
+        self.assertEqual(get_user_phone(202, "vk"), "+79991112233")
+
+        ok_merge, _ = link_user_phone(101, "89991112233", platform="telegram")
+        self.assertTrue(ok_merge)
+
+        stats_tg_after = get_referral_stats(101, "telegram")
+        stats_vk_after = get_referral_stats(202, "vk")
+        self.assertEqual(stats_tg_after["started"], 1)
+        self.assertEqual(stats_vk_after["started"], 1)
+        self.assertEqual(stats_tg_after["started"], stats_vk_after["started"])
+
 
 if __name__ == "__main__":
     unittest.main()

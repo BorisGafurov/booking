@@ -171,9 +171,9 @@ def register_referral(new_user_telegram_id: int, referrer_telegram_id: int) -> t
     return True, "Реферальная связь сохранена.", notify_data
 
 
-def get_referral_stats(referrer_telegram_id: int) -> dict:
+def get_referral_stats(referrer_telegram_id: int, platform: str | None = "telegram") -> dict:
     with get_connection() as conn:
-        referrer = _find_user(conn, referrer_telegram_id, "telegram")
+        referrer = _find_user(conn, referrer_telegram_id, platform)
         if not referrer:
             return {
                 "started": 0,
@@ -404,9 +404,34 @@ def mark_reward_used(reward_id: int) -> tuple[bool, str, dict | None]:
     return True, f"Бонус {reward['amount']} ₽ отмечен как использованный.", notify_data
 
 
+def normalize_phone(phone: str) -> str:
+    digits = "".join(ch for ch in phone if ch.isdigit())
+    if len(digits) == 11 and digits.startswith("8"):
+        digits = "7" + digits[1:]
+    elif len(digits) == 10:
+        digits = "7" + digits
+    return f"+{digits}" if digits else phone
+
+
+def is_phone_number(text: str) -> bool:
+    if not text:
+        return False
+    digits = "".join(ch for ch in text if ch.isdigit())
+    return len(digits) in (10, 11) and (text.strip().startswith("+") or digits.startswith(("7", "8", "9")))
+
+
+def get_user_phone(user_identifier: int, platform: str | None = None) -> str | None:
+    with get_connection() as conn:
+        user = _find_user(conn, user_identifier, platform)
+        if user and user.get("phone"):
+            return user["phone"]
+    return None
+
+
 def link_user_phone(user_identifier: int, phone: str, platform: str | None = None) -> tuple[bool, str]:
-    clean_phone = "".join(ch for ch in phone if ch.isdigit() or ch == "+")
-    if len(clean_phone) < 10:
+    clean_phone = normalize_phone(phone)
+    digits = "".join(ch for ch in clean_phone if ch.isdigit())
+    if len(digits) < 11:
         return False, "Некорректный номер телефона."
 
     with get_connection() as conn:
@@ -422,6 +447,11 @@ def link_user_phone(user_identifier: int, phone: str, platform: str | None = Non
 
         if existing:
             target_id = existing["id"]
+            # Clear unique fields on old record first to prevent UNIQUE constraint conflict during transfer
+            conn.execute(
+                "UPDATE users SET telegram_id = NULL, vk_id = NULL, max_user_id = NULL, phone = NULL WHERE id = %s",
+                (user_db_id,),
+            )
             conn.execute(
                 """
                 UPDATE users
@@ -431,6 +461,7 @@ def link_user_phone(user_identifier: int, phone: str, platform: str | None = Non
                     username = COALESCE(username, %s),
                     first_name = COALESCE(first_name, %s),
                     last_name = COALESCE(last_name, %s),
+                    phone = %s,
                     updated_at = CURRENT_TIMESTAMP
                 WHERE id = %s
                 """,
@@ -441,11 +472,19 @@ def link_user_phone(user_identifier: int, phone: str, platform: str | None = Non
                     current_user.get("username"),
                     current_user.get("first_name"),
                     current_user.get("last_name"),
+                    clean_phone,
                     target_id,
                 ),
             )
             conn.execute("UPDATE referrals SET referrer_user_id = %s WHERE referrer_user_id = %s", (target_id, user_db_id))
-            conn.execute("UPDATE referrals SET invited_user_id = %s WHERE invited_user_id = %s", (target_id, user_db_id))
+            
+            existing_invite = conn.execute("SELECT id FROM referrals WHERE invited_user_id = %s", (target_id,)).fetchone()
+            if existing_invite:
+                conn.execute("DELETE FROM referrals WHERE invited_user_id = %s", (user_db_id,))
+            else:
+                conn.execute("UPDATE referrals SET invited_user_id = %s WHERE invited_user_id = %s", (target_id, user_db_id))
+
+            conn.execute("DELETE FROM referrals WHERE referrer_user_id = %s AND invited_user_id = %s", (target_id, target_id))
             conn.execute("UPDATE rewards SET user_id = %s WHERE user_id = %s", (target_id, user_db_id))
             conn.execute("DELETE FROM users WHERE id = %s", (user_db_id,))
             return True, "Профиль успешно объединён по номеру телефона."
