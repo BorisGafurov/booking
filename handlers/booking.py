@@ -36,10 +36,13 @@ def _format_services_text(selected_keys: list[str] | set[str]) -> str:
     names_str = " + ".join(calc["names"])
     return (
         "✂️ <b>Онлайн-запись к мастеру Борису Гафурову</b>\n\n"
-        "Нажмите на услугу, чтобы добавить или убрать её:\n\n"
+        "💡 <b>Как выбрать услуги:</b>\n"
+        "• Нажмите на услугу один раз — появится галочка ✅ (услуга выбрана)\n"
+        "• Нажмите ещё раз — галочка снимется ⚪️ (услуга удалена)\n"
+        "<i>Можно выбрать одну услугу или сразу обе.</i>\n\n"
         f"📋 <b>Выбрано:</b> {names_str}\n"
         f"💰 <b>Итого:</b> {calc['total_price']} ₽ ({calc['duration_text']})\n\n"
-        "<i>Нажмите кнопку ниже для перехода к выбору даты и времени:</i>"
+        "<i>После выбора нажмите кнопку «📅 Выбрать время»:</i>"
     )
 
 
@@ -68,9 +71,12 @@ async def toggle_service(callback: CallbackQuery):
     key = callback.data.split(":")[2]
 
     current = user_selected_services.get(user_id, {"hair"})
+    alert_msg = None
     if key in current:
         if len(current) > 1:
             current.remove(key)
+        else:
+            alert_msg = "Нужно выбрать хотя бы одну услугу"
     else:
         current.add(key)
     user_selected_services[user_id] = current
@@ -84,7 +90,7 @@ async def toggle_service(callback: CallbackQuery):
             )
     except TelegramBadRequest:
         pass
-    await callback.answer()
+    await callback.answer(alert_msg)
 
 
 @router.callback_query(F.data == "book:services")
