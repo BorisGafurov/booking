@@ -49,6 +49,33 @@ def _get_retention_keyboard() -> InlineKeyboardMarkup:
     )
 
 
+def _resolve_platform_user_id(appt: dict, platform: str) -> int | None:
+    user_id = appt.get("platform_user_id")
+    if user_id and user_id != 0:
+        return user_id
+
+    from database import get_connection
+    with get_connection() as conn:
+        col = {"telegram": "telegram_id", "vk": "vk_id", "max": "max_user_id"}.get(platform)
+        if not col:
+            return None
+        row = None
+        if appt.get("user_id"):
+            row = conn.execute(f"SELECT {col} FROM users WHERE id = %s", (appt["user_id"],)).fetchone()
+        if not row and appt.get("phone"):
+            row = conn.execute(f"SELECT {col} FROM users WHERE phone = %s", (appt["phone"],)).fetchone()
+
+        if row and row[col]:
+            found_id = row[col]
+            conn.execute(
+                "UPDATE appointments SET platform_user_id = %s, platform = %s WHERE id = %s",
+                (found_id, platform, appt["id"]),
+            )
+            conn.commit()
+            return found_id
+    return None
+
+
 async def run_reminder_worker(bot: Bot, platform: str = "telegram"):
     logger.info("Запущен фоновый воркер напоминаний (%s)", platform)
     sync_counter = 0
@@ -58,6 +85,11 @@ async def run_reminder_worker(bot: Bot, platform: str = "telegram"):
             # 1. Evening reminder (day before visit, >= 18:00)
             evening_due = get_due_evening_reminders(platform=platform)
             for appt in evening_due:
+                target_user_id = _resolve_platform_user_id(appt, platform)
+                if not target_user_id:
+                    mark_reminder_sent(appt["id"], "evening")
+                    continue
+
                 dt = appt["appointment_time"]
                 if isinstance(dt, str):
                     dt = datetime.datetime.fromisoformat(dt)
@@ -77,19 +109,24 @@ async def run_reminder_worker(bot: Bot, platform: str = "telegram"):
                 )
                 try:
                     await bot.send_message(
-                        chat_id=appt["platform_user_id"],
+                        chat_id=target_user_id,
                         text=text,
                         reply_markup=_get_evening_reminder_keyboard(appt["id"]),
                         parse_mode="HTML",
                     )
                     mark_reminder_sent(appt["id"], "evening")
-                    logger.info("Отправлено вечернее напоминание клиенту #%s (appt #%s)", appt["platform_user_id"], appt["id"])
+                    logger.info("Отправлено вечернее напоминание клиенту #%s (appt #%s)", target_user_id, appt["id"])
                 except Exception as send_err:
                     logger.warning("Ошибка отправки вечернего напоминания #%s: %s", appt["id"], send_err)
 
             # 2. 2h express reminder
             two_h_due = get_due_2h_reminders(platform=platform)
             for appt in two_h_due:
+                target_user_id = _resolve_platform_user_id(appt, platform)
+                if not target_user_id:
+                    mark_reminder_sent(appt["id"], "2h")
+                    continue
+
                 dt = appt["appointment_time"]
                 if isinstance(dt, str):
                     dt = datetime.datetime.fromisoformat(dt)
@@ -105,18 +142,23 @@ async def run_reminder_worker(bot: Bot, platform: str = "telegram"):
                 )
                 try:
                     await bot.send_message(
-                        chat_id=appt["platform_user_id"],
+                        chat_id=target_user_id,
                         text=text,
                         parse_mode="HTML",
                     )
                     mark_reminder_sent(appt["id"], "2h")
-                    logger.info("Отправлено 2ч напоминание клиенту #%s (appt #%s)", appt["platform_user_id"], appt["id"])
+                    logger.info("Отправлено 2ч напоминание клиенту #%s (appt #%s)", target_user_id, appt["id"])
                 except Exception as send_err:
                     logger.warning("Ошибка отправки 2ч напоминания #%s: %s", appt["id"], send_err)
 
             # 3. 2.5 weeks retention reminder
             retention_due = get_due_retention_reminders(platform=platform)
             for appt in retention_due:
+                target_user_id = _resolve_platform_user_id(appt, platform)
+                if not target_user_id:
+                    mark_reminder_sent(appt["id"], "retention")
+                    continue
+
                 text = (
                     "✂️ <b>Привет! Прошло 2,5 недели с твоей стрижки</b>\n\n"
                     "Волосы уже отросли, и форма начинает теряться. Самое время освежить стрижку и бороду! 💈\n\n"
@@ -124,13 +166,13 @@ async def run_reminder_worker(bot: Bot, platform: str = "telegram"):
                 )
                 try:
                     await bot.send_message(
-                        chat_id=appt["platform_user_id"],
+                        chat_id=target_user_id,
                         text=text,
                         reply_markup=_get_retention_keyboard(),
                         parse_mode="HTML",
                     )
                     mark_reminder_sent(appt["id"], "retention")
-                    logger.info("Отправлено retention напоминание клиенту #%s (appt #%s)", appt["platform_user_id"], appt["id"])
+                    logger.info("Отправлено retention напоминание клиенту #%s (appt #%s)", target_user_id, appt["id"])
                 except Exception as send_err:
                     logger.warning("Ошибка отправки retention напоминания #%s: %s", appt["id"], send_err)
 
