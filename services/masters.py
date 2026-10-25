@@ -3,6 +3,7 @@ import http.cookiejar
 import json
 import logging
 import re
+import ssl
 import time
 import urllib.parse
 import urllib.request
@@ -13,6 +14,14 @@ from config import BOOKING_URL
 logger = logging.getLogger(__name__)
 
 BASE_MASTER_URL = "https://mst.link/boris_gafurov"
+
+
+def _get_ssl_context() -> ssl.SSLContext:
+    try:
+        import certifi
+        return ssl.create_default_context(cafile=certifi.where())
+    except Exception:
+        return ssl._create_unverified_context()
 
 SERVICES = {
     "hair": {
@@ -83,7 +92,10 @@ def get_schedule(selected_keys: list[str] | set[str] | None) -> dict[str, Any]:
     days_map: dict[str, Any] = {}
     try:
         cj = http.cookiejar.CookieJar()
-        opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cj))
+        opener = urllib.request.build_opener(
+            urllib.request.HTTPCookieProcessor(cj),
+            urllib.request.HTTPSHandler(context=_get_ssl_context()),
+        )
         headers = {"User-Agent": "Mozilla/5.0"}
 
         # Step 1: visit price page to acquire session and CID
@@ -128,7 +140,10 @@ def initiate_booking(phone: str, selected_keys: list[str] | set[str] | None, tim
     calc = calculate_services(selected_keys)
     try:
         cj = http.cookiejar.CookieJar()
-        opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cj))
+        opener = urllib.request.build_opener(
+            urllib.request.HTTPCookieProcessor(cj),
+            urllib.request.HTTPSHandler(context=_get_ssl_context()),
+        )
         headers = {"User-Agent": "Mozilla/5.0"}
 
         # 1. Price
