@@ -220,7 +220,7 @@ def confirm_master_login(session_data: dict[str, Any], sms_code: str) -> tuple[b
 def get_active_masters_session() -> dict[str, Any] | None:
     with get_connection() as conn:
         row = conn.execute(
-            "SELECT * FROM masters_session WHERE is_active = TRUE or is_active = 1 ORDER BY id DESC LIMIT 1"
+            "SELECT * FROM masters_session WHERE is_active = TRUE ORDER BY id DESC LIMIT 1"
         ).fetchone()
         return dict(row) if row else None
 

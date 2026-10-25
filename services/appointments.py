@@ -203,7 +203,7 @@ def get_due_evening_reminders(platform: str | None = None) -> list[dict]:
         query = """
             SELECT * FROM appointments
             WHERE status = 'confirmed'
-              AND (reminder_evening_sent = FALSE OR reminder_evening_sent = 0)
+              AND reminder_evening_sent = FALSE
               AND appointment_time >= %s AND appointment_time < %s
         """
         t_start = tomorrow_start if conn.is_pg else tomorrow_start.strftime("%Y-%m-%d %H:%M:%S")
@@ -229,7 +229,7 @@ def get_due_2h_reminders(platform: str | None = None) -> list[dict]:
         query = """
             SELECT * FROM appointments
             WHERE status = 'confirmed'
-              AND (reminder_2h_sent = FALSE OR reminder_2h_sent = 0)
+              AND reminder_2h_sent = FALSE
               AND appointment_time > %s AND appointment_time <= %s
         """
         p_now = now if conn.is_pg else now.strftime("%Y-%m-%d %H:%M:%S")
@@ -260,7 +260,7 @@ def get_due_retention_reminders(platform: str | None = None) -> list[dict]:
         query = """
             SELECT * FROM appointments
             WHERE status = 'confirmed'
-              AND (retention_18d_sent = FALSE OR retention_18d_sent = 0)
+              AND retention_18d_sent = FALSE
               AND appointment_time <= %s AND appointment_time >= %s
         """
         p_older = older_than if conn.is_pg else older_than.strftime("%Y-%m-%d %H:%M:%S")

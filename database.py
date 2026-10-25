@@ -78,6 +78,8 @@ class DBConnection:
             query = query.replace("VARCHAR(32)", "TEXT")
             query = query.replace("BOOLEAN NOT NULL DEFAULT FALSE", "INTEGER NOT NULL DEFAULT 0")
             query = query.replace("BOOLEAN NOT NULL DEFAULT TRUE", "INTEGER NOT NULL DEFAULT 1")
+            query = query.replace("= FALSE", "= 0")
+            query = query.replace("= TRUE", "= 1")
             query = query.replace("TIMESTAMP WITH TIME ZONE", "TIMESTAMP")
             query = query.replace("TIMESTAMP WITHOUT TIME ZONE", "TIMESTAMP")
         return self.raw_conn.execute(query, params)
