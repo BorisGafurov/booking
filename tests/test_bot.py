@@ -1,4 +1,5 @@
 import asyncio
+import datetime
 import os
 import shutil
 import tempfile
@@ -377,6 +378,66 @@ class TestBookingBot(unittest.IsolatedAsyncioTestCase):
         save_user(telegram_id=999888, username="test_bc")
         recipients = get_broadcast_recipients("telegram")
         self.assertIn(999888, recipients)
+
+    def test_client_confirmation_and_followup_reminders(self):
+        from services.appointments import (
+            create_or_update_appointment,
+            confirm_appointment_by_client,
+            cancel_appointment,
+            get_appointment,
+            get_due_confirmation_followup_reminders,
+            mark_reminder_sent,
+            get_current_saratov_time,
+        )
+
+        now = get_current_saratov_time()
+        in_3h = now + datetime.timedelta(hours=3)
+
+        appt_id = create_or_update_appointment(
+            phone="+79991112233",
+            appointment_time=in_3h,
+            services="Мужская стрижка",
+            total_price=1200,
+            client_name="Подтверждающий Клиент",
+            platform="telegram",
+            platform_user_id=888777,
+        )
+        self.assertIsNotNone(appt_id)
+
+        appt = get_appointment(appt_id)
+        self.assertFalse(bool(appt["client_confirmed"]))
+
+        # Mark evening sent so it can be eligible for morning follow-up
+        mark_reminder_sent(appt_id, "evening")
+
+        # If it's daytime (>= 09:00), check followup list
+        if now.hour >= 9:
+            due = get_due_confirmation_followup_reminders()
+            self.assertTrue(any(a["id"] == appt_id for a in due))
+
+        # Client confirms the appointment
+        ok, msg, confirmed_appt = confirm_appointment_by_client(appt_id)
+        self.assertTrue(ok)
+        self.assertEqual(msg, "Запись успешно подтверждена")
+        self.assertTrue(bool(confirmed_appt["client_confirmed"]))
+
+        appt_after = get_appointment(appt_id)
+        self.assertTrue(bool(appt_after["client_confirmed"]))
+
+        # Once confirmed, it should no longer be in morning followup list
+        if now.hour >= 9:
+            due = get_due_confirmation_followup_reminders()
+            self.assertFalse(any(a["id"] == appt_id for a in due))
+
+        # Cancel appointment
+        ok_cancel, _, cancelled = cancel_appointment(appt_id)
+        self.assertTrue(ok_cancel)
+        self.assertEqual(cancelled["status"], "cancelled")
+
+        # Trying to confirm a cancelled appointment should fail
+        ok_conf_again, msg_conf, _ = confirm_appointment_by_client(appt_id)
+        self.assertFalse(ok_conf_again)
+        self.assertIn("отменена", msg_conf)
 
 
 if __name__ == "__main__":

@@ -166,6 +166,27 @@ def cancel_appointment(appointment_id: int) -> tuple[bool, str, dict | None]:
         return True, "Запись успешно отменена", res
 
 
+def confirm_appointment_by_client(appointment_id: int) -> tuple[bool, str, dict | None]:
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT * FROM appointments WHERE id = %s", (appointment_id,)
+        ).fetchone()
+        if not row:
+            return False, "Запись не найдена", None
+        if row["status"] == "cancelled":
+            return False, "Запись уже отменена", dict(row)
+
+        val = True if conn.is_pg else 1
+        conn.execute(
+            "UPDATE appointments SET client_confirmed = %s, updated_at = CURRENT_TIMESTAMP WHERE id = %s",
+            (val, appointment_id),
+        )
+        conn.commit()
+        res = dict(row)
+        res["client_confirmed"] = True
+        return True, "Запись успешно подтверждена", res
+
+
 def get_appointment(appointment_id: int) -> dict | None:
     with get_connection() as conn:
         row = conn.execute(
@@ -209,6 +230,43 @@ def get_due_evening_reminders(platform: str | None = None) -> list[dict]:
         t_start = tomorrow_start if conn.is_pg else tomorrow_start.strftime("%Y-%m-%d %H:%M:%S")
         t_end = tomorrow_end if conn.is_pg else tomorrow_end.strftime("%Y-%m-%d %H:%M:%S")
         params = [t_start, t_end]
+        if platform:
+            query += " AND platform = %s"
+            params.append(platform)
+        query += " ORDER BY appointment_time ASC"
+
+        rows = conn.execute(query, tuple(params)).fetchall()
+        return [dict(r) for r in rows]
+
+
+def get_due_confirmation_followup_reminders(platform: str | None = None) -> list[dict]:
+    """
+    Find appointments scheduled for today where evening reminder was sent,
+    but client has not confirmed yet, morning follow-up has not been sent,
+    it is morning (>= 09:00 Saratov time), and visit is at least 2 hours away.
+    """
+    now = get_current_saratov_time()
+    if now.hour < 9:
+        return []
+
+    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    today_end = today_start + datetime.timedelta(days=1)
+    min_time = now + datetime.timedelta(hours=2)
+
+    with get_connection() as conn:
+        query = """
+            SELECT * FROM appointments
+            WHERE status = 'confirmed'
+              AND reminder_evening_sent = TRUE
+              AND reminder_morning_sent = FALSE
+              AND client_confirmed = FALSE
+              AND appointment_time >= %s AND appointment_time < %s
+              AND appointment_time > %s
+        """
+        t_start = today_start if conn.is_pg else today_start.strftime("%Y-%m-%d %H:%M:%S")
+        t_end = today_end if conn.is_pg else today_end.strftime("%Y-%m-%d %H:%M:%S")
+        t_min = min_time if conn.is_pg else min_time.strftime("%Y-%m-%d %H:%M:%S")
+        params = [t_start, t_end, t_min]
         if platform:
             query += " AND platform = %s"
             params.append(platform)
@@ -278,6 +336,7 @@ def get_due_retention_reminders(platform: str | None = None) -> list[dict]:
 def mark_reminder_sent(appointment_id: int, reminder_type: str) -> None:
     column = {
         "evening": "reminder_evening_sent",
+        "morning": "reminder_morning_sent",
         "2h": "reminder_2h_sent",
         "retention": "retention_18d_sent",
     }.get(reminder_type)

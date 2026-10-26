@@ -8,6 +8,7 @@ from config import ADMIN_IDS
 from services.appointments import (
     SARATOV_TZ,
     get_due_2h_reminders,
+    get_due_confirmation_followup_reminders,
     get_due_evening_reminders,
     get_due_retention_reminders,
     mark_reminder_sent,
@@ -17,12 +18,16 @@ from services.masters_sync import sync_masters_appointments
 logger = logging.getLogger(__name__)
 
 
-def _get_evening_reminder_keyboard(appointment_id: int) -> InlineKeyboardMarkup:
+def _get_confirmation_keyboard(appointment_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="❌ Отменить запись",
+                    text="✅ Подтверждаю запись",
+                    callback_data=f"appt:confirm:{appointment_id}",
+                ),
+                InlineKeyboardButton(
+                    text="❌ Отменить",
                     callback_data=f"appt:cancel:{appointment_id}",
                 ),
             ],
@@ -30,6 +35,23 @@ def _get_evening_reminder_keyboard(appointment_id: int) -> InlineKeyboardMarkup:
                 InlineKeyboardButton(
                     text="📍 Как добраться",
                     url="https://yandex.ru/maps/-/CDu~v-7x",
+                ),
+            ],
+        ]
+    )
+
+
+def _get_confirmed_2h_keyboard(appointment_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="📍 Как добраться",
+                    url="https://yandex.ru/maps/-/CDu~v-7x",
+                ),
+                InlineKeyboardButton(
+                    text="❌ Отменить",
+                    callback_data=f"appt:cancel:{appointment_id}",
                 ),
             ],
         ]
@@ -105,13 +127,13 @@ async def run_reminder_worker(bot: Bot, platform: str = "telegram"):
                     f"✂️ <b>Услуги:</b> {appt['services']}\n"
                     f"💰 <b>Стоимость:</b> {appt['total_price']} ₽\n"
                     "📍 <b>Адрес:</b> Саратов, ул. имени Е.И. Пугачёва, 110\n\n"
-                    "<i>Если твои планы изменились, пожалуйста, нажми кнопку ниже:</i>"
+                    "👉 <b>Пожалуйста, подтверди свой визит</b> или отмени запись, если твои планы изменились:"
                 )
                 try:
                     await bot.send_message(
                         chat_id=target_user_id,
                         text=text,
-                        reply_markup=_get_evening_reminder_keyboard(appt["id"]),
+                        reply_markup=_get_confirmation_keyboard(appt["id"]),
                         parse_mode="HTML",
                     )
                     mark_reminder_sent(appt["id"], "evening")
@@ -119,7 +141,41 @@ async def run_reminder_worker(bot: Bot, platform: str = "telegram"):
                 except Exception as send_err:
                     logger.warning("Ошибка отправки вечернего напоминания #%s: %s", appt["id"], send_err)
 
-            # 2. 2h express reminder
+            # 2. Morning follow-up reminder (on visit day, >= 09:00, if not confirmed)
+            morning_due = get_due_confirmation_followup_reminders(platform=platform)
+            for appt in morning_due:
+                target_user_id = _resolve_platform_user_id(appt, platform)
+                if not target_user_id:
+                    mark_reminder_sent(appt["id"], "morning")
+                    continue
+
+                dt = appt["appointment_time"]
+                if isinstance(dt, str):
+                    dt = datetime.datetime.fromisoformat(dt)
+                dt_local = dt.astimezone(SARATOV_TZ) if dt.tzinfo else dt
+                time_str = dt_local.strftime("%H:%M")
+
+                text = (
+                    "⚠️ <b>Подтверждение записи на сегодня</b>\n\n"
+                    f"Ты записан сегодня в <b>{time_str}</b>, но ещё <b>не подтвердил</b> свой визит.\n\n"
+                    f"✂️ <b>Услуги:</b> {appt['services']}\n"
+                    f"💰 <b>Стоимость:</b> {appt['total_price']} ₽\n"
+                    "📍 <b>Адрес:</b> Саратов, ул. имени Е.И. Пугачёва, 110\n\n"
+                    "👉 Пожалуйста, подтверди запись, чтобы мастер держал за тобой время, или отмени её, если не сможешь прийти:"
+                )
+                try:
+                    await bot.send_message(
+                        chat_id=target_user_id,
+                        text=text,
+                        reply_markup=_get_confirmation_keyboard(appt["id"]),
+                        parse_mode="HTML",
+                    )
+                    mark_reminder_sent(appt["id"], "morning")
+                    logger.info("Отправлено утреннее напоминание о подтверждении клиенту #%s (appt #%s)", target_user_id, appt["id"])
+                except Exception as send_err:
+                    logger.warning("Ошибка отправки утреннего напоминания #%s: %s", appt["id"], send_err)
+
+            # 3. 2h express reminder
             two_h_due = get_due_2h_reminders(platform=platform)
             for appt in two_h_due:
                 target_user_id = _resolve_platform_user_id(appt, platform)
@@ -133,25 +189,40 @@ async def run_reminder_worker(bot: Bot, platform: str = "telegram"):
                 dt_local = dt.astimezone(SARATOV_TZ) if dt.tzinfo else dt
                 time_str = dt_local.strftime("%H:%M")
 
-                text = (
-                    "⏰ <b>До твоей записи осталось 2 часа!</b>\n\n"
-                    f"Ждём тебя сегодня в <b>{time_str}</b>.\n"
-                    f"✂️ <b>Услуги:</b> {appt['services']}\n"
-                    "📍 <b>Адрес:</b> Саратов, ул. имени Е.И. Пугачёва, 110\n\n"
-                    "<i>До скорой встречи!</i>"
-                )
+                is_confirmed = bool(appt.get("client_confirmed"))
+                if is_confirmed:
+                    text = (
+                        "⏰ <b>До твоей записи осталось 2 часа!</b>\n\n"
+                        f"Ждём тебя сегодня в <b>{time_str}</b>.\n"
+                        f"✂️ <b>Услуги:</b> {appt['services']}\n"
+                        "📍 <b>Адрес:</b> Саратов, ул. имени Е.И. Пугачёва, 110\n\n"
+                        "<i>Твоя запись подтверждена, мастер готов и ждёт тебя! ✂️</i>"
+                    )
+                    reply_markup = _get_confirmed_2h_keyboard(appt["id"])
+                else:
+                    text = (
+                        "⏰ <b>До твоей записи осталось 2 часа!</b>\n\n"
+                        f"Ждём тебя сегодня в <b>{time_str}</b>.\n"
+                        f"✂️ <b>Услуги:</b> {appt['services']}\n"
+                        "📍 <b>Адрес:</b> Саратов, ул. имени Е.И. Пугачёва, 110\n\n"
+                        "⚠️ <b>Внимание: запись всё ещё не подтверждена!</b>\n"
+                        "Пожалуйста, подтверди визит или отмени запись, чтобы мастер не ждал впустую:"
+                    )
+                    reply_markup = _get_confirmation_keyboard(appt["id"])
+
                 try:
                     await bot.send_message(
                         chat_id=target_user_id,
                         text=text,
+                        reply_markup=reply_markup,
                         parse_mode="HTML",
                     )
                     mark_reminder_sent(appt["id"], "2h")
-                    logger.info("Отправлено 2ч напоминание клиенту #%s (appt #%s)", target_user_id, appt["id"])
+                    logger.info("Отправлено 2ч напоминание клиенту #%s (appt #%s, confirmed=%s)", target_user_id, appt["id"], is_confirmed)
                 except Exception as send_err:
                     logger.warning("Ошибка отправки 2ч напоминания #%s: %s", appt["id"], send_err)
 
-            # 3. 2.5 weeks retention reminder
+            # 4. 2.5 weeks retention reminder
             retention_due = get_due_retention_reminders(platform=platform)
             for appt in retention_due:
                 target_user_id = _resolve_platform_user_id(appt, platform)
@@ -176,7 +247,7 @@ async def run_reminder_worker(bot: Bot, platform: str = "telegram"):
                 except Exception as send_err:
                     logger.warning("Ошибка отправки retention напоминания #%s: %s", appt["id"], send_err)
 
-            # 4. Periodic Masters sync every ~10 minutes (10 ticks * 60s)
+            # 5. Periodic Masters sync every ~10 minutes (10 ticks * 60s)
             sync_counter += 1
             if sync_counter >= 10:
                 sync_counter = 0

@@ -9,6 +9,7 @@ from config import ADMIN_IDS, BOOKING_URL
 from services.appointments import (
     SARATOV_TZ,
     cancel_appointment,
+    confirm_appointment_by_client,
     create_or_update_appointment,
 )
 from keyboards.booking import (
@@ -382,6 +383,78 @@ async def handle_sms_code(message: Message):
             )
         except Exception as e:
             logger.error("Failed to notify admin %s: %s", admin_id, e)
+
+
+@router.callback_query(F.data.startswith("appt:confirm:"))
+async def handle_confirm_appointment(callback: CallbackQuery):
+    if not callback.from_user or not callback.data:
+        return
+
+    parts = callback.data.split(":")
+    if len(parts) < 3 or not parts[2].isdigit():
+        await callback.answer("Некорректная запись")
+        return
+
+    appt_id = int(parts[2])
+    success, msg, appt = confirm_appointment_by_client(appt_id)
+
+    if not success:
+        await callback.answer(msg, show_alert=True)
+        return
+
+    dt_str = ""
+    if appt and appt.get("appointment_time"):
+        dt = appt["appointment_time"]
+        if isinstance(dt, str):
+            dt = datetime.datetime.fromisoformat(dt)
+        dt_local = dt.astimezone(SARATOV_TZ) if dt.tzinfo else dt
+        dt_str = dt_local.strftime("%d.%m.%Y в %H:%M")
+
+    try:
+        if callback.message:
+            await callback.message.edit_text(
+                "✅ <b>Запись подтверждена!</b>\n\n"
+                f"Спасибо за подтверждение! Ждём вас <b>{dt_str}</b> ✂️\n"
+                "📍 <b>Адрес:</b> Саратов, ул. имени Е.И. Пугачёва, 110",
+                reply_markup=InlineKeyboardMarkup(
+                    inline_keyboard=[
+                        [
+                            InlineKeyboardButton(
+                                text="📍 Как добраться",
+                                url="https://yandex.ru/maps/-/CDu~v-7x",
+                            ),
+                            InlineKeyboardButton(
+                                text="❌ Отменить запись",
+                                callback_data=f"appt:cancel:{appt_id}",
+                            ),
+                        ]
+                    ]
+                ),
+                parse_mode="HTML",
+            )
+    except TelegramBadRequest:
+        pass
+
+    await callback.answer("Запись успешно подтверждена! Ждём вас.")
+
+    # Notify master
+    if appt:
+        for admin_id in ADMIN_IDS:
+            try:
+                await callback.bot.send_message(
+                    chat_id=admin_id,
+                    text=(
+                        "✅ <b>Клиент подтвердил запись!</b>\n\n"
+                        f"👤 <b>Клиент:</b> {appt.get('client_name') or 'Клиент'}\n"
+                        f"📱 <b>Телефон:</b> {appt.get('phone')}\n"
+                        f"✂️ <b>Услуги:</b> {appt.get('services')}\n"
+                        f"📅 <b>Время:</b> {dt_str}\n"
+                        "Клиент точно придёт к назначенному времени."
+                    ),
+                    parse_mode="HTML",
+                )
+            except Exception as e:
+                logger.error("Failed to notify admin %s: %s", admin_id, e)
 
 
 @router.callback_query(F.data.startswith("appt:cancel:"))

@@ -178,13 +178,18 @@ def init_db() -> None:
                     total_price INTEGER NOT NULL DEFAULT 0,
                     appointment_time TIMESTAMP WITH TIME ZONE NOT NULL,
                     status VARCHAR(32) NOT NULL DEFAULT 'confirmed',
+                    client_confirmed BOOLEAN NOT NULL DEFAULT FALSE,
                     reminder_evening_sent BOOLEAN NOT NULL DEFAULT FALSE,
+                    reminder_morning_sent BOOLEAN NOT NULL DEFAULT FALSE,
                     reminder_2h_sent BOOLEAN NOT NULL DEFAULT FALSE,
                     retention_18d_sent BOOLEAN NOT NULL DEFAULT FALSE,
                     masters_id VARCHAR(64) UNIQUE,
                     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
                     updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
                 );
+
+                ALTER TABLE appointments ADD COLUMN IF NOT EXISTS client_confirmed BOOLEAN NOT NULL DEFAULT FALSE;
+                ALTER TABLE appointments ADD COLUMN IF NOT EXISTS reminder_morning_sent BOOLEAN NOT NULL DEFAULT FALSE;
 
                 CREATE TABLE IF NOT EXISTS masters_session (
                     id SERIAL PRIMARY KEY,
@@ -206,6 +211,7 @@ def init_db() -> None:
                 CREATE INDEX IF NOT EXISTS idx_appointments_time ON appointments(appointment_time);
                 CREATE INDEX IF NOT EXISTS idx_appointments_phone ON appointments(phone);
                 CREATE INDEX IF NOT EXISTS idx_appointments_status ON appointments(status);
+                CREATE INDEX IF NOT EXISTS idx_appointments_client_confirmed ON appointments(client_confirmed);
                 """
             )
         else:
@@ -277,7 +283,9 @@ def init_db() -> None:
                     total_price INTEGER NOT NULL DEFAULT 0,
                     appointment_time TIMESTAMP NOT NULL,
                     status TEXT NOT NULL DEFAULT 'confirmed',
+                    client_confirmed INTEGER NOT NULL DEFAULT 0,
                     reminder_evening_sent INTEGER NOT NULL DEFAULT 0,
+                    reminder_morning_sent INTEGER NOT NULL DEFAULT 0,
                     reminder_2h_sent INTEGER NOT NULL DEFAULT 0,
                     retention_18d_sent INTEGER NOT NULL DEFAULT 0,
                     masters_id TEXT UNIQUE,
@@ -286,6 +294,12 @@ def init_db() -> None:
                 )
                 """
             )
+
+            cursor = conn.raw_conn.execute("PRAGMA table_info(appointments)")
+            app_cols = [row["name"] for row in cursor.fetchall()]
+            for col in ["client_confirmed", "reminder_morning_sent"]:
+                if col not in app_cols:
+                    conn.raw_conn.execute(f"ALTER TABLE appointments ADD COLUMN {col} INTEGER NOT NULL DEFAULT 0")
 
             conn.execute(
                 """
@@ -311,3 +325,4 @@ def init_db() -> None:
             conn.execute("CREATE INDEX IF NOT EXISTS idx_appointments_time ON appointments(appointment_time)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_appointments_phone ON appointments(phone)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_appointments_status ON appointments(status)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_appointments_client_confirmed ON appointments(client_confirmed)")
