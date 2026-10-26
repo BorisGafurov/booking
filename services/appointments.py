@@ -63,7 +63,7 @@ def create_or_update_appointment(
         # Check existing by masters_id if provided
         if masters_id:
             existing = conn.execute(
-                "SELECT id, client_name, phone FROM appointments WHERE masters_id = %s", (masters_id,)
+                "SELECT id, client_name, phone, services, total_price FROM appointments WHERE masters_id = %s", (masters_id,)
             ).fetchone()
             if existing:
                 eff_name = client_name or ""
@@ -72,6 +72,13 @@ def create_or_update_appointment(
                 eff_phone = norm_phone
                 if norm_phone == "+79173225155" and existing["phone"] and existing["phone"] != "+79173225155":
                     eff_phone = existing["phone"]
+
+                eff_price = total_price
+                eff_services = services
+                if existing["total_price"] is not None and existing["total_price"] > 0:
+                    if platform == "masters" or not total_price:
+                        eff_price = existing["total_price"]
+                        eff_services = existing["services"] or services
 
                 conn.execute(
                     """
@@ -94,8 +101,8 @@ def create_or_update_appointment(
                         platform_user_id,
                         eff_name,
                         eff_phone,
-                        services,
-                        total_price,
+                        eff_services,
+                        eff_price,
                         appointment_time if conn.is_pg else appointment_time.strftime("%Y-%m-%d %H:%M:%S"),
                         existing["id"],
                     ),
@@ -347,6 +354,30 @@ def reschedule_appointment(
         logger.error("Error executing Masters reschedule sync for appt %s: %s", appointment_id, e)
 
     return True, "Запись успешно перенесена!", appt
+
+
+def update_appointment_price_and_service(
+    appt_id: int,
+    total_price: int,
+    services: str | None = None,
+) -> tuple[bool, str, dict | None]:
+    with get_connection() as conn:
+        appt = conn.execute("SELECT * FROM appointments WHERE id = %s", (appt_id,)).fetchone()
+        if not appt:
+            return False, "Запись не найдена.", None
+
+        eff_service = services.strip() if services and services.strip() else (appt["services"] or "Стрижка")
+        conn.execute(
+            """
+            UPDATE appointments
+            SET total_price = %s, services = %s, updated_at = CURRENT_TIMESTAMP
+            WHERE id = %s
+            """,
+            (int(total_price), eff_service, appt_id),
+        )
+        conn.commit()
+        updated_row = conn.execute("SELECT * FROM appointments WHERE id = %s", (appt_id,)).fetchone()
+        return True, f"Стоимость записи #{appt_id} обновлена: {total_price} ₽ ({eff_service})", dict(updated_row) if updated_row else None
 
 
 def get_appointments_counts() -> dict[str, int]:

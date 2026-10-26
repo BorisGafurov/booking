@@ -677,8 +677,30 @@ class TestBookingBot(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(appt_after["client_name"], "Дмитрий Смирнов")
         self.assertEqual(appt_after["phone"], "+79270001122")
 
+        # 5. Price update and preservation
+        from services.appointments import update_appointment_price_and_service
+        ok_p, p_msg, p_appt = update_appointment_price_and_service(appt_id, 700, "Оформление бороды")
+        self.assertTrue(ok_p)
+        self.assertEqual(p_appt["total_price"], 700)
+        self.assertEqual(p_appt["services"], "Оформление бороды")
+
+        # Background masters sync must NOT overwrite this custom price back to 2300
+        create_or_update_appointment(
+            masters_id="mst_test_import_99",
+            appointment_time=now + datetime.timedelta(days=1),
+            services="Стрижка (МУЖСКАЯ)",
+            total_price=2300,
+            client_name="Клиент (Masters)",
+            phone="+79173225155",
+            platform="masters",
+        )
+        appt_final = get_appointment(appt_id)
+        self.assertEqual(appt_final["total_price"], 700)
+        self.assertEqual(appt_final["services"], "Оформление бороды")
+
 
 if __name__ == "__main__":
     unittest.main()
+
 
 

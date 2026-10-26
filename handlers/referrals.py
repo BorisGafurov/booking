@@ -26,6 +26,7 @@ from services.appointments import (
     get_upcoming_days_schedule,
     reschedule_appointment,
     set_master_day_schedule,
+    update_appointment_price_and_service,
 )
 from services.client_import import (
     get_clients_page,
@@ -67,6 +68,7 @@ admin_broadcast_drafts: dict[int, dict] = {}
 admin_create_drafts: dict[int, dict] = {}
 admin_resched_drafts: dict[int, dict] = {}
 admin_edit_client_drafts: dict[int, dict] = {}
+admin_edit_price_drafts: dict[int, dict] = {}
 admin_clients_state: dict[int, dict] = {}
 
 RU_MONTHS = ["", "янв", "фев", "мар", "апр", "май", "июн", "июл", "авг", "сен", "окт", "ноя", "дек"]
@@ -194,15 +196,17 @@ def admin_appt_card_keyboard(appt: dict, current_filter: str, offset: int) -> In
                 InlineKeyboardButton(text="✅ Подтвердить запись", callback_data=f"admin:confirm_appt:{appt_id}:{current_filter}:{offset}")
             ])
         rows.append([
-            InlineKeyboardButton(text="✏️ Указать имя клиента", callback_data=f"admin:edit_client:{appt_id}:{current_filter}:{offset}"),
-            InlineKeyboardButton(text="🗓 Перенести", callback_data=f"admin:resched_start:{appt_id}:{current_filter}:{offset}"),
+            InlineKeyboardButton(text="✏️ Указать имя", callback_data=f"admin:edit_client:{appt_id}:{current_filter}:{offset}"),
+            InlineKeyboardButton(text="💰 Изменить цену / услугу", callback_data=f"admin:edit_price:{appt_id}:{current_filter}:{offset}"),
         ])
         rows.append([
+            InlineKeyboardButton(text="🗓 Перенести", callback_data=f"admin:resched_start:{appt_id}:{current_filter}:{offset}"),
             InlineKeyboardButton(text="❌ Отменить запись", callback_data=f"admin:cancel_appt:{appt_id}:{current_filter}:{offset}"),
         ])
     else:
         rows.append([
-            InlineKeyboardButton(text="✏️ Указать имя клиента", callback_data=f"admin:edit_client:{appt_id}:{current_filter}:{offset}"),
+            InlineKeyboardButton(text="✏️ Указать имя", callback_data=f"admin:edit_client:{appt_id}:{current_filter}:{offset}"),
+            InlineKeyboardButton(text="💰 Изменить цену / услугу", callback_data=f"admin:edit_price:{appt_id}:{current_filter}:{offset}"),
         ])
 
     rows.append([
@@ -1420,6 +1424,103 @@ async def admin_edit_client_start(callback: CallbackQuery):
     await callback.answer()
 
 
+@router.callback_query(F.data.startswith("admin:edit_price:"))
+async def admin_edit_price_start(callback: CallbackQuery):
+    if not callback.from_user or not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа.", show_alert=True)
+        return
+
+    parts = callback.data.split(":")
+    appt_id = int(parts[2])
+    current_filter = parts[3] if len(parts) > 3 else "today"
+    offset = int(parts[4]) if len(parts) > 4 and parts[4].isdigit() else 0
+
+    appt = get_appointment(appt_id)
+    if not appt:
+        await callback.answer("Запись не найдена", show_alert=True)
+        return
+
+    cur_svc = appt.get("services") or "—"
+    cur_price = appt.get("total_price") or 0
+    cur_client = appt.get("client_name") or "Клиент"
+
+    text = (
+        f"💰 <b>Редактирование услуги и стоимости для записи #{appt_id}</b>\n\n"
+        f"👤 Клиент: <b>{html.escape(cur_client)}</b>\n"
+        f"✂️ Текущая услуга: <b>{html.escape(cur_svc)}</b>\n"
+        f"💵 Текущая стоимость: <b>{cur_price} ₽</b>\n\n"
+        "👉 <b>Выберите реальную услугу с ценой в 1 клик или введите любую свою цену:</b>"
+    )
+
+    rows = [
+        [InlineKeyboardButton(text="💈 Стрижка (МУЖСКАЯ) — 2 300 ₽", callback_data=f"admin:set_price:{appt_id}:2300:hair:{current_filter}:{offset}")],
+        [InlineKeyboardButton(text="🧔 Оформление бороды — 700 ₽", callback_data=f"admin:set_price:{appt_id}:700:beard:{current_filter}:{offset}")],
+        [InlineKeyboardButton(text="💈+🧔 Стрижка + Борода — 3 000 ₽", callback_data=f"admin:set_price:{appt_id}:3000:combo:{current_filter}:{offset}")],
+        [InlineKeyboardButton(text="✏️ Ввести свою цену (например 1500)", callback_data=f"admin:set_custom_price:{appt_id}:{current_filter}:{offset}")],
+        [InlineKeyboardButton(text="⬅️ Назад к карточке", callback_data=f"admin:appt:{appt_id}:{current_filter}:{offset}")],
+    ]
+
+    if callback.message:
+        await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=rows), parse_mode="HTML")
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admin:set_price:"))
+async def admin_set_price_quick(callback: CallbackQuery):
+    if not callback.from_user or not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа.", show_alert=True)
+        return
+
+    parts = callback.data.split(":")
+    appt_id = int(parts[2])
+    price = int(parts[3])
+    svc_code = parts[4]
+    current_filter = parts[5] if len(parts) > 5 else "today"
+    offset = int(parts[6]) if len(parts) > 6 and parts[6].isdigit() else 0
+
+    svc_map = {
+        "hair": "Стрижка (МУЖСКАЯ)",
+        "beard": "Оформление бороды",
+        "combo": "Стрижка + Борода",
+    }
+    svc_name = svc_map.get(svc_code, "Стрижка")
+
+    ok, msg, appt = update_appointment_price_and_service(appt_id, price, svc_name)
+    await callback.answer(f"Стоимость обновлена: {price} ₽", show_alert=False)
+
+    if callback.message:
+        await admin_appt_detail(callback)
+
+
+@router.callback_query(F.data.startswith("admin:set_custom_price:"))
+async def admin_set_custom_price_start(callback: CallbackQuery):
+    if not callback.from_user or not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа.", show_alert=True)
+        return
+
+    parts = callback.data.split(":")
+    appt_id = int(parts[2])
+    current_filter = parts[3] if len(parts) > 3 else "today"
+    offset = int(parts[4]) if len(parts) > 4 and parts[4].isdigit() else 0
+
+    admin_edit_price_drafts[callback.from_user.id] = {
+        "appt_id": appt_id,
+        "current_filter": current_filter,
+        "offset": offset,
+    }
+
+    text = (
+        f"✏️ <b>Ввод своей стоимости для записи #{appt_id}</b>\n\n"
+        "Отправьте в чат новую стоимость в рублях (например: <code>1500</code> или <code>2000</code>):"
+    )
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="⬅️ Отмена", callback_data=f"admin:edit_price:{appt_id}:{current_filter}:{offset}")]]
+    )
+    if callback.message:
+        await callback.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+    await callback.answer()
+
+
 @router.message(F.document)
 async def admin_document_handler(message: Message):
     if not message.from_user or not is_admin(message.from_user.id):
@@ -1555,6 +1656,35 @@ async def handle_admin_text_inputs(message: Message):
                     [InlineKeyboardButton(text="⬅️ К списку записей", callback_data=f"admin:appts:{current_filter}:{offset}")],
                 ]
             ),
+            parse_mode="HTML",
+        )
+        return
+
+    # 3b. Custom price edit on appointment
+    if user_id in admin_edit_price_drafts:
+        p_draft = admin_edit_price_drafts.pop(user_id)
+        appt_id = p_draft["appt_id"]
+        current_filter = p_draft["current_filter"]
+        offset = p_draft["offset"]
+
+        price_digits = re.sub(r"\D", "", raw_text)
+        if not price_digits or int(price_digits) <= 0:
+            await message.answer("⚠️ Пожалуйста, введите корректную сумму в рублях (например: <code>1500</code>):", parse_mode="HTML")
+            admin_edit_price_drafts[user_id] = p_draft
+            return
+
+        new_price = int(price_digits)
+        ok, res_msg, updated_appt = update_appointment_price_and_service(appt_id, new_price)
+
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="📋 К карточке записи", callback_data=f"admin:appt:{appt_id}:{current_filter}:{offset}")],
+                [InlineKeyboardButton(text="⬅️ К календарю записей", callback_data=f"admin:appts:{current_filter}:{offset}")],
+            ]
+        )
+        await message.answer(
+            f"✅ <b>Стоимость записи #{appt_id} успешно изменена на {new_price} ₽!</b>",
+            reply_markup=kb,
             parse_mode="HTML",
         )
         return

@@ -677,7 +677,10 @@ def sync_schedule_from_masters_link() -> tuple[bool, int, str]:
                 if not existing:
                     # Determine service name and price based on duration
                     duration_slots = len(group)
-                    if duration_slots >= 4:
+                    if duration_slots <= 2:
+                        svc_name = "Оформление бороды"
+                        price = 700
+                    elif duration_slots >= 4:
                         svc_name = "Стрижка + Борода"
                         price = 3000
                     else:
