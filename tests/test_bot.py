@@ -570,21 +570,26 @@ class TestBookingBot(unittest.IsolatedAsyncioTestCase):
             set_master_day_schedule,
         )
 
-        test_day = "2026-11-15"
-        # 1. Default schedule
-        sched = get_master_day_schedule(test_day)
-        self.assertTrue(sched["is_working"])
-        self.assertEqual(sched["start_time"], "10:00")
-        self.assertEqual(sched["end_time"], "20:00")
+        tuesday_day = "2026-11-17"  # Tuesday (working in Masters)
+        sunday_day = "2026-11-15"   # Sunday (day off)
 
-        # 2. Make day off (weekend)
-        set_master_day_schedule(test_day, is_working=False)
-        sched2 = get_master_day_schedule(test_day)
+        # 1. Default schedule from Masters: Tuesday is working, Sunday is day off
+        tue_sched = get_master_day_schedule(tuesday_day)
+        self.assertTrue(tue_sched["is_working"])
+        self.assertEqual(tue_sched["start_time"], "10:00")
+        self.assertEqual(tue_sched["end_time"], "19:00")
+
+        sun_sched = get_master_day_schedule(sunday_day)
+        self.assertFalse(sun_sched["is_working"])
+
+        # 2. Make Tuesday a day off (override in DB)
+        set_master_day_schedule(tuesday_day, is_working=False)
+        sched2 = get_master_day_schedule(tuesday_day)
         self.assertFalse(sched2["is_working"])
 
         # 3. Make working and adjust hours
-        set_master_day_schedule(test_day, is_working=True, start_time="09:00", end_time="21:00")
-        adj = adjust_master_day_hours(test_day, start_delta_hours=-1, end_delta_hours=1)
+        set_master_day_schedule(tuesday_day, is_working=True, start_time="09:00", end_time="21:00")
+        adj = adjust_master_day_hours(tuesday_day, start_delta_hours=-1, end_delta_hours=1)
         self.assertEqual(adj["start_time"], "08:00")
         self.assertEqual(adj["end_time"], "22:00")
 

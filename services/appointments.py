@@ -342,6 +342,73 @@ def reschedule_appointment(
     return True, "Запись успешно перенесена!", appt
 
 
+def get_appointments_counts() -> dict[str, int]:
+    """
+    Returns appointment counts for filter badges: today, tomorrow, pending, all.
+    """
+    now = get_current_saratov_time()
+    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    today_end = today_start + datetime.timedelta(days=1)
+    tomorrow_start = today_end
+    tomorrow_end = tomorrow_start + datetime.timedelta(days=1)
+
+    counts = {"today": 0, "tomorrow": 0, "pending": 0, "all": 0}
+
+    with get_connection() as conn:
+        t_start = today_start if conn.is_pg else today_start.strftime("%Y-%m-%d %H:%M:%S")
+        t_end = today_end if conn.is_pg else today_end.strftime("%Y-%m-%d %H:%M:%S")
+        tm_start = tomorrow_start if conn.is_pg else tomorrow_start.strftime("%Y-%m-%d %H:%M:%S")
+        tm_end = tomorrow_end if conn.is_pg else tomorrow_end.strftime("%Y-%m-%d %H:%M:%S")
+        val_false = False if conn.is_pg else 0
+
+        # today
+        row = conn.execute(
+            """
+            SELECT COUNT(*) AS c FROM appointments
+            WHERE (status IS NULL OR status != 'cancelled')
+              AND appointment_time >= %s AND appointment_time < %s
+            """,
+            (t_start, t_end),
+        ).fetchone()
+        counts["today"] = row["c"] if row else 0
+
+        # tomorrow
+        row = conn.execute(
+            """
+            SELECT COUNT(*) AS c FROM appointments
+            WHERE (status IS NULL OR status != 'cancelled')
+              AND appointment_time >= %s AND appointment_time < %s
+            """,
+            (tm_start, tm_end),
+        ).fetchone()
+        counts["tomorrow"] = row["c"] if row else 0
+
+        # pending confirmation
+        row = conn.execute(
+            """
+            SELECT COUNT(*) AS c FROM appointments
+            WHERE (status IS NULL OR status != 'cancelled')
+              AND (client_confirmed IS NULL OR client_confirmed = %s)
+              AND appointment_time >= %s
+            """,
+            (val_false, t_start),
+        ).fetchone()
+        counts["pending"] = row["c"] if row else 0
+
+        # all upcoming
+        row = conn.execute(
+            """
+            SELECT COUNT(*) AS c FROM appointments
+            WHERE (status IS NULL OR status != 'cancelled')
+              AND appointment_time >= %s
+            """,
+            (t_start,),
+        ).fetchone()
+        counts["all"] = row["c"] if row else 0
+
+    return counts
+
+
 def get_master_appointments(
     date_filter: str | None = None,
     limit: int = 15,
@@ -357,7 +424,7 @@ def get_master_appointments(
     tomorrow_start = today_end
     tomorrow_end = tomorrow_start + datetime.timedelta(days=1)
 
-    where_clauses = ["status != 'cancelled'"]
+    where_clauses = ["(status IS NULL OR status != 'cancelled')"]
     params: list[Any] = []
 
     if date_filter == "today":
@@ -367,8 +434,8 @@ def get_master_appointments(
         where_clauses.append("appointment_time >= %s AND appointment_time < %s")
         params.extend([tomorrow_start, tomorrow_end])
     elif date_filter == "pending":
-        where_clauses.append("client_confirmed = %s AND status = 'confirmed'")
-        params.append(False)
+        where_clauses.append("(client_confirmed IS NULL OR client_confirmed = %s) AND appointment_time >= %s")
+        params.extend([False, today_start])
     elif date_filter and date_filter not in ("all", "future"):
         try:
             d = datetime.date.fromisoformat(date_filter)
@@ -452,8 +519,14 @@ def create_manual_appointment(
 
 def get_master_day_schedule(day_key: str) -> dict:
     """
-    Returns schedule for day_key (YYYY-MM-DD). Defaults to working 10:00 - 20:00.
+    Returns schedule for day_key (YYYY-MM-DD).
+    1. Checks DB master_schedule table for master overrides.
+    2. Checks Masters CRM live schedule (via services.masters.get_schedule).
+    3. Falls back to Boris Gafurov's standard schedule:
+       Tuesdays (1) and Saturdays (5) are working days (10:00 - 19:00).
+       All other days (Mon, Wed, Thu, Fri, Sun) are non-working days / days off.
     """
+    # 1. Custom DB override
     with get_connection() as conn:
         row = conn.execute("SELECT * FROM master_schedule WHERE day_key = %s", (day_key,)).fetchone()
         if row:
@@ -465,13 +538,51 @@ def get_master_day_schedule(day_key: str) -> dict:
                 "end_time": r["end_time"],
                 "note": r.get("note"),
             }
-        return {
-            "day_key": day_key,
-            "is_working": True,
-            "start_time": "10:00",
-            "end_time": "20:00",
-            "note": None,
-        }
+
+    # 2. Check Masters CRM schedule
+    try:
+        from services.masters import get_schedule
+        masters_map = get_schedule(["hair"])
+        if masters_map and day_key in masters_map:
+            slots = masters_map[day_key].get("slots", [])
+            start_time = "10:00"
+            end_time = "19:00"
+            if slots:
+                start_time = slots[0].get("time", "10:00")
+                end_time = slots[-1].get("time", "19:00")
+            return {
+                "day_key": day_key,
+                "is_working": True,
+                "start_time": start_time,
+                "end_time": end_time,
+                "note": None,
+            }
+        elif masters_map:
+            # Masters schedule was successfully fetched and this day has no slots -> day off in Masters
+            return {
+                "day_key": day_key,
+                "is_working": False,
+                "start_time": "10:00",
+                "end_time": "19:00",
+                "note": "Выходной в Masters",
+            }
+    except Exception as e:
+        logger.debug("Masters schedule check skipped for %s: %s", day_key, e)
+
+    # 3. Standard fallback: Tuesdays (1) and Saturdays (5) are working (10:00 - 19:00)
+    try:
+        d = datetime.date.fromisoformat(day_key)
+        is_working_day = d.weekday() in (1, 5)
+    except Exception:
+        is_working_day = False
+
+    return {
+        "day_key": day_key,
+        "is_working": is_working_day,
+        "start_time": "10:00",
+        "end_time": "19:00",
+        "note": None if is_working_day else "Выходной день",
+    }
 
 
 def set_master_day_schedule(

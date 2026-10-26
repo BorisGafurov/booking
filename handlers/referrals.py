@@ -18,6 +18,7 @@ from services.appointments import (
     confirm_appointment_by_client,
     create_manual_appointment,
     get_appointment,
+    get_appointments_counts,
     get_current_saratov_time,
     get_master_appointments,
     get_master_day_schedule,
@@ -90,7 +91,7 @@ def format_dt(val) -> str:
 def admin_menu_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="📋 Календарь записей", callback_data="admin:appts:today:0")],
+            [InlineKeyboardButton(text="📋 Календарь записей", callback_data="admin:appts:all:0")],
             [InlineKeyboardButton(text="➕ Новая запись мастера", callback_data="admin:create:start")],
             [InlineKeyboardButton(text="🕒 Рабочий график", callback_data="admin:sched:0")],
             [InlineKeyboardButton(text="⏳ Ожидают подтверждения", callback_data="admin:pending:0")],
@@ -101,14 +102,26 @@ def admin_menu_keyboard() -> InlineKeyboardMarkup:
     )
 
 
-def admin_appts_keyboard(appts: list[dict], current_filter: str, offset: int, total: int) -> InlineKeyboardMarkup:
+def admin_appts_keyboard(
+    appts: list[dict],
+    current_filter: str,
+    offset: int,
+    total: int,
+    counts: dict[str, int] | None = None,
+) -> InlineKeyboardMarkup:
     rows = []
 
+    if counts is None:
+        try:
+            counts = get_appointments_counts()
+        except Exception:
+            counts = {"today": 0, "tomorrow": 0, "pending": 0, "all": total}
+
     filters = [
-        ("today", "Сегодня"),
-        ("tomorrow", "Завтра"),
-        ("pending", "Ожидающие"),
-        ("all", "Все будущие"),
+        ("today", f"Сегодня ({counts['today']})"),
+        ("tomorrow", f"Завтра ({counts['tomorrow']})"),
+        ("pending", f"Ожидающие ({counts['pending']})"),
+        ("all", f"Все ({counts['all']})"),
     ]
     f_row = []
     for f_key, f_title in filters:
@@ -347,9 +360,10 @@ async def admin_appts_list(callback: CallbackQuery):
         return
 
     parts = callback.data.split(":")
-    current_filter = parts[2] if len(parts) > 2 else "today"
+    current_filter = parts[2] if len(parts) > 2 else "all"
     offset = int(parts[3]) if len(parts) > 3 and parts[3].isdigit() else 0
 
+    counts = get_appointments_counts()
     appts, total = get_master_appointments(date_filter=current_filter, limit=PAGE_SIZE, offset=offset)
 
     filter_names = {
@@ -370,7 +384,7 @@ async def admin_appts_list(callback: CallbackQuery):
         if callback.message:
             await callback.message.edit_text(
                 text,
-                reply_markup=admin_appts_keyboard(appts, current_filter, offset, total),
+                reply_markup=admin_appts_keyboard(appts, current_filter, offset, total, counts),
             )
     except TelegramBadRequest:
         pass
@@ -1264,8 +1278,20 @@ async def admin_broadcast_send(callback: CallbackQuery):
         await callback.message.edit_text(report, reply_markup=back_kb, parse_mode="HTML")
 
 
+def _has_active_admin_draft(message: Message) -> bool:
+    if not message.from_user:
+        return False
+    uid = message.from_user.id
+    return (
+        uid in pending_master_logins
+        or uid in admin_broadcast_drafts
+        or uid in admin_resched_drafts
+        or uid in admin_create_drafts
+    )
+
+
 # Message dispatcher for text inputs (SMS, Broadcast, Reschedule, Create appointment)
-@router.message(F.text & ~F.text.startswith("/"))
+@router.message(F.text & ~F.text.startswith("/") & _has_active_admin_draft)
 async def handle_admin_text_inputs(message: Message):
     if not message.from_user:
         return
