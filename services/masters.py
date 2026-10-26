@@ -44,6 +44,62 @@ SERVICES = {
 
 DEFAULT_SERVICE_KEYS = ["hair"]
 
+_last_services_fetch_time = 0.0
+_cached_masters_services: list[dict[str, Any]] | None = None
+
+
+def get_service_options_for_creation() -> list[dict[str, Any]]:
+    """
+    Returns actual services from Masters for appointment creation.
+    Defaults to Boris Gafurov's real services on Masters:
+    - Стрижка (МУЖСКАЯ) — 2 300 ₽
+    - Оформление бороды — 700 ₽
+    - Стрижка + Борода — 3 000 ₽
+    """
+    global _last_services_fetch_time, _cached_masters_services
+    now = time.time()
+    if _cached_masters_services and (now - _last_services_fetch_time < 300):
+        return _cached_masters_services
+
+    opts = [
+        {"name": "Стрижка (МУЖСКАЯ)", "price": 2300, "duration_text": "1 ч 15 мин"},
+        {"name": "Оформление бороды", "price": 700, "duration_text": "1 ч"},
+        {"name": "Стрижка + Борода", "price": 3000, "duration_text": "2 ч 15 мин"},
+    ]
+    try:
+        req = urllib.request.Request(
+            f"{BASE_MASTER_URL}/price",
+            headers={"User-Agent": "Mozilla/5.0"},
+        )
+        with urllib.request.urlopen(req, context=_get_ssl_context(), timeout=4) as resp:
+            html = resp.read().decode("utf-8", errors="ignore")
+            pattern = r'<div class="service[^"]*"[^>]*data-id="([^"]+)".*?<div class="name">(.*?)</div>.*?<div class="info">(.*?)</div>'
+            parsed = []
+            for m in re.finditer(pattern, html, re.DOTALL):
+                s_name = m.group(2).strip()
+                info = m.group(3).strip()
+                pm = re.search(r'([\d\s]+)\s*₽', info)
+                price = int(re.sub(r'\D', '', pm.group(1))) if pm else 2300
+                dm = re.search(r'<span>([^<]+(?:час|мин)[^<]*)</span>', info)
+                dur_text = dm.group(1).strip() if dm else ""
+                parsed.append({"name": s_name, "price": price, "duration_text": dur_text})
+            if parsed:
+                opts = parsed
+                hair = next((s for s in parsed if "стрижк" in s["name"].lower()), None)
+                beard = next((s for s in parsed if "бород" in s["name"].lower()), None)
+                if hair and beard:
+                    opts.append({
+                        "name": f"{hair['name']} + {beard['name']}",
+                        "price": hair["price"] + beard["price"],
+                        "duration_text": "2 ч 15 мин",
+                    })
+    except Exception as e:
+        logger.debug("Live services fetch from Masters skipped: %s", e)
+
+    _cached_masters_services = opts
+    _last_services_fetch_time = now
+    return opts
+
 # In-memory storage for user selections and pending bookings
 user_selected_services: dict[int, set[str]] = {}
 user_selected_day: dict[int, str] = {}

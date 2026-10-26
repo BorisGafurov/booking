@@ -63,13 +63,20 @@ def create_or_update_appointment(
         # Check existing by masters_id if provided
         if masters_id:
             existing = conn.execute(
-                "SELECT id FROM appointments WHERE masters_id = %s", (masters_id,)
+                "SELECT id, client_name, phone FROM appointments WHERE masters_id = %s", (masters_id,)
             ).fetchone()
             if existing:
+                eff_name = client_name or ""
+                if eff_name in ("Клиент (Masters)", "Клиент", "") and existing["client_name"] and existing["client_name"] not in ("Клиент (Masters)", "Клиент"):
+                    eff_name = existing["client_name"]
+                eff_phone = norm_phone
+                if norm_phone == "+79173225155" and existing["phone"] and existing["phone"] != "+79173225155":
+                    eff_phone = existing["phone"]
+
                 conn.execute(
                     """
                     UPDATE appointments
-                    SET user_id = %s,
+                    SET user_id = COALESCE(%s, user_id),
                         platform = %s,
                         platform_user_id = %s,
                         client_name = %s,
@@ -85,8 +92,8 @@ def create_or_update_appointment(
                         user_db_id,
                         platform,
                         platform_user_id,
-                        client_name or "",
-                        norm_phone,
+                        eff_name,
+                        eff_phone,
                         services,
                         total_price,
                         appointment_time if conn.is_pg else appointment_time.strftime("%Y-%m-%d %H:%M:%S"),

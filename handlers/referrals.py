@@ -1,6 +1,7 @@
 import asyncio
 import datetime
 import html
+import io
 import logging
 import re
 from zoneinfo import ZoneInfo
@@ -26,6 +27,14 @@ from services.appointments import (
     reschedule_appointment,
     set_master_day_schedule,
 )
+from services.client_import import (
+    get_clients_page,
+    get_clients_stats,
+    import_clients_from_file,
+    import_clients_from_text,
+    update_appointment_client_details,
+)
+from services.masters import get_service_options_for_creation
 from services.masters_sync import (
     confirm_master_login,
     disconnect_masters_session,
@@ -57,6 +66,8 @@ PAGE_SIZE = 8
 admin_broadcast_drafts: dict[int, dict] = {}
 admin_create_drafts: dict[int, dict] = {}
 admin_resched_drafts: dict[int, dict] = {}
+admin_edit_client_drafts: dict[int, dict] = {}
+admin_clients_state: dict[int, dict] = {}
 
 RU_MONTHS = ["", "янв", "фев", "мар", "апр", "май", "июн", "июл", "авг", "сен", "окт", "ноя", "дек"]
 RU_WEEKDAYS = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
@@ -93,6 +104,7 @@ def admin_menu_keyboard() -> InlineKeyboardMarkup:
         inline_keyboard=[
             [InlineKeyboardButton(text="📋 Календарь записей", callback_data="admin:appts:all:0")],
             [InlineKeyboardButton(text="➕ Новая запись мастера", callback_data="admin:create:start")],
+            [InlineKeyboardButton(text="👥 База клиентов", callback_data="admin:clients:0")],
             [InlineKeyboardButton(text="🕒 Рабочий график", callback_data="admin:sched:0")],
             [InlineKeyboardButton(text="⏳ Ожидают подтверждения", callback_data="admin:pending:0")],
             [InlineKeyboardButton(text="💰 Активные бонусы", callback_data="admin:rewards:0")],
@@ -182,8 +194,15 @@ def admin_appt_card_keyboard(appt: dict, current_filter: str, offset: int) -> In
                 InlineKeyboardButton(text="✅ Подтвердить запись", callback_data=f"admin:confirm_appt:{appt_id}:{current_filter}:{offset}")
             ])
         rows.append([
-            InlineKeyboardButton(text="🗓 Перенести запись", callback_data=f"admin:resched_start:{appt_id}:{current_filter}:{offset}"),
-            InlineKeyboardButton(text="❌ Отменить", callback_data=f"admin:cancel_appt:{appt_id}:{current_filter}:{offset}"),
+            InlineKeyboardButton(text="✏️ Указать имя клиента", callback_data=f"admin:edit_client:{appt_id}:{current_filter}:{offset}"),
+            InlineKeyboardButton(text="🗓 Перенести", callback_data=f"admin:resched_start:{appt_id}:{current_filter}:{offset}"),
+        ])
+        rows.append([
+            InlineKeyboardButton(text="❌ Отменить запись", callback_data=f"admin:cancel_appt:{appt_id}:{current_filter}:{offset}"),
+        ])
+    else:
+        rows.append([
+            InlineKeyboardButton(text="✏️ Указать имя клиента", callback_data=f"admin:edit_client:{appt_id}:{current_filter}:{offset}"),
         ])
 
     rows.append([
@@ -684,19 +703,22 @@ async def admin_create_start(callback: CallbackQuery):
         "step": "service",
     }
 
-    rows = [
-        [InlineKeyboardButton(text="Мужская стрижка (1000 ₽)", callback_data="admin:create:svc:Мужская стрижка:1000")],
-        [InlineKeyboardButton(text="Стрижка + Борода (1400 ₽)", callback_data="admin:create:svc:Стрижка + Борода:1400")],
-        [InlineKeyboardButton(text="Стрижка бороды (600 ₽)", callback_data="admin:create:svc:Стрижка бороды:600")],
-        [InlineKeyboardButton(text="Отец + Сын (1800 ₽)", callback_data="admin:create:svc:Отец + Сын:1800")],
-        [InlineKeyboardButton(text="✏️ Другая услуга", callback_data="admin:create:svc:custom")],
-        [InlineKeyboardButton(text="⬅️ Отмена", callback_data="admin:menu")],
-    ]
+    opts = get_service_options_for_creation()
+    rows = []
+    for o in opts:
+        rows.append([
+            InlineKeyboardButton(
+                text=f"{o['name']} ({o['price']} ₽)",
+                callback_data=f"admin:create:svc:{o['name']}:{o['price']}",
+            )
+        ])
+    rows.append([InlineKeyboardButton(text="✏️ Другая услуга / своя цена", callback_data="admin:create:svc:custom")])
+    rows.append([InlineKeyboardButton(text="⬅️ Отмена", callback_data="admin:menu")])
 
     if callback.message:
         await callback.message.edit_text(
             "➕ <b>Создание новой записи мастером</b>\n\n"
-            "<b>Шаг 1 из 4:</b> Выберите услугу или введите другое название:",
+            "<b>Шаг 1 из 4:</b> Выберите услугу из Masters или введите другое название:",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
         )
     await callback.answer()
@@ -724,7 +746,7 @@ async def admin_create_service_chosen(callback: CallbackQuery):
         await callback.answer()
         return
 
-    price = int(parts[4]) if len(parts) > 4 and parts[4].isdigit() else 1000
+    price = int(parts[4]) if len(parts) > 4 and parts[4].isdigit() else 2300
     draft["service"] = svc_name
     draft["price"] = price
     draft["step"] = "day"
@@ -819,8 +841,8 @@ async def admin_create_time_chosen(callback: CallbackQuery):
     draft["time_str"] = time_val
     draft["step"] = "awaiting_client_info"
 
-    curr_price = draft.get("price", 1000)
-    curr_svc = draft.get("service", "Стрижка")
+    curr_price = draft.get("price", 2300)
+    curr_svc = draft.get("service", "Стрижка (МУЖСКАЯ)")
     day_key = draft.get("day_key", "")
 
     if callback.message:
@@ -1278,6 +1300,170 @@ async def admin_broadcast_send(callback: CallbackQuery):
         await callback.message.edit_text(report, reply_markup=back_kb, parse_mode="HTML")
 
 
+@router.callback_query(F.data.startswith("admin:clients:"))
+async def admin_clients_list(callback: CallbackQuery):
+    if not callback.from_user or not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа.", show_alert=True)
+        return
+
+    parts = callback.data.split(":")
+    action = parts[2] if len(parts) > 2 else "0"
+
+    if action == "import":
+        admin_clients_state[callback.from_user.id] = {"action": "awaiting_import"}
+        text = (
+            "📥 <b>Импорт базы клиентов из Masters</b>\n\n"
+            "Вы можете выгрузить базу клиентов из Masters и загрузить в бота:\n"
+            "1. В приложении или на сайте Masters: <b>Клиенты ➔ Экспорт базы (в Excel / CSV)</b>.\n"
+            "2. <b>Отправьте полученный файл (.xlsx или .csv) прямо в этот чат</b> как документ.\n\n"
+            "<i>Либо просто отправьте список клиентов сообщением в чат в формате:\n"
+            "<code>Иван Иванов +79271234567\n"
+            "Алексей 89053214455</code></i>"
+        )
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад к базе", callback_data="admin:clients:0")]]
+        )
+        if callback.message:
+            await callback.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+        await callback.answer()
+        return
+
+    if action == "search":
+        admin_clients_state[callback.from_user.id] = {"action": "awaiting_search"}
+        text = (
+            "🔍 <b>Поиск клиента в базе</b>\n\n"
+            "Отправьте в чат имя или номер телефона клиента для поиска:"
+        )
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад к базе", callback_data="admin:clients:0")]]
+        )
+        if callback.message:
+            await callback.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+        await callback.answer()
+        return
+
+    offset = int(action) if action.isdigit() else 0
+    stats = get_clients_stats()
+    clients, total = get_clients_page(offset=offset, limit=PAGE_SIZE)
+
+    text = (
+        f"👥 <b>База клиентов</b> ({stats['total']} всего, с телефонами: {stats['with_phone']}):\n\n"
+    )
+    if not clients:
+        text += "<i>В базе пока нет сохранённых клиентов.\nНажмите кнопку «📥 Импорт из Masters», чтобы загрузить выгрузку Excel / CSV или список контактов.</i>"
+    else:
+        for c in clients:
+            c_name = f"{c['first_name'] or ''} {c['last_name'] or ''}".strip() or "Без имени"
+            c_phone = c.get("phone") or "—"
+            text += f"• <b>{html.escape(c_name)}</b> — <code>{c_phone}</code>\n"
+
+    rows = []
+    nav_row = []
+    if offset > 0:
+        nav_row.append(InlineKeyboardButton(text="◀️ Назад", callback_data=f"admin:clients:{max(0, offset - PAGE_SIZE)}"))
+    if offset + PAGE_SIZE < total:
+        nav_row.append(InlineKeyboardButton(text="Вперёд ▶️", callback_data=f"admin:clients:{offset + PAGE_SIZE}"))
+    if nav_row:
+        rows.append(nav_row)
+
+    rows.append([
+        InlineKeyboardButton(text="📥 Импорт из Masters (Excel / CSV)", callback_data="admin:clients:import"),
+    ])
+    rows.append([
+        InlineKeyboardButton(text="🔍 Поиск клиента", callback_data="admin:clients:search"),
+        InlineKeyboardButton(text="⬅️ Меню админки", callback_data="admin:menu"),
+    ])
+
+    if callback.message:
+        await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=rows), parse_mode="HTML")
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admin:edit_client:"))
+async def admin_edit_client_start(callback: CallbackQuery):
+    if not callback.from_user or not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа.", show_alert=True)
+        return
+
+    parts = callback.data.split(":")
+    appt_id = int(parts[2])
+    current_filter = parts[3] if len(parts) > 3 else "today"
+    offset = int(parts[4]) if len(parts) > 4 and parts[4].isdigit() else 0
+
+    appt = get_appointment(appt_id)
+    if not appt:
+        await callback.answer("Запись не найдена", show_alert=True)
+        return
+
+    admin_edit_client_drafts[callback.from_user.id] = {
+        "appt_id": appt_id,
+        "current_filter": current_filter,
+        "offset": offset,
+    }
+
+    cur_name = appt.get("client_name") or "Клиент"
+    cur_phone = appt.get("phone") or "—"
+
+    text = (
+        f"✏️ <b>Указание имени клиента для записи #{appt_id}</b>\n\n"
+        f"Текущее имя: <b>{html.escape(cur_name)}</b>\n"
+        f"Текущий телефон: <code>{cur_phone}</code>\n\n"
+        "👉 <b>Отправьте в чат имя (или имя и номер телефона) клиента:</b>\n"
+        "Например: <code>Алексей</code> или <code>Алексей +79271234567</code>\n\n"
+        "<i>Запись мгновенно обновится и свяжется с клиентом.</i>"
+    )
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="⬅️ Отмена", callback_data=f"admin:appt:{appt_id}:{current_filter}:{offset}")]]
+    )
+    if callback.message:
+        await callback.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+    await callback.answer()
+
+
+@router.message(F.document)
+async def admin_document_handler(message: Message):
+    if not message.from_user or not is_admin(message.from_user.id):
+        return
+
+    doc = message.document
+    if not doc:
+        return
+
+    user_id = message.from_user.id
+    fn = doc.file_name or "file.xlsx"
+    if not fn.lower().endswith((".xlsx", ".csv", ".tsv", ".txt")):
+        await message.answer("⚠️ Пожалуйста, отправьте файл выгрузки Masters в формате <code>.xlsx</code> или <code>.csv</code>.")
+        return
+
+    status_msg = await message.answer("⏳ Читаю и обрабатываю файл выгрузки клиентов из Masters...")
+    try:
+        file = await message.bot.get_file(doc.file_id)
+        file_io = io.BytesIO()
+        await message.bot.download_file(file.file_path, file_io)
+        file_bytes = file_io.getvalue()
+
+        added, updated, msg = import_clients_from_file(fn, file_bytes)
+        admin_clients_state.pop(user_id, None)
+
+        await status_msg.edit_text(
+            f"✅ <b>Импорт клиентов завершён!</b>\n\n"
+            f"• Добавлено новых клиентов: <b>{added}</b>\n"
+            f"• Обновлено данных: <b>{updated}</b>\n"
+            f"• {msg}\n\n"
+            "Все клиенты успешно сохранены в базу данных бота.",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [InlineKeyboardButton(text="👥 Открыть базу клиентов", callback_data="admin:clients:0")],
+                    [InlineKeyboardButton(text="📋 Календарь записей", callback_data="admin:appts:all:0")],
+                ]
+            ),
+            parse_mode="HTML",
+        )
+    except Exception as e:
+        logger.error("Error importing clients from document: %s", e)
+        await status_msg.edit_text(f"❌ Ошибка при чтении файла: {e}")
+
+
 def _has_active_admin_draft(message: Message) -> bool:
     if not message.from_user:
         return False
@@ -1287,6 +1473,8 @@ def _has_active_admin_draft(message: Message) -> bool:
         or uid in admin_broadcast_drafts
         or uid in admin_resched_drafts
         or uid in admin_create_drafts
+        or uid in admin_edit_client_drafts
+        or uid in admin_clients_state
     )
 
 
@@ -1335,7 +1523,84 @@ async def handle_admin_text_inputs(message: Message):
     if not is_admin(user_id):
         return
 
-    # 3. Broadcast text
+    # 3. Client name edit on appointment
+    if user_id in admin_edit_client_drafts:
+        edit_draft = admin_edit_client_drafts.pop(user_id)
+        appt_id = edit_draft["appt_id"]
+        current_filter = edit_draft["current_filter"]
+        offset = edit_draft["offset"]
+
+        phone_match = re.search(r"(\+?[78][\s\-\(]*\d{3}[\s\-\)]*\d{3}[\s\-]*\d{2}[\s\-]*\d{2}|\b9\d{9}\b|\b\d{10,11}\b)", raw_text)
+        client_phone = None
+        if phone_match:
+            client_phone = phone_match.group(1)
+            client_name = (raw_text[:phone_match.start()] + " " + raw_text[phone_match.end():]).strip(" :;,-")
+            client_name = re.sub(r"\s+", " ", client_name).strip()
+        else:
+            client_name = raw_text.strip()
+
+        if not client_name:
+            client_name = "Клиент"
+
+        ok, msg = update_appointment_client_details(appt_id, client_name, client_phone)
+        appt = get_appointment(appt_id)
+
+        await message.answer(
+            f"✅ <b>Имя клиента обновлено!</b>\n\n"
+            f"👤 Клиент: <b>{html.escape(client_name)}</b>\n"
+            f"📱 Телефон: <code>{appt.get('phone', '—')}</code>",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [InlineKeyboardButton(text="📋 К карточке записи", callback_data=f"admin:appt:{appt_id}:{current_filter}:{offset}")],
+                    [InlineKeyboardButton(text="⬅️ К списку записей", callback_data=f"admin:appts:{current_filter}:{offset}")],
+                ]
+            ),
+            parse_mode="HTML",
+        )
+        return
+
+    # 4. Clients search / import text
+    c_state = admin_clients_state.get(user_id)
+    if c_state:
+        action = c_state.get("action")
+        if action == "awaiting_search":
+            admin_clients_state.pop(user_id, None)
+            clients, total = get_clients_page(offset=0, limit=PAGE_SIZE, search=raw_text)
+            text = f"🔍 <b>Результаты поиска «{html.escape(raw_text)}»</b> (найдено: {total}):\n\n"
+            if not clients:
+                text += "<i>Клиенты не найдены.</i>"
+            else:
+                for c in clients:
+                    c_name = f"{c['first_name'] or ''} {c['last_name'] or ''}".strip() or "Без имени"
+                    text += f"• <b>{html.escape(c_name)}</b> — <code>{c.get('phone', '—')}</code>\n"
+            kb = InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [InlineKeyboardButton(text="🔍 Новый поиск", callback_data="admin:clients:search")],
+                    [InlineKeyboardButton(text="👥 Вся база", callback_data="admin:clients:0")],
+                ]
+            )
+            await message.answer(text, reply_markup=kb, parse_mode="HTML")
+            return
+
+        if action == "awaiting_import":
+            admin_clients_state.pop(user_id, None)
+            added, updated, msg = import_clients_from_text(raw_text)
+            await message.answer(
+                f"✅ <b>Импорт клиентов завершён!</b>\n\n"
+                f"• Добавлено новых клиентов: <b>{added}</b>\n"
+                f"• Обновлено существующих: <b>{updated}</b>\n"
+                f"• {msg}",
+                reply_markup=InlineKeyboardMarkup(
+                    inline_keyboard=[
+                        [InlineKeyboardButton(text="👥 Открыть базу клиентов", callback_data="admin:clients:0")],
+                        [InlineKeyboardButton(text="⬅️ Меню админки", callback_data="admin:menu")],
+                    ]
+                ),
+                parse_mode="HTML",
+            )
+            return
+
+    # 5. Broadcast text
     if admin_broadcast_drafts.get(user_id, {}).get("step") == "awaiting_text":
         recipients = get_broadcast_recipients("telegram")
         count = len(recipients)
@@ -1361,7 +1626,7 @@ async def handle_admin_text_inputs(message: Message):
         await message.answer(preview, reply_markup=kb, parse_mode="HTML")
         return
 
-    # 4. Reschedule custom time
+    # 6. Reschedule custom time
     if admin_resched_drafts.get(user_id, {}).get("step") == "awaiting_custom_time":
         draft = admin_resched_drafts.pop(user_id)
         # Parse time string e.g. "08:30" or "8 30"
@@ -1406,14 +1671,14 @@ async def handle_admin_text_inputs(message: Message):
         )
         return
 
-    # 5. Create appointment steps
+    # 7. Create appointment steps
     create_draft = admin_create_drafts.get(user_id)
     if create_draft:
         step = create_draft.get("step")
 
         if step == "awaiting_custom_service":
             create_draft["service"] = raw_text
-            create_draft["price"] = 1000
+            create_draft["price"] = 2300
             create_draft["step"] = "day"
             now = get_current_saratov_time()
             rows = []
@@ -1452,7 +1717,7 @@ async def handle_admin_text_inputs(message: Message):
             tokens = raw_text.split()
             phone = ""
             name = "Клиент"
-            custom_price = create_draft.get("price", 1000)
+            custom_price = create_draft.get("price", 2300)
 
             for token in tokens:
                 digits = re.sub(r"\D", "", token)
