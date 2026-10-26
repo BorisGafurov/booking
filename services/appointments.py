@@ -406,6 +406,32 @@ def get_appointments_counts() -> dict[str, int]:
         ).fetchone()
         counts["all"] = row["c"] if row else 0
 
+        if counts["all"] == 0:
+            try:
+                from services.masters_sync import sync_masters_appointments
+                sync_masters_appointments()
+                r_tm = conn.execute(
+                    """
+                    SELECT COUNT(*) AS c FROM appointments
+                    WHERE (status IS NULL OR status != 'cancelled')
+                      AND appointment_time >= %s AND appointment_time < %s
+                    """,
+                    (tm_start, tm_end),
+                ).fetchone()
+                counts["tomorrow"] = r_tm["c"] if r_tm else 0
+
+                r_all = conn.execute(
+                    """
+                    SELECT COUNT(*) AS c FROM appointments
+                    WHERE (status IS NULL OR status != 'cancelled')
+                      AND appointment_time >= %s
+                    """,
+                    (t_start,),
+                ).fetchone()
+                counts["all"] = r_all["c"] if r_all else 0
+            except Exception as e:
+                logger.debug("Auto-sync inside get_appointments_counts: %s", e)
+
     return counts
 
 
@@ -464,7 +490,17 @@ def get_master_appointments(
                 exec_params.append(p)
 
         count_sql = f"SELECT COUNT(*) AS total FROM appointments WHERE {where_sql}"
-        total = conn.execute(count_sql, tuple(exec_params)).fetchone()["total"]
+        row = conn.execute(count_sql, tuple(exec_params)).fetchone()
+        total = row["total"] if row else 0
+
+        if total == 0 and date_filter in ("tomorrow", "all"):
+            try:
+                from services.masters_sync import sync_masters_appointments
+                sync_masters_appointments()
+                row = conn.execute(count_sql, tuple(exec_params)).fetchone()
+                total = row["total"] if row else 0
+            except Exception as e:
+                logger.debug("Auto-sync inside get_master_appointments: %s", e)
 
         list_sql = f"""
             SELECT * FROM appointments
@@ -548,8 +584,15 @@ def get_master_day_schedule(day_key: str) -> dict:
             start_time = "10:00"
             end_time = "19:00"
             if slots:
-                start_time = slots[0].get("time", "10:00")
-                end_time = slots[-1].get("time", "19:00")
+                first_s = slots[0].get("time", "10:00")
+                start_time = min("10:00", first_s)
+                last_s = slots[-1].get("time", "17:30")
+                try:
+                    lh, lm = [int(p) for p in last_s.split(":")[:2]]
+                    end_dt = datetime.datetime(2000, 1, 1, lh, lm) + datetime.timedelta(minutes=90)
+                    end_time = end_dt.strftime("%H:%M")
+                except Exception:
+                    end_time = "19:00"
             return {
                 "day_key": day_key,
                 "is_working": True,

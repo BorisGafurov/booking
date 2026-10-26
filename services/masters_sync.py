@@ -600,28 +600,171 @@ def create_masters_appointment(
     return True, "Запись создана в боте и поставлена в очередь синхронизации Masters.", None
 
 
+def sync_schedule_from_masters_link() -> tuple[bool, int, str]:
+    """
+    Fetches the live public schedule from mst.link/boris_gafurov/price,
+    detects booked appointment slots (gaps between available slots),
+    and synchronizes them into the appointments table.
+    """
+    try:
+        from services.masters import get_schedule
+        days = get_schedule(["hair"])
+    except Exception as e:
+        logger.error("Failed to get schedule from Masters: %s", e)
+        return False, 0, f"Ошибка получения расписания: {e}"
+
+    if not days:
+        return False, 0, "Не удалось получить расписание из Masters (mst.link)"
+
+    synced_count = 0
+    now = datetime.datetime.now(SARATOV_TZ)
+    today_key = now.strftime("%Y-%m-%d")
+
+    all_standard_slots = [
+        "10:00", "10:30", "11:00", "11:30", "12:00", "12:30", "13:00", "13:30",
+        "14:00", "14:30", "15:00", "15:30", "16:00", "16:30", "17:00", "17:30"
+    ]
+
+    for day_key, day_data in days.items():
+        if day_key < today_key:
+            continue
+
+        avail_slots = [s["time"] for s in day_data.get("slots", [])]
+        avail_set = set(avail_slots)
+
+        # Detect busy slots (grouped contiguous 30-min intervals)
+        cur: list[str] = []
+        appts: list[list[str]] = []
+        for s in all_standard_slots:
+            if s not in avail_set:
+                cur.append(s)
+            else:
+                if cur:
+                    appts.append(cur)
+                    cur = []
+        if cur:
+            appts.append(cur)
+
+        # For each busy group, check or create appointment
+        for group in appts:
+            start_time = group[0]
+            dt_str = f"{day_key} {start_time}:00"
+            try:
+                dt = datetime.datetime.fromisoformat(dt_str).replace(tzinfo=SARATOV_TZ)
+            except Exception:
+                continue
+
+            masters_id = f"mst_{day_key}_{start_time.replace(':', '')}"
+
+            # Check if appointment already exists around this time (+/- 45 min)
+            with get_connection() as conn:
+                dt_from = dt - datetime.timedelta(minutes=45)
+                dt_to = dt + datetime.timedelta(minutes=45)
+                p_from = dt_from if conn.is_pg else dt_from.strftime("%Y-%m-%d %H:%M:%S")
+                p_to = dt_to if conn.is_pg else dt_to.strftime("%Y-%m-%d %H:%M:%S")
+
+                existing = conn.execute(
+                    """
+                    SELECT id, client_name, phone, status, platform, masters_id
+                    FROM appointments
+                    WHERE (masters_id = %s OR (appointment_time >= %s AND appointment_time <= %s))
+                      AND (status IS NULL OR status != 'cancelled')
+                    LIMIT 1
+                    """,
+                    (masters_id, p_from, p_to),
+                ).fetchone()
+
+                if not existing:
+                    # Determine service name and price based on duration
+                    duration_slots = len(group)
+                    if duration_slots >= 4:
+                        svc_name = "Стрижка + Борода"
+                        price = 3000
+                    else:
+                        svc_name = "Стрижка (МУЖСКАЯ)"
+                        price = 2300
+
+                    create_or_update_appointment(
+                        phone="+79173225155",
+                        appointment_time=dt,
+                        services=svc_name,
+                        total_price=price,
+                        client_name="Клиент (Masters)",
+                        platform="masters",
+                        masters_id=masters_id,
+                    )
+                    # Mark confirmed
+                    val_true = True if conn.is_pg else 1
+                    conn.execute(
+                        "UPDATE appointments SET client_confirmed = %s WHERE masters_id = %s",
+                        (val_true, masters_id),
+                    )
+                    conn.commit()
+                    synced_count += 1
+                elif not existing["masters_id"]:
+                    # Update masters_id if was booked via bot
+                    conn.execute(
+                        "UPDATE appointments SET masters_id = %s WHERE id = %s",
+                        (masters_id, existing["id"]),
+                    )
+                    conn.commit()
+
+        # Check for cancelled masters appointments (slot became available on mst.link)
+        with get_connection() as conn:
+            d_start = f"{day_key} 00:00:00"
+            d_end = f"{day_key} 23:59:59"
+            p_start = datetime.datetime.fromisoformat(d_start).replace(tzinfo=SARATOV_TZ) if conn.is_pg else d_start
+            p_end = datetime.datetime.fromisoformat(d_end).replace(tzinfo=SARATOV_TZ) if conn.is_pg else d_end
+
+            m_appts = conn.execute(
+                """
+                SELECT id, masters_id, appointment_time
+                FROM appointments
+                WHERE platform = 'masters'
+                  AND (status IS NULL OR status != 'cancelled')
+                  AND appointment_time >= %s AND appointment_time <= %s
+                """,
+                (p_start, p_end),
+            ).fetchall()
+
+            for ma in m_appts:
+                ma_id = ma["masters_id"]
+                if ma_id and ma_id.startswith("mst_"):
+                    time_part = ma_id.split("_")[-1]
+                    if len(time_part) == 4:
+                        slot_time = f"{time_part[:2]}:{time_part[2:]}"
+                        if slot_time in avail_set:
+                            # Slot is now available, client cancelled in Masters
+                            conn.execute(
+                                "UPDATE appointments SET status = 'cancelled' WHERE id = %s",
+                                (ma["id"],),
+                            )
+                            conn.commit()
+
+    return True, synced_count, f"Синхронизировано записей: {synced_count}"
+
+
 def sync_masters_appointments() -> tuple[bool, int, str]:
     """
-    Fetches records from authenticated Masters session and updates appointments table.
+    Synchronizes records from Masters CRM:
+    1. Synchronizes live schedule & booked appointments from mst.link
+    2. If active master session exists, also queries prod.mastersapp.ru
     Returns (success, synced_count, message).
     """
+    ok_link, count_link, msg_link = sync_schedule_from_masters_link()
+
     session = get_active_masters_session()
     if not session or not session.get("cookie_phpsessid"):
-        return False, 0, "Нет активной сессии мастера Masters"
+        return ok_link, count_link, f"Синхронизация Masters завершена: {count_link} записей."
 
+    synced_web = 0
     opener, _ = _get_masters_opener(session)
-
-    # Request calendar / records page
     target_urls = [
         "https://prod.mastersapp.ru/account/calendar",
         "https://prod.mastersapp.ru/calendar",
         "https://prod.mastersapp.ru/account/records",
         "https://prod.mastersapp.ru/records",
-        "https://prod.mastersapp.ru/journal",
-        "https://prod.mastersapp.ru/",
     ]
-
-    synced_count = 0
     for url in target_urls:
         try:
             req = urllib.request.Request(
@@ -631,107 +774,37 @@ def sync_masters_appointments() -> tuple[bool, int, str]:
                     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
                 },
             )
-            with opener.open(req, timeout=15) as resp:
+            with opener.open(req, timeout=5) as resp:
                 content = resp.read().decode("utf-8", errors="ignore")
                 if "login" in resp.geturl():
-                    # Session expired
                     disconnect_masters_session()
-                    return False, 0, "Сессия Masters истекла. Пожалуйста, войдите снова."
-
-                # Look for JSON appointments data (direct JSON or embedded in HTML)
-                events_data = None
-                content_clean = content.strip()
-                if content_clean.startswith("[") and content_clean.endswith("]"):
-                    try:
-                        parsed = json.loads(content_clean)
-                        if isinstance(parsed, list):
-                            events_data = parsed
-                    except Exception:
-                        pass
-                elif content_clean.startswith("{") and content_clean.endswith("}"):
-                    try:
-                        parsed = json.loads(content_clean)
-                        if isinstance(parsed, dict) and "events" in parsed and isinstance(parsed["events"], list):
-                            events_data = parsed["events"]
-                    except Exception:
-                        pass
-
-                if not events_data:
-                    events_match = re.search(r'(?:events|records|appointments)\s*=\s*(\[\{.*?\}\]);', content, re.DOTALL)
-                    if events_match:
-                        try:
-                            events_data = json.loads(events_match.group(1))
-                        except Exception:
-                            pass
-
-                if events_data:
-                    try:
-                        for ev in events_data:
-                            # Extract phone, date, client name, service, status
-                            ev_client = ev.get("client") if isinstance(ev.get("client"), dict) else {}
-                            ev_user = ev.get("user") if isinstance(ev.get("user"), dict) else {}
-                            ev_id = str(ev.get("id") or "")
-                            ev_phone = (
-                                ev.get("phone")
-                                or ev.get("client_phone")
-                                or ev_client.get("phone")
-                                or ev_user.get("phone")
-                                or (f"+7900{ev_id[-7:]}" if len(ev_id) >= 7 else "+79001234567")
-                            )
-                            ev_name = (
-                                ev.get("client_name")
-                                or ev.get("name")
-                                or ev_client.get("name")
-                                or ev_client.get("first_name")
-                                or ev_user.get("name")
-                                or "Клиент"
-                            )
-                            ev_start = ev.get("start") or ev.get("datetime")
-                            ev_title = ev.get("title") or ev.get("service_name") or "Стрижка"
-                            ev_price = ev.get("price") or 2300
-
-                            ev_confirmed = bool(ev.get("confirmed") or ev.get("client_confirmed"))
-                            ev_status = str(ev.get("status") or "").lower()
-                            if ev_status in ("confirmed", "подтверждена", "approved"):
-                                ev_confirmed = True
-
-                            is_cancelled = ev_status in ("canceled", "cancelled", "отменена", "удалена", "deleted")
-
-                            if ev_phone and ev_start:
-                                try:
-                                    dt = datetime.datetime.fromisoformat(ev_start.replace("Z", "+00:00"))
-                                    appt_id = create_or_update_appointment(
-                                        phone=ev_phone,
-                                        appointment_time=dt,
-                                        services=ev_title,
-                                        total_price=int(ev_price),
-                                        client_name=ev_name,
-                                        masters_id=ev_id if ev_id else None,
-                                    )
-                                    if ev_confirmed:
-                                        with get_connection() as conn:
-                                            val_true = True if conn.is_pg else 1
-                                            conn.execute(
-                                                "UPDATE appointments SET client_confirmed = %s WHERE id = %s",
-                                                (val_true, appt_id),
-                                            )
-                                            conn.commit()
-                                    if is_cancelled:
-                                        with get_connection() as conn:
-                                            conn.execute(
-                                                "UPDATE appointments SET status = 'cancelled' WHERE id = %s",
-                                                (appt_id,),
-                                            )
-                                            conn.commit()
-                                    synced_count += 1
-                                except Exception as parse_err:
-                                    logger.debug("Failed to parse event: %s", parse_err)
-                    except Exception as json_err:
-                        logger.debug("Failed to parse JSON records: %s", json_err)
-
-                if synced_count > 0:
                     break
-        except Exception as e:
-            logger.debug("Failed checking URL %s: %s", url, e)
 
-    return True, synced_count, f"Синхронизировано записей: {synced_count}"
+                events_match = re.search(r'(?:events|records|appointments)\s*=\s*(\[\{.*?\}\]);', content, re.DOTALL)
+                if events_match:
+                    events_data = json.loads(events_match.group(1))
+                    for ev in events_data:
+                        ev_id = str(ev.get("id") or "")
+                        ev_phone = ev.get("phone") or ev.get("client_phone") or "+79173225155"
+                        ev_name = ev.get("client_name") or ev.get("name") or "Клиент"
+                        ev_start = ev.get("start") or ev.get("datetime")
+                        ev_title = ev.get("title") or ev.get("service_name") or "Стрижка"
+                        ev_price = ev.get("price") or 2300
+                        if ev_start:
+                            dt = datetime.datetime.fromisoformat(ev_start.replace("Z", "+00:00"))
+                            create_or_update_appointment(
+                                phone=ev_phone,
+                                appointment_time=dt,
+                                services=ev_title,
+                                total_price=int(ev_price),
+                                client_name=ev_name,
+                                masters_id=ev_id if ev_id else None,
+                            )
+                            synced_web += 1
+                    if synced_web > 0:
+                        break
+        except Exception as e:
+            logger.debug("Web sync attempt on %s: %s", url, e)
+
+    total_synced = count_link + synced_web
+    return True, total_synced, f"Синхронизация Masters завершена: {total_synced} записей."
