@@ -224,6 +224,327 @@ def get_user_upcoming_appointments(platform: str, platform_user_id: int) -> list
         return [dict(r) for r in rows]
 
 
+def complete_appointment(appointment_id: int) -> tuple[bool, str, dict | None, dict | None]:
+    """
+    Marks appointment as completed (клиент пострижен / визит состоялся).
+    If the client was invited by a referral, marks the referral visited and awards bonus.
+    Synchronizes status with Masters CRM.
+    Returns (success, message, appointment_dict, referral_notify_data).
+    """
+    with get_connection() as conn:
+        row = conn.execute("SELECT * FROM appointments WHERE id = %s", (appointment_id,)).fetchone()
+        if not row:
+            return False, "Запись не найдена", None, None
+
+        if row["status"] == "completed":
+            return False, "Визит уже был отмечен как выполненный ранее", dict(row), None
+
+        conn.execute(
+            "UPDATE appointments SET status = 'completed', updated_at = CURRENT_TIMESTAMP WHERE id = %s",
+            (appointment_id,),
+        )
+        conn.commit()
+        appt = dict(row)
+        appt["status"] = "completed"
+
+    # Check for pending referral for this client
+    referral_notify_data = None
+    try:
+        from services.referrals import mark_referral_visited, normalize_phone
+        norm_phone = normalize_phone(appt.get("phone", ""))
+        with get_connection() as conn:
+            user_id = appt.get("user_id")
+            ref_row = None
+            if user_id:
+                ref_row = conn.execute(
+                    "SELECT id FROM referrals WHERE invited_user_id = %s AND status = 'started' LIMIT 1",
+                    (user_id,),
+                ).fetchone()
+            if not ref_row and norm_phone:
+                ref_row = conn.execute(
+                    """
+                    SELECT r.id FROM referrals r
+                    JOIN users u ON u.id = r.invited_user_id
+                    WHERE u.phone = %s AND r.status = 'started'
+                    LIMIT 1
+                    """,
+                    (norm_phone,),
+                ).fetchone()
+
+            if ref_row:
+                ref_ok, ref_msg, notify_data = mark_referral_visited(ref_row["id"])
+                if ref_ok and notify_data:
+                    referral_notify_data = notify_data
+                    logger.info("Auto-credited referral bonus for completed appointment %s: %s", appointment_id, notify_data)
+    except Exception as ref_err:
+        logger.error("Error checking referral for completed appt %s: %s", appointment_id, ref_err)
+
+    # Sync to Masters CRM
+    try:
+        from services.masters_sync import complete_masters_appointment
+        sync_ok, sync_msg = complete_masters_appointment(appt)
+        logger.info("Masters complete sync for appt %s: %s (%s)", appointment_id, sync_ok, sync_msg)
+    except Exception as e:
+        logger.error("Error executing Masters complete sync for appt %s: %s", appointment_id, e)
+
+    msg = "Визит успешно отмечен! Запись выполнена."
+    if referral_notify_data:
+        msg += f" Другу начислен бонус за рекомендацию: {referral_notify_data.get('amount', 300)} ₽!"
+
+    return True, msg, appt, referral_notify_data
+
+
+def reschedule_appointment(
+    appointment_id: int,
+    new_datetime: datetime.datetime,
+) -> tuple[bool, str, dict | None]:
+    """
+    Reschedules appointment to a new date and time and resets reminder flags.
+    Synchronizes with Masters CRM.
+    """
+    if new_datetime.tzinfo is None:
+        new_datetime = new_datetime.replace(tzinfo=SARATOV_TZ)
+
+    with get_connection() as conn:
+        row = conn.execute("SELECT * FROM appointments WHERE id = %s", (appointment_id,)).fetchone()
+        if not row:
+            return False, "Запись не найдена", None
+
+        val_false = False if conn.is_pg else 0
+        dt_val = new_datetime if conn.is_pg else new_datetime.strftime("%Y-%m-%d %H:%M:%S")
+
+        conn.execute(
+            """
+            UPDATE appointments
+            SET appointment_time = %s,
+                status = 'confirmed',
+                reminder_evening_sent = %s,
+                reminder_morning_sent = %s,
+                reminder_2h_sent = %s,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = %s
+            """,
+            (dt_val, val_false, val_false, val_false, appointment_id),
+        )
+        conn.commit()
+        appt = dict(row)
+        appt["appointment_time"] = new_datetime
+        appt["status"] = "confirmed"
+
+    # Sync to Masters CRM
+    try:
+        from services.masters_sync import reschedule_masters_appointment
+        sync_ok, sync_msg = reschedule_masters_appointment(appt, new_datetime)
+        logger.info("Masters reschedule sync for appt %s: %s (%s)", appointment_id, sync_ok, sync_msg)
+    except Exception as e:
+        logger.error("Error executing Masters reschedule sync for appt %s: %s", appointment_id, e)
+
+    return True, "Запись успешно перенесена!", appt
+
+
+def get_master_appointments(
+    date_filter: str | None = None,
+    limit: int = 15,
+    offset: int = 0,
+) -> tuple[list[dict], int]:
+    """
+    Fetches master appointments with flexible filtering ('today', 'tomorrow', 'pending', 'all', or YYYY-MM-DD).
+    Returns (list_of_appointments, total_count).
+    """
+    now = get_current_saratov_time()
+    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    today_end = today_start + datetime.timedelta(days=1)
+    tomorrow_start = today_end
+    tomorrow_end = tomorrow_start + datetime.timedelta(days=1)
+
+    where_clauses = ["status != 'cancelled'"]
+    params: list[Any] = []
+
+    if date_filter == "today":
+        where_clauses.append("appointment_time >= %s AND appointment_time < %s")
+        params.extend([today_start, today_end])
+    elif date_filter == "tomorrow":
+        where_clauses.append("appointment_time >= %s AND appointment_time < %s")
+        params.extend([tomorrow_start, tomorrow_end])
+    elif date_filter == "pending":
+        where_clauses.append("client_confirmed = %s AND status = 'confirmed'")
+        params.append(False)
+    elif date_filter and date_filter not in ("all", "future"):
+        try:
+            d = datetime.date.fromisoformat(date_filter)
+            dt_from = datetime.datetime(d.year, d.month, d.day, 0, 0, 0, tzinfo=SARATOV_TZ)
+            dt_to = dt_from + datetime.timedelta(days=1)
+            where_clauses.append("appointment_time >= %s AND appointment_time < %s")
+            params.extend([dt_from, dt_to])
+        except Exception:
+            where_clauses.append("appointment_time >= %s")
+            params.append(today_start)
+    else:
+        # Default: all future from today
+        where_clauses.append("appointment_time >= %s")
+        params.append(today_start)
+
+    where_sql = " AND ".join(where_clauses)
+
+    with get_connection() as conn:
+        exec_params = []
+        for p in params:
+            if isinstance(p, datetime.datetime) and not conn.is_pg:
+                exec_params.append(p.strftime("%Y-%m-%d %H:%M:%S"))
+            elif isinstance(p, bool) and not conn.is_pg:
+                exec_params.append(1 if p else 0)
+            else:
+                exec_params.append(p)
+
+        count_sql = f"SELECT COUNT(*) AS total FROM appointments WHERE {where_sql}"
+        total = conn.execute(count_sql, tuple(exec_params)).fetchone()["total"]
+
+        list_sql = f"""
+            SELECT * FROM appointments
+            WHERE {where_sql}
+            ORDER BY appointment_time ASC
+            LIMIT %s OFFSET %s
+        """
+        list_params = tuple(exec_params + [limit, offset])
+        rows = conn.execute(list_sql, list_params).fetchall()
+        return [dict(r) for r in rows], total
+
+
+def create_manual_appointment(
+    phone: str,
+    appointment_time: datetime.datetime,
+    services: str,
+    total_price: int,
+    client_name: str | None = None,
+    platform: str = "telegram",
+) -> tuple[bool, str, int | None]:
+    """
+    Creates an appointment directly by master, with support for any custom time/price.
+    Syncs to Masters CRM if session active.
+    """
+    if appointment_time.tzinfo is None:
+        appointment_time = appointment_time.replace(tzinfo=SARATOV_TZ)
+
+    appt_id = create_or_update_appointment(
+        phone=phone,
+        appointment_time=appointment_time,
+        services=services,
+        total_price=total_price,
+        client_name=client_name or "Клиент",
+        platform=platform,
+    )
+
+    # Sync to Masters CRM
+    try:
+        from services.masters_sync import create_masters_appointment
+        create_masters_appointment(
+            client_name=client_name or "Клиент",
+            phone=phone,
+            services=services,
+            appointment_time=appointment_time,
+            price=total_price,
+        )
+    except Exception as e:
+        logger.debug("Masters create sync notice: %s", e)
+
+    return True, "Запись успешно создана!", appt_id
+
+
+def get_master_day_schedule(day_key: str) -> dict:
+    """
+    Returns schedule for day_key (YYYY-MM-DD). Defaults to working 10:00 - 20:00.
+    """
+    with get_connection() as conn:
+        row = conn.execute("SELECT * FROM master_schedule WHERE day_key = %s", (day_key,)).fetchone()
+        if row:
+            r = dict(row)
+            return {
+                "day_key": day_key,
+                "is_working": bool(r["is_working"]),
+                "start_time": r["start_time"],
+                "end_time": r["end_time"],
+                "note": r.get("note"),
+            }
+        return {
+            "day_key": day_key,
+            "is_working": True,
+            "start_time": "10:00",
+            "end_time": "20:00",
+            "note": None,
+        }
+
+
+def set_master_day_schedule(
+    day_key: str,
+    is_working: bool,
+    start_time: str = "10:00",
+    end_time: str = "20:00",
+    note: str | None = None,
+) -> bool:
+    with get_connection() as conn:
+        val_work = is_working if conn.is_pg else (1 if is_working else 0)
+        existing = conn.execute("SELECT id FROM master_schedule WHERE day_key = %s", (day_key,)).fetchone()
+        if existing:
+            conn.execute(
+                """
+                UPDATE master_schedule
+                SET is_working = %s, start_time = %s, end_time = %s, note = %s, updated_at = CURRENT_TIMESTAMP
+                WHERE day_key = %s
+                """,
+                (val_work, start_time, end_time, note or "", day_key),
+            )
+        else:
+            conn.execute(
+                """
+                INSERT INTO master_schedule (day_key, is_working, start_time, end_time, note)
+                VALUES (%s, %s, %s, %s, %s)
+                """,
+                (day_key, val_work, start_time, end_time, note or ""),
+            )
+        conn.commit()
+        return True
+
+
+def adjust_master_day_hours(
+    day_key: str,
+    start_delta_hours: int = 0,
+    end_delta_hours: int = 0,
+) -> dict:
+    sched = get_master_day_schedule(day_key)
+    start_h, start_m = [int(p) for p in sched["start_time"].split(":")[:2]]
+    end_h, end_m = [int(p) for p in sched["end_time"].split(":")[:2]]
+
+    new_start_h = max(0, min(23, start_h + start_delta_hours))
+    new_end_h = max(new_start_h + 1, min(24, end_h + end_delta_hours))
+
+    new_start = f"{new_start_h:02d}:{start_m:02d}"
+    new_end = f"{new_end_h:02d}:{end_m:02d}" if new_end_h < 24 else "23:59"
+
+    set_master_day_schedule(day_key, sched["is_working"], new_start, new_end)
+    return get_master_day_schedule(day_key)
+
+
+def get_upcoming_days_schedule(days_ahead: int = 14) -> list[dict]:
+    now = get_current_saratov_time()
+    ru_weekdays = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
+    months_ru = ["", "янв", "фев", "мар", "апр", "май", "июн", "июл", "авг", "сен", "окт", "ноя", "дек"]
+
+    result = []
+    for i in range(days_ahead):
+        d = now + datetime.timedelta(days=i)
+        day_key = d.strftime("%Y-%m-%d")
+        sched = get_master_day_schedule(day_key)
+        wd = ru_weekdays[d.weekday()]
+        title = f"{wd}, {d.day} {months_ru[d.month]}"
+        if i == 0:
+            title += " (Сегодня)"
+        elif i == 1:
+            title += " (Завтра)"
+        sched["title"] = title
+        result.append(sched)
+    return result
+
+
 def get_due_evening_reminders(platform: str | None = None) -> list[dict]:
     """
     Find appointments scheduled for tomorrow where reminder_evening_sent is False.

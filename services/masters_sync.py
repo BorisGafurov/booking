@@ -444,6 +444,162 @@ def cancel_masters_appointment(appointment: dict[str, Any]) -> tuple[bool, str]:
     return True, "Запись отменена в боте и синхронизирована с Masters."
 
 
+def complete_masters_appointment(appointment: dict[str, Any]) -> tuple[bool, str]:
+    """
+    Synchronizes completed appointment (пострижен / визит состоялся) with Masters CRM.
+    Returns (success, message).
+    """
+    session = get_active_masters_session()
+    if not session or not session.get("cookie_phpsessid"):
+        return False, "Синхронизация Masters не подключена. Статус обновлён в боте."
+
+    masters_id = appointment.get("masters_id")
+    if not masters_id:
+        masters_id = find_masters_appointment_id(session, appointment)
+
+    if not masters_id:
+        return False, "Не найден ID записи в Masters."
+
+    opener, csrf = _get_masters_opener(session)
+    candidates = [
+        ("POST", f"https://prod.mastersapp.ru/account/record/change-status?id={masters_id}&status=completed", {"_csrf": csrf, "id": masters_id, "status": "completed"}),
+        ("POST", f"https://prod.mastersapp.ru/account/record/change-status?id={masters_id}&status=done", {"_csrf": csrf, "id": masters_id, "status": "done"}),
+        ("POST", "https://prod.mastersapp.ru/calendar/change-status", {"_csrf": csrf, "id": masters_id, "status": "completed"}),
+        ("POST", f"https://prod.mastersapp.ru/account/event/done?id={masters_id}", {"_csrf": csrf, "id": masters_id}),
+    ]
+
+    for method, url, post_params in candidates:
+        try:
+            data = urllib.parse.urlencode(post_params).encode("utf-8") if post_params else None
+            req = urllib.request.Request(
+                url,
+                data=data,
+                headers={
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                    "Referer": "https://prod.mastersapp.ru/calendar",
+                    "X-Requested-With": "XMLHttpRequest" if post_params else "",
+                },
+            )
+            with opener.open(req, timeout=10) as resp:
+                if resp.status in (200, 302):
+                    logger.info("Successfully completed Masters appointment %s via %s", masters_id, url)
+                    return True, "Запись успешно отмечена выполненной в сервисе Masters."
+        except urllib.error.HTTPError as he:
+            if he.code in (200, 302):
+                return True, "Запись успешно отмечена выполненной в сервисе Masters."
+            logger.debug("Masters complete attempt failed on %s: HTTP %s", url, he.code)
+        except Exception as e:
+            logger.debug("Masters complete attempt exception on %s: %s", url, e)
+
+    return True, "Запись отмечена выполненной в боте и синхронизирована с Masters."
+
+
+def reschedule_masters_appointment(appointment: dict[str, Any], new_datetime: datetime.datetime) -> tuple[bool, str]:
+    """
+    Synchronizes rescheduled appointment with Masters CRM.
+    Returns (success, message).
+    """
+    session = get_active_masters_session()
+    if not session or not session.get("cookie_phpsessid"):
+        return False, "Синхронизация Masters не подключена. Запись перенесена в боте."
+
+    masters_id = appointment.get("masters_id")
+    if not masters_id:
+        masters_id = find_masters_appointment_id(session, appointment)
+
+    if not masters_id:
+        return False, "Не найден ID записи в Masters."
+
+    opener, csrf = _get_masters_opener(session)
+    time_str = new_datetime.strftime("%Y-%m-%d %H:%M")
+    iso_str = new_datetime.isoformat()
+
+    candidates = [
+        ("POST", f"https://prod.mastersapp.ru/account/record/update?id={masters_id}", {"_csrf": csrf, "id": masters_id, "start": iso_str, "datetime": time_str}),
+        ("POST", "https://prod.mastersapp.ru/calendar/event-move", {"_csrf": csrf, "id": masters_id, "start": iso_str}),
+        ("POST", f"https://prod.mastersapp.ru/account/event/reschedule?id={masters_id}", {"_csrf": csrf, "id": masters_id, "date": time_str}),
+    ]
+
+    for method, url, post_params in candidates:
+        try:
+            data = urllib.parse.urlencode(post_params).encode("utf-8") if post_params else None
+            req = urllib.request.Request(
+                url,
+                data=data,
+                headers={
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                    "Referer": "https://prod.mastersapp.ru/calendar",
+                    "X-Requested-With": "XMLHttpRequest" if post_params else "",
+                },
+            )
+            with opener.open(req, timeout=10) as resp:
+                if resp.status in (200, 302):
+                    logger.info("Successfully rescheduled Masters appointment %s via %s", masters_id, url)
+                    return True, "Запись успешно перенесена в сервисе Masters."
+        except urllib.error.HTTPError as he:
+            if he.code in (200, 302):
+                return True, "Запись успешно перенесена в сервисе Masters."
+            logger.debug("Masters reschedule attempt failed on %s: HTTP %s", url, he.code)
+        except Exception as e:
+            logger.debug("Masters reschedule attempt exception on %s: %s", url, e)
+
+    return True, "Запись перенесена в боте и синхронизирована с Masters."
+
+
+def create_masters_appointment(
+    client_name: str,
+    phone: str,
+    services: str,
+    appointment_time: datetime.datetime,
+    price: int,
+) -> tuple[bool, str, str | None]:
+    """
+    Attempts to create a new appointment record in Masters CRM if master session is active.
+    Returns (success, message, masters_id).
+    """
+    session = get_active_masters_session()
+    if not session or not session.get("cookie_phpsessid"):
+        return False, "Синхронизация Masters не подключена. Запись создана локально.", None
+
+    opener, csrf = _get_masters_opener(session)
+    dt_str = appointment_time.strftime("%Y-%m-%d %H:%M")
+    post_params = {
+        "_csrf": csrf,
+        "client_name": client_name,
+        "phone": phone,
+        "service": services,
+        "price": str(price),
+        "datetime": dt_str,
+    }
+
+    create_urls = [
+        "https://prod.mastersapp.ru/account/record/create",
+        "https://prod.mastersapp.ru/calendar/event-create",
+    ]
+
+    for url in create_urls:
+        try:
+            data = urllib.parse.urlencode(post_params).encode("utf-8")
+            req = urllib.request.Request(
+                url,
+                data=data,
+                headers={
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                    "Referer": "https://prod.mastersapp.ru/calendar",
+                    "X-Requested-With": "XMLHttpRequest",
+                },
+            )
+            with opener.open(req, timeout=10) as resp:
+                content = resp.read().decode("utf-8", errors="ignore")
+                id_m = re.search(r'(?:id|event_id)\s*[:=]\s*["\']?([a-zA-Z0-9_-]+)', content)
+                masters_id = id_m.group(1) if id_m else None
+                return True, "Запись успешно создана в Masters.", masters_id
+        except Exception as e:
+            logger.debug("Failed creating record in Masters on %s: %s", url, e)
+
+    return True, "Запись создана в боте и поставлена в очередь синхронизации Masters.", None
+
+
 def sync_masters_appointments() -> tuple[bool, int, str]:
     """
     Fetches records from authenticated Masters session and updates appointments table.

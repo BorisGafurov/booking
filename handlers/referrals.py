@@ -1,12 +1,30 @@
 import asyncio
+import datetime
 import html
 import logging
+import re
+from zoneinfo import ZoneInfo
 from aiogram import F, Router
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 from config import ADMIN_IDS, REFERRAL_REWARD_TEXT
+from services.appointments import (
+    SARATOV_TZ,
+    adjust_master_day_hours,
+    cancel_appointment,
+    complete_appointment,
+    confirm_appointment_by_client,
+    create_manual_appointment,
+    get_appointment,
+    get_current_saratov_time,
+    get_master_appointments,
+    get_master_day_schedule,
+    get_upcoming_days_schedule,
+    reschedule_appointment,
+    set_master_day_schedule,
+)
 from services.masters_sync import (
     confirm_master_login,
     disconnect_masters_session,
@@ -22,28 +40,186 @@ from services.referrals import (
     get_pending_referrals,
     get_referral_stats,
     get_user_phone,
+    is_admin_user,
+    is_master_user,
     is_phone_number,
     mark_referral_visited,
     mark_reward_used,
+    normalize_phone,
     save_user,
 )
 
 logger = logging.getLogger(__name__)
 router = Router()
 
-PAGE_SIZE = 10
+PAGE_SIZE = 8
 admin_broadcast_drafts: dict[int, dict] = {}
+admin_create_drafts: dict[int, dict] = {}
+admin_resched_drafts: dict[int, dict] = {}
+
+RU_MONTHS = ["", "янв", "фев", "мар", "апр", "май", "июн", "июл", "авг", "сен", "окт", "ноя", "дек"]
+RU_WEEKDAYS = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
+
+
+def is_admin(user_id: int) -> bool:
+    return is_master_user(user_id, platform="telegram")
+
+
+def parse_to_saratov(val) -> datetime.datetime:
+    if isinstance(val, datetime.datetime):
+        if val.tzinfo is None:
+            return val.replace(tzinfo=SARATOV_TZ)
+        return val.astimezone(SARATOV_TZ)
+    if isinstance(val, str):
+        val_clean = val.replace("T", " ")
+        if "." in val_clean:
+            val_clean = val_clean.split(".")[0]
+        try:
+            dt = datetime.datetime.strptime(val_clean[:19], "%Y-%m-%d %H:%M:%S")
+            return dt.replace(tzinfo=SARATOV_TZ)
+        except Exception:
+            pass
+    return get_current_saratov_time()
+
+
+def format_dt(val) -> str:
+    dt = parse_to_saratov(val)
+    return f"{dt.day} {RU_MONTHS[dt.month]} в {dt.strftime('%H:%M')}"
 
 
 def admin_menu_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
+            [InlineKeyboardButton(text="📋 Календарь записей", callback_data="admin:appts:today:0")],
+            [InlineKeyboardButton(text="➕ Новая запись мастера", callback_data="admin:create:start")],
+            [InlineKeyboardButton(text="🕒 Рабочий график", callback_data="admin:sched:0")],
             [InlineKeyboardButton(text="⏳ Ожидают подтверждения", callback_data="admin:pending:0")],
             [InlineKeyboardButton(text="💰 Активные бонусы", callback_data="admin:rewards:0")],
             [InlineKeyboardButton(text="🔄 Синхронизация Masters", callback_data="admin:masters")],
             [InlineKeyboardButton(text="📢 Сделать рассылку", callback_data="admin:broadcast")],
         ]
     )
+
+
+def admin_appts_keyboard(appts: list[dict], current_filter: str, offset: int, total: int) -> InlineKeyboardMarkup:
+    rows = []
+
+    filters = [
+        ("today", "Сегодня"),
+        ("tomorrow", "Завтра"),
+        ("pending", "Ожидающие"),
+        ("all", "Все будущие"),
+    ]
+    f_row = []
+    for f_key, f_title in filters:
+        title = f"• {f_title} •" if f_key == current_filter else f_title
+        f_row.append(InlineKeyboardButton(text=title, callback_data=f"admin:appts:{f_key}:0"))
+    rows.append(f_row)
+
+    for item in appts:
+        dt = parse_to_saratov(item["appointment_time"])
+        time_str = dt.strftime("%H:%M")
+        if current_filter == "all":
+            time_str = f"{dt.day} {RU_MONTHS[dt.month]} {time_str}"
+
+        st = item.get("status", "confirmed")
+        if st == "completed":
+            badge = "✅"
+        elif item.get("client_confirmed"):
+            badge = "🟢"
+        else:
+            badge = "⏳"
+
+        name = (item.get("client_name") or "Клиент")[:12]
+        price = item.get("total_price") or 0
+        btn_text = f"{badge} {time_str} · {name} ({price} ₽)"
+        rows.append([InlineKeyboardButton(text=btn_text, callback_data=f"admin:appt:{item['id']}:{current_filter}:{offset}")])
+
+    if not appts:
+        rows.append([InlineKeyboardButton(text="Нет записей в этой категории", callback_data="noop")])
+
+    nav_row = []
+    if offset > 0:
+        prev_offset = max(0, offset - PAGE_SIZE)
+        nav_row.append(InlineKeyboardButton(text="◀️ Назад", callback_data=f"admin:appts:{current_filter}:{prev_offset}"))
+    if offset + PAGE_SIZE < total:
+        next_offset = offset + PAGE_SIZE
+        nav_row.append(InlineKeyboardButton(text="Вперёд ▶️", callback_data=f"admin:appts:{current_filter}:{next_offset}"))
+    if nav_row:
+        rows.append(nav_row)
+
+    rows.append([
+        InlineKeyboardButton(text="➕ Новая запись", callback_data="admin:create:start"),
+        InlineKeyboardButton(text="⬅️ Главное меню", callback_data="admin:menu"),
+    ])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def admin_appt_card_keyboard(appt: dict, current_filter: str, offset: int) -> InlineKeyboardMarkup:
+    rows = []
+    appt_id = appt["id"]
+    status = appt.get("status", "confirmed")
+
+    if status != "completed" and status != "cancelled":
+        rows.append([
+            InlineKeyboardButton(text="✂️ Пострижен (Завершить)", callback_data=f"admin:complete_appt:{appt_id}:{current_filter}:{offset}")
+        ])
+        if not appt.get("client_confirmed"):
+            rows.append([
+                InlineKeyboardButton(text="✅ Подтвердить запись", callback_data=f"admin:confirm_appt:{appt_id}:{current_filter}:{offset}")
+            ])
+        rows.append([
+            InlineKeyboardButton(text="🗓 Перенести запись", callback_data=f"admin:resched_start:{appt_id}:{current_filter}:{offset}"),
+            InlineKeyboardButton(text="❌ Отменить", callback_data=f"admin:cancel_appt:{appt_id}:{current_filter}:{offset}"),
+        ])
+
+    rows.append([
+        InlineKeyboardButton(text="⬅️ К списку записей", callback_data=f"admin:appts:{current_filter}:{offset}")
+    ])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def admin_schedule_keyboard(days: list[dict], offset: int, total: int) -> InlineKeyboardMarkup:
+    rows = []
+    for d in days:
+        status_txt = f"🟢 {d['start_time']} - {d['end_time']}" if d["is_working"] else "🔴 Выходной"
+        rows.append([
+            InlineKeyboardButton(
+                text=f"{d['title']}: {status_txt}",
+                callback_data=f"admin:sched_day:{d['day_key']}",
+            )
+        ])
+
+    nav_row = []
+    if offset > 0:
+        nav_row.append(InlineKeyboardButton(text="◀️ Назад", callback_data=f"admin:sched:{max(0, offset - 7)}"))
+    if offset + 7 < total:
+        nav_row.append(InlineKeyboardButton(text="Вперёд ▶️", callback_data=f"admin:sched:{offset + 7}"))
+    if nav_row:
+        rows.append(nav_row)
+
+    rows.append([InlineKeyboardButton(text="⬅️ Главное меню", callback_data="admin:menu")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def admin_sched_day_keyboard(sched: dict) -> InlineKeyboardMarkup:
+    day_key = sched["day_key"]
+    rows = []
+    if sched["is_working"]:
+        rows.append([InlineKeyboardButton(text="🔴 Сделать выходным днем", callback_data=f"admin:sched_toggle:{day_key}")])
+        rows.append([
+            InlineKeyboardButton(text="➖ Начало -1ч", callback_data=f"admin:sched_adj:{day_key}:start:-1"),
+            InlineKeyboardButton(text="➕ Начало +1ч", callback_data=f"admin:sched_adj:{day_key}:start:1"),
+        ])
+        rows.append([
+            InlineKeyboardButton(text="➖ Конец -1ч", callback_data=f"admin:sched_adj:{day_key}:end:-1"),
+            InlineKeyboardButton(text="➕ Конец +1ч", callback_data=f"admin:sched_adj:{day_key}:end:1"),
+        ])
+    else:
+        rows.append([InlineKeyboardButton(text="🟢 Сделать рабочим днем (10:00 - 20:00)", callback_data=f"admin:sched_toggle:{day_key}")])
+
+    rows.append([InlineKeyboardButton(text="⬅️ К календарю графика", callback_data="admin:sched:0")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def pending_referrals_keyboard(referrals: list[dict], offset: int, total: int) -> InlineKeyboardMarkup:
@@ -61,7 +237,6 @@ def pending_referrals_keyboard(referrals: list[dict], offset: int, total: int) -
     if not rows:
         rows = [[InlineKeyboardButton(text="Нет ожидающих рефералов", callback_data="noop")]]
 
-    # Pagination buttons
     nav_row = []
     if offset > 0:
         prev_offset = max(0, offset - PAGE_SIZE)
@@ -89,7 +264,6 @@ def active_rewards_keyboard(rewards: list[dict], offset: int, total: int) -> Inl
     if not rows:
         rows = [[InlineKeyboardButton(text="Нет активных бонусов", callback_data="noop")]]
 
-    # Pagination buttons
     nav_row = []
     if offset > 0:
         prev_offset = max(0, offset - PAGE_SIZE)
@@ -102,10 +276,6 @@ def active_rewards_keyboard(rewards: list[dict], offset: int, total: int) -> Inl
 
     rows.append([InlineKeyboardButton(text="⬅️ Главное меню админки", callback_data="admin:menu")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
-
-
-def is_admin(user_id: int) -> bool:
-    return user_id in ADMIN_IDS
 
 
 @router.message(Command("myid"))
@@ -122,7 +292,6 @@ async def referrals(message: Message):
         return
 
     user = message.from_user
-    # Ensure current user is registered in DB so their ref link works immediately
     save_user(user.id, user.username, user.first_name, user.last_name)
 
     referral_link = await build_referral_link(message.bot, user.id)
@@ -149,7 +318,7 @@ async def admin_panel(message: Message):
         return
 
     await message.answer(
-        "⚙️ <b>Админ-панель:</b>",
+        "⚙️ <b>Панель мастера и администратора:</b>",
         reply_markup=admin_menu_keyboard(),
     )
 
@@ -163,7 +332,7 @@ async def admin_menu(callback: CallbackQuery):
     try:
         if callback.message:
             await callback.message.edit_text(
-                "⚙️ <b>Админ-панель:</b>",
+                "⚙️ <b>Панель мастера и администратора:</b>",
                 reply_markup=admin_menu_keyboard(),
             )
     except TelegramBadRequest:
@@ -171,6 +340,576 @@ async def admin_menu(callback: CallbackQuery):
     await callback.answer()
 
 
+@router.callback_query(F.data.startswith("admin:appts:"))
+async def admin_appts_list(callback: CallbackQuery):
+    if not callback.from_user or not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа.", show_alert=True)
+        return
+
+    parts = callback.data.split(":")
+    current_filter = parts[2] if len(parts) > 2 else "today"
+    offset = int(parts[3]) if len(parts) > 3 and parts[3].isdigit() else 0
+
+    appts, total = get_master_appointments(date_filter=current_filter, limit=PAGE_SIZE, offset=offset)
+
+    filter_names = {
+        "today": "Сегодня",
+        "tomorrow": "Завтра",
+        "pending": "Ожидающие подтверждения",
+        "all": "Все будущие",
+    }
+    title = filter_names.get(current_filter, current_filter)
+
+    text = f"📋 <b>Календарь записей · {title}</b> ({total} всего):\n\n"
+    if not appts:
+        text += "<i>Записей не найдено.</i>"
+    else:
+        text += "<i>Нажмите на запись для просмотра деталей, подтверждения, завершения визита или переноса:</i>"
+
+    try:
+        if callback.message:
+            await callback.message.edit_text(
+                text,
+                reply_markup=admin_appts_keyboard(appts, current_filter, offset, total),
+            )
+    except TelegramBadRequest:
+        pass
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admin:appt:"))
+async def admin_appt_detail(callback: CallbackQuery):
+    if not callback.from_user or not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа.", show_alert=True)
+        return
+
+    parts = callback.data.split(":")
+    appt_id = int(parts[2])
+    current_filter = parts[3] if len(parts) > 3 else "today"
+    offset = int(parts[4]) if len(parts) > 4 and parts[4].isdigit() else 0
+
+    appt = get_appointment(appt_id)
+    if not appt:
+        await callback.answer("Запись не найдена", show_alert=True)
+        return
+
+    st = appt.get("status", "confirmed")
+    if st == "completed":
+        st_text = "✂️ Завершена (клиент пострижен)"
+    elif st == "cancelled":
+        st_text = "❌ Отменена"
+    elif appt.get("client_confirmed"):
+        st_text = "🟢 Подтверждена клиентом"
+    else:
+        st_text = "⏳ Ожидает подтверждения"
+
+    phone = appt.get("phone") or "—"
+    name = appt.get("client_name") or "Клиент"
+    services = appt.get("services") or "—"
+    price = appt.get("total_price") or 0
+    time_fmt = format_dt(appt["appointment_time"])
+    platform = appt.get("platform") or "telegram"
+    masters_id = appt.get("masters_id") or "—"
+
+    card_text = (
+        f"📋 <b>Карточка записи #{appt['id']}</b>\n\n"
+        f"👤 <b>Клиент:</b> {html.escape(name)}\n"
+        f"📱 <b>Телефон:</b> <code>{phone}</code>\n"
+        f"✂️ <b>Услуга:</b> {html.escape(services)}\n"
+        f"💰 <b>Стоимость:</b> {price} ₽\n"
+        f"⏰ <b>Дата и время:</b> {time_fmt}\n"
+        f"📌 <b>Статус:</b> {st_text}\n"
+        f"🌐 <b>Источник:</b> {platform.upper()}\n"
+        f"🔄 <b>Masters ID:</b> <code>{masters_id}</code>"
+    )
+
+    try:
+        if callback.message:
+            await callback.message.edit_text(
+                card_text,
+                reply_markup=admin_appt_card_keyboard(appt, current_filter, offset),
+            )
+    except TelegramBadRequest:
+        pass
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admin:complete_appt:"))
+async def admin_complete_appt_handler(callback: CallbackQuery):
+    if not callback.from_user or not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа.", show_alert=True)
+        return
+
+    parts = callback.data.split(":")
+    appt_id = int(parts[2])
+    current_filter = parts[3] if len(parts) > 3 else "today"
+    offset = int(parts[4]) if len(parts) > 4 and parts[4].isdigit() else 0
+
+    ok, msg, appt, ref_notify = complete_appointment(appt_id)
+    if not ok:
+        await callback.answer(msg, show_alert=True)
+        return
+
+    if ref_notify:
+        try:
+            invited_name = html.escape(ref_notify["invited_first_name"])
+            await callback.bot.send_message(
+                ref_notify["referrer_telegram_id"],
+                f"🎉 <b>Отличные новости!</b>\n"
+                f"Твой друг <b>{invited_name}</b> посетил салон!\n"
+                f"Тебе начислен бонус: <b>{ref_notify['amount']} ₽</b>.\n\n"
+                f"💰 Доступный баланс бонусов: <b>{ref_notify['new_balance']} ₽</b>.\n"
+                "Ты можешь списать их при следующем визите к мастеру!",
+            )
+        except Exception as e:
+            logger.warning("Не удалось отправить уведомление рефереру: %s", e)
+
+    await callback.answer(msg[:200], show_alert=False)
+    # Refresh card
+    updated_appt = get_appointment(appt_id)
+    if updated_appt and callback.message:
+        await admin_appt_detail(callback)
+
+
+@router.callback_query(F.data.startswith("admin:confirm_appt:"))
+async def admin_confirm_appt_handler(callback: CallbackQuery):
+    if not callback.from_user or not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа.", show_alert=True)
+        return
+
+    parts = callback.data.split(":")
+    appt_id = int(parts[2])
+    ok, msg, appt = confirm_appointment_by_client(appt_id)
+    await callback.answer(msg, show_alert=False)
+    await admin_appt_detail(callback)
+
+
+@router.callback_query(F.data.startswith("admin:cancel_appt:"))
+async def admin_cancel_appt_handler(callback: CallbackQuery):
+    if not callback.from_user or not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа.", show_alert=True)
+        return
+
+    parts = callback.data.split(":")
+    appt_id = int(parts[2])
+    current_filter = parts[3] if len(parts) > 3 else "today"
+    offset = int(parts[4]) if len(parts) > 4 and parts[4].isdigit() else 0
+
+    ok, msg, appt = cancel_appointment(appt_id)
+    if ok and appt and appt.get("platform_user_id") and appt.get("platform") == "telegram":
+        try:
+            await callback.bot.send_message(
+                chat_id=appt["platform_user_id"],
+                text="❌ <b>Ваша запись была отменена мастером.</b>\n\nЕсли у вас возникли вопросы или вы хотите подобрать другое время, напишите мастеру.",
+            )
+        except Exception as e:
+            logger.warning("Failed to notify client about cancel: %s", e)
+
+    await callback.answer("Запись отменена", show_alert=False)
+    await admin_appts_list(callback)
+
+
+# Reschedule flow
+@router.callback_query(F.data.startswith("admin:resched_start:"))
+async def admin_resched_start(callback: CallbackQuery):
+    if not callback.from_user or not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа.", show_alert=True)
+        return
+
+    parts = callback.data.split(":")
+    appt_id = int(parts[2])
+    current_filter = parts[3] if len(parts) > 3 else "today"
+    offset = int(parts[4]) if len(parts) > 4 and parts[4].isdigit() else 0
+
+    now = get_current_saratov_time()
+    rows = []
+    for i in range(7):
+        d = now + datetime.timedelta(days=i)
+        day_key = d.strftime("%Y-%m-%d")
+        title = f"{RU_WEEKDAYS[d.weekday()]}, {d.day} {RU_MONTHS[d.month]}"
+        if i == 0:
+            title += " (Сегодня)"
+        elif i == 1:
+            title += " (Завтра)"
+        rows.append([
+            InlineKeyboardButton(
+                text=title,
+                callback_data=f"admin:resched_day:{appt_id}:{day_key}:{current_filter}:{offset}",
+            )
+        ])
+
+    rows.append([
+        InlineKeyboardButton(text="⬅️ Назад к карточке", callback_data=f"admin:appt:{appt_id}:{current_filter}:{offset}")
+    ])
+
+    if callback.message:
+        await callback.message.edit_text(
+            f"🗓 <b>Перенос записи #{appt_id}</b>\n\nВыберите новую дату:",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+        )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admin:resched_day:"))
+async def admin_resched_day_chosen(callback: CallbackQuery):
+    if not callback.from_user or not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа.", show_alert=True)
+        return
+
+    parts = callback.data.split(":")
+    appt_id = int(parts[2])
+    day_key = parts[3]
+    current_filter = parts[4] if len(parts) > 4 else "today"
+    offset = int(parts[5]) if len(parts) > 5 and parts[5].isdigit() else 0
+
+    # Times keyboard
+    hours = ["10:00", "11:00", "12:00", "13:00", "14:00", "15:00", "16:00", "17:00", "18:00", "19:00", "20:00"]
+    rows = []
+    row = []
+    for h in hours:
+        row.append(InlineKeyboardButton(text=h, callback_data=f"admin:resched_time:{appt_id}:{day_key}:{h}:{current_filter}:{offset}"))
+        if len(row) == 3:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+
+    rows.append([
+        InlineKeyboardButton(text="✏️ Ввести другое время (например 08:30)", callback_data=f"admin:resched_custom:{appt_id}:{day_key}:{current_filter}:{offset}")
+    ])
+    rows.append([
+        InlineKeyboardButton(text="⬅️ Назад к выбору даты", callback_data=f"admin:resched_start:{appt_id}:{current_filter}:{offset}")
+    ])
+
+    if callback.message:
+        await callback.message.edit_text(
+            f"🗓 <b>Перенос записи #{appt_id} на {day_key}</b>\n\nВыберите время или введите любое своё:",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+        )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admin:resched_time:"))
+async def admin_resched_time_chosen(callback: CallbackQuery):
+    if not callback.from_user or not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа.", show_alert=True)
+        return
+
+    parts = callback.data.split(":")
+    appt_id = int(parts[2])
+    day_key = parts[3]
+    time_str = parts[4]
+    current_filter = parts[5] if len(parts) > 5 else "today"
+    offset = int(parts[6]) if len(parts) > 6 and parts[6].isdigit() else 0
+
+    try:
+        new_dt = datetime.datetime.strptime(f"{day_key} {time_str}", "%Y-%m-%d %H:%M").replace(tzinfo=SARATOV_TZ)
+    except Exception as e:
+        await callback.answer("Ошибка формата времени", show_alert=True)
+        return
+
+    ok, msg, appt = reschedule_appointment(appt_id, new_dt)
+    if ok and appt and appt.get("platform_user_id") and appt.get("platform") == "telegram":
+        try:
+            await callback.bot.send_message(
+                chat_id=appt["platform_user_id"],
+                text=(
+                    "🗓 <b>Ваша запись перенесена мастером!</b>\n\n"
+                    f"⏰ Новое время: <b>{format_dt(new_dt)}</b>\n"
+                    f"✂️ Услуга: {appt.get('services')}\n"
+                    f"💰 Стоимость: {appt.get('total_price')} ₽\n\n"
+                    "Ждем вас!"
+                ),
+            )
+        except Exception as e:
+            logger.warning("Failed to notify client about reschedule: %s", e)
+
+    await callback.answer("Запись успешно перенесена!", show_alert=False)
+    await admin_appt_detail(callback)
+
+
+@router.callback_query(F.data.startswith("admin:resched_custom:"))
+async def admin_resched_custom_start(callback: CallbackQuery):
+    if not callback.from_user or not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа.", show_alert=True)
+        return
+
+    parts = callback.data.split(":")
+    appt_id = int(parts[2])
+    day_key = parts[3]
+    current_filter = parts[4] if len(parts) > 4 else "today"
+    offset = int(parts[5]) if len(parts) > 5 and parts[5].isdigit() else 0
+
+    admin_resched_drafts[callback.from_user.id] = {
+        "appt_id": appt_id,
+        "day_key": day_key,
+        "current_filter": current_filter,
+        "offset": offset,
+        "step": "awaiting_custom_time",
+    }
+
+    if callback.message:
+        await callback.message.edit_text(
+            f"✏️ <b>Введите желаемое время на {day_key}</b>\n\n"
+            "Напишите время в ответном сообщении (например <code>08:30</code> или <code>21:15</code>):",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[[InlineKeyboardButton(text="⬅️ Отмена", callback_data=f"admin:appt:{appt_id}:{current_filter}:{offset}")]]
+            ),
+        )
+    await callback.answer()
+
+
+# Manual appointment creation flow
+@router.callback_query(F.data == "admin:create:start")
+async def admin_create_start(callback: CallbackQuery):
+    if not callback.from_user or not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа.", show_alert=True)
+        return
+
+    admin_create_drafts[callback.from_user.id] = {
+        "step": "service",
+    }
+
+    rows = [
+        [InlineKeyboardButton(text="Мужская стрижка (1000 ₽)", callback_data="admin:create:svc:Мужская стрижка:1000")],
+        [InlineKeyboardButton(text="Стрижка + Борода (1400 ₽)", callback_data="admin:create:svc:Стрижка + Борода:1400")],
+        [InlineKeyboardButton(text="Стрижка бороды (600 ₽)", callback_data="admin:create:svc:Стрижка бороды:600")],
+        [InlineKeyboardButton(text="Отец + Сын (1800 ₽)", callback_data="admin:create:svc:Отец + Сын:1800")],
+        [InlineKeyboardButton(text="✏️ Другая услуга", callback_data="admin:create:svc:custom")],
+        [InlineKeyboardButton(text="⬅️ Отмена", callback_data="admin:menu")],
+    ]
+
+    if callback.message:
+        await callback.message.edit_text(
+            "➕ <b>Создание новой записи мастером</b>\n\n"
+            "<b>Шаг 1 из 4:</b> Выберите услугу или введите другое название:",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+        )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admin:create:svc:"))
+async def admin_create_service_chosen(callback: CallbackQuery):
+    if not callback.from_user or not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа.", show_alert=True)
+        return
+
+    parts = callback.data.split(":")
+    svc_name = parts[3]
+
+    draft = admin_create_drafts.setdefault(callback.from_user.id, {})
+    if svc_name == "custom":
+        draft["step"] = "awaiting_custom_service"
+        if callback.message:
+            await callback.message.edit_text(
+                "✏️ <b>Введите название услуги</b> в чат (например: <code>Моделирование бороды VIP</code>):",
+                reply_markup=InlineKeyboardMarkup(
+                    inline_keyboard=[[InlineKeyboardButton(text="⬅️ Отмена", callback_data="admin:create:start")]]
+                ),
+            )
+        await callback.answer()
+        return
+
+    price = int(parts[4]) if len(parts) > 4 and parts[4].isdigit() else 1000
+    draft["service"] = svc_name
+    draft["price"] = price
+    draft["step"] = "day"
+
+    await show_create_day_picker(callback)
+
+
+async def show_create_day_picker(callback: CallbackQuery):
+    now = get_current_saratov_time()
+    rows = []
+    for i in range(7):
+        d = now + datetime.timedelta(days=i)
+        day_key = d.strftime("%Y-%m-%d")
+        title = f"{RU_WEEKDAYS[d.weekday()]}, {d.day} {RU_MONTHS[d.month]}"
+        if i == 0:
+            title += " (Сегодня)"
+        elif i == 1:
+            title += " (Завтра)"
+        rows.append([
+            InlineKeyboardButton(
+                text=title,
+                callback_data=f"admin:create:day:{day_key}",
+            )
+        ])
+
+    rows.append([InlineKeyboardButton(text="⬅️ Отмена", callback_data="admin:menu")])
+    if callback.message:
+        await callback.message.edit_text(
+            "➕ <b>Шаг 2 из 4:</b> Выберите дату записи:",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+        )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admin:create:day:"))
+async def admin_create_day_chosen(callback: CallbackQuery):
+    if not callback.from_user or not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа.", show_alert=True)
+        return
+
+    day_key = callback.data.split(":")[3]
+    draft = admin_create_drafts.setdefault(callback.from_user.id, {})
+    draft["day_key"] = day_key
+    draft["step"] = "time"
+
+    hours = ["09:00", "10:00", "11:00", "12:00", "13:00", "14:00", "15:00", "16:00", "17:00", "18:00", "19:00", "20:00", "21:00"]
+    rows = []
+    row = []
+    for h in hours:
+        row.append(InlineKeyboardButton(text=h, callback_data=f"admin:create:time:{h}"))
+        if len(row) == 3:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+
+    rows.append([
+        InlineKeyboardButton(text="✏️ Любое другое время (08:30, 22:00...)", callback_data="admin:create:time:custom")
+    ])
+    rows.append([InlineKeyboardButton(text="⬅️ Назад к датам", callback_data="admin:create:start")])
+
+    if callback.message:
+        await callback.message.edit_text(
+            f"➕ <b>Шаг 3 из 4:</b> Выберите время на <b>{day_key}</b>:\n"
+            "<i>(можно записать клиента и вне стандартного рабочего графика)</i>",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+        )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admin:create:time:"))
+async def admin_create_time_chosen(callback: CallbackQuery):
+    if not callback.from_user or not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа.", show_alert=True)
+        return
+
+    time_val = callback.data.split(":")[3]
+    draft = admin_create_drafts.setdefault(callback.from_user.id, {})
+    if time_val == "custom":
+        draft["step"] = "awaiting_custom_time"
+        if callback.message:
+            await callback.message.edit_text(
+                f"✏️ <b>Введите любое время записи</b> на {draft.get('day_key')}\n\n"
+                "Напишите в ответном сообщении (например <code>08:30</code> или <code>22:15</code>):",
+                reply_markup=InlineKeyboardMarkup(
+                    inline_keyboard=[[InlineKeyboardButton(text="⬅️ Отмена", callback_data="admin:create:start")]]
+                ),
+            )
+        await callback.answer()
+        return
+
+    draft["time_str"] = time_val
+    draft["step"] = "awaiting_client_info"
+
+    curr_price = draft.get("price", 1000)
+    curr_svc = draft.get("service", "Стрижка")
+    day_key = draft.get("day_key", "")
+
+    if callback.message:
+        await callback.message.edit_text(
+            f"➕ <b>Шаг 4 из 4: Данные клиента и цена</b>\n\n"
+            f"✂️ Услуга: <b>{curr_svc}</b>\n"
+            f"⏰ Время: <b>{day_key} {time_val}</b>\n"
+            f"💰 Цена: <b>{curr_price} ₽</b>\n\n"
+            "👉 <b>Отправьте в чат телефон и имя клиента:</b>\n"
+            "Например: <code>+79173225155 Борис</code> или просто номер <code>89991234567</code>.\n\n"
+            "<i>Если хотите изменить цену, укажите её в конце сообщения, например: <code>89173225155 Борис 1200</code></i>",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[[InlineKeyboardButton(text="⬅️ Отмена", callback_data="admin:menu")]]
+            ),
+        )
+    await callback.answer()
+
+
+# Schedule management flow
+@router.callback_query(F.data.startswith("admin:sched:"))
+async def admin_sched_list(callback: CallbackQuery):
+    if not callback.from_user or not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа.", show_alert=True)
+        return
+
+    offset = int(callback.data.split(":")[2])
+    all_days = get_upcoming_days_schedule(days_ahead=14)
+    slice_days = all_days[offset:offset+7]
+
+    text = (
+        "🕒 <b>Управление рабочим графиком мастера</b>\n\n"
+        "Выберите день, чтобы сделать его выходным/рабочим или изменить часы работы (прибавить/убавить начало и конец дня):"
+    )
+    if callback.message:
+        await callback.message.edit_text(
+            text,
+            reply_markup=admin_schedule_keyboard(slice_days, offset, len(all_days)),
+        )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admin:sched_day:"))
+async def admin_sched_day_detail(callback: CallbackQuery):
+    if not callback.from_user or not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа.", show_alert=True)
+        return
+
+    day_key = callback.data.split(":")[2]
+    sched = get_master_day_schedule(day_key)
+
+    st_txt = "🟢 Рабочий день" if sched["is_working"] else "🔴 Выходной день"
+    card_text = (
+        f"🗓 <b>График на {day_key}:</b>\n\n"
+        f"• Статус: <b>{st_txt}</b>\n"
+        f"• Рабочие часы: <b>{sched['start_time']} — {sched['end_time']}</b>\n\n"
+        "Вы можете изменить статус дня или скорректировать рабочие часы:"
+    )
+
+    if callback.message:
+        await callback.message.edit_text(
+            card_text,
+            reply_markup=admin_sched_day_keyboard(sched),
+        )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admin:sched_toggle:"))
+async def admin_sched_toggle(callback: CallbackQuery):
+    if not callback.from_user or not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа.", show_alert=True)
+        return
+
+    day_key = callback.data.split(":")[2]
+    sched = get_master_day_schedule(day_key)
+    new_work = not sched["is_working"]
+    set_master_day_schedule(day_key, new_work, sched["start_time"], sched["end_time"])
+
+    msg = "День отмечен как РАБОЧИЙ!" if new_work else "День отмечен как ВЫХОДНОЙ!"
+    await callback.answer(msg, show_alert=False)
+    await admin_sched_day_detail(callback)
+
+
+@router.callback_query(F.data.startswith("admin:sched_adj:"))
+async def admin_sched_adj(callback: CallbackQuery):
+    if not callback.from_user or not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа.", show_alert=True)
+        return
+
+    parts = callback.data.split(":")
+    day_key = parts[2]
+    which = parts[3]
+    delta = int(parts[4])
+
+    if which == "start":
+        adjust_master_day_hours(day_key, start_delta_hours=delta, end_delta_hours=0)
+    else:
+        adjust_master_day_hours(day_key, start_delta_hours=0, end_delta_hours=delta)
+
+    await callback.answer("Часы обновлены", show_alert=False)
+    await admin_sched_day_detail(callback)
+
+
+# Referrals & Rewards
 @router.callback_query(F.data.startswith("admin:pending"))
 async def admin_pending(callback: CallbackQuery):
     if not callback.from_user or not is_admin(callback.from_user.id):
@@ -311,6 +1050,7 @@ async def noop(callback: CallbackQuery):
     await callback.answer()
 
 
+# Masters integration
 @router.callback_query(F.data == "admin:masters")
 async def admin_masters_status(callback: CallbackQuery):
     if not callback.from_user or not is_admin(callback.from_user.id):
@@ -430,49 +1170,7 @@ async def admin_masters_disconnect(callback: CallbackQuery):
     await admin_masters_status(callback)
 
 
-@router.message(lambda msg: bool(msg.from_user and msg.from_user.id in pending_master_logins and msg.text and msg.text.strip().isdigit() and len(msg.text.strip()) == 4))
-async def handle_master_sms_code(message: Message):
-    user_id = message.from_user.id
-    session_data = pending_master_logins.get(user_id)
-    if not session_data or session_data.get("awaiting_phone"):
-        return
-
-    code = message.text.strip()
-    success, msg = confirm_master_login(session_data, code)
-    if not success:
-        await message.answer(f"❌ <b>{msg}</b>\n\nПопробуйте ввести код ещё раз:")
-        return
-
-    pending_master_logins.pop(user_id, None)
-    ok, count, sync_msg = sync_masters_appointments()
-
-    await message.answer(
-        "🎉 <b>Аккаунт Masters успешно подключен!</b>\n\n"
-        f"✅ {sync_msg}\n"
-        "Теперь бот будет автоматически отправлять клиентам напоминания накануне вечером и за 2 часа до начала визита.",
-        reply_markup=admin_menu_keyboard(),
-        parse_mode="HTML",
-    )
-
-
-@router.message(lambda msg: bool(msg.from_user and msg.from_user.id in pending_master_logins and pending_master_logins.get(msg.from_user.id, {}).get("awaiting_phone") and msg.text and is_phone_number(msg.text)))
-async def handle_master_phone_input(message: Message):
-    user_id = message.from_user.id
-    phone = message.text.strip()
-    success, msg, session_data = request_master_login(phone)
-    if not success:
-        await message.answer(f"❌ <b>{msg}</b>\n\nПопробуйте ввести другой номер телефона:")
-        return
-
-    pending_master_logins[user_id] = session_data
-    await message.answer(
-        f"📩 <b>Код подтверждения отправлен</b>\n\n"
-        f"На номер <code>{session_data['phone_formatted']}</code> отправлено СМС от Masters.\n\n"
-        "👉 <b>Напишите 4 цифры из СМС в ответном сообщении:</b>",
-        parse_mode="HTML",
-    )
-
-
+# Broadcast flow
 @router.callback_query(F.data == "admin:broadcast")
 async def admin_broadcast_start(callback: CallbackQuery):
     if not callback.from_user or not is_admin(callback.from_user.id):
@@ -506,45 +1204,6 @@ async def admin_broadcast_cancel(callback: CallbackQuery):
     admin_broadcast_drafts.pop(callback.from_user.id, None)
     await callback.answer("Рассылка отменена.")
     await admin_menu(callback)
-
-
-@router.message(
-    lambda msg: bool(
-        msg.from_user
-        and is_admin(msg.from_user.id)
-        and admin_broadcast_drafts.get(msg.from_user.id, {}).get("step") == "awaiting_text"
-        and msg.text
-        and not msg.text.startswith("/")
-    )
-)
-async def admin_broadcast_receive_text(message: Message):
-    admin_id = message.from_user.id
-    broadcast_text = message.text.strip()
-    recipients = get_broadcast_recipients("telegram")
-    count = len(recipients)
-
-    admin_broadcast_drafts[admin_id] = {
-        "step": "confirm",
-        "text": broadcast_text,
-    }
-
-    kb = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text=f"✅ Отправить рассылку ({count})", callback_data="admin:broadcast:send")],
-            [InlineKeyboardButton(text="✏️ Изменить текст", callback_data="admin:broadcast")],
-            [InlineKeyboardButton(text="❌ Отмена", callback_data="admin:broadcast:cancel")],
-        ]
-    )
-
-    preview = (
-        "📢 <b>Предпросмотр рассылки:</b>\n"
-        "━━━━━━━━━━━━━━━━━━━━\n"
-        f"{broadcast_text}\n"
-        "━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"👥 <b>Получателей в Telegram:</b> {count} чел.\n\n"
-        "Отправить это сообщение всем клиентам?"
-    )
-    await message.answer(preview, reply_markup=kb, parse_mode="HTML")
 
 
 @router.callback_query(F.data == "admin:broadcast:send")
@@ -605,3 +1264,223 @@ async def admin_broadcast_send(callback: CallbackQuery):
         await callback.message.edit_text(report, reply_markup=back_kb, parse_mode="HTML")
 
 
+# Message dispatcher for text inputs (SMS, Broadcast, Reschedule, Create appointment)
+@router.message(F.text & ~F.text.startswith("/"))
+async def handle_admin_text_inputs(message: Message):
+    if not message.from_user:
+        return
+    user_id = message.from_user.id
+    raw_text = message.text.strip()
+
+    # 1. Master SMS login
+    if user_id in pending_master_logins and raw_text.isdigit() and len(raw_text) == 4:
+        session_data = pending_master_logins.get(user_id)
+        if session_data and not session_data.get("awaiting_phone"):
+            success, msg = confirm_master_login(session_data, raw_text)
+            if not success:
+                await message.answer(f"❌ <b>{msg}</b>\n\nПопробуйте ввести код ещё раз:")
+                return
+            pending_master_logins.pop(user_id, None)
+            ok, count, sync_msg = sync_masters_appointments()
+            await message.answer(
+                "🎉 <b>Аккаунт Masters успешно подключен!</b>\n\n"
+                f"✅ {sync_msg}\n"
+                "Теперь бот будет автоматически отправлять клиентам напоминания накануне вечером и за 2 часа до начала визита.",
+                reply_markup=admin_menu_keyboard(),
+                parse_mode="HTML",
+            )
+            return
+
+    # 2. Master phone input
+    if user_id in pending_master_logins and pending_master_logins.get(user_id, {}).get("awaiting_phone") and is_phone_number(raw_text):
+        success, msg, session_data = request_master_login(raw_text)
+        if not success:
+            await message.answer(f"❌ <b>{msg}</b>\n\nПопробуйте ввести другой номер телефона:")
+            return
+        pending_master_logins[user_id] = session_data
+        await message.answer(
+            f"📩 <b>Код подтверждения отправлен</b>\n\n"
+            f"На номер <code>{session_data['phone_formatted']}</code> отправлено СМС от Masters.\n\n"
+            "👉 <b>Напишите 4 цифры из СМС в ответном сообщении:</b>",
+            parse_mode="HTML",
+        )
+        return
+
+    if not is_admin(user_id):
+        return
+
+    # 3. Broadcast text
+    if admin_broadcast_drafts.get(user_id, {}).get("step") == "awaiting_text":
+        recipients = get_broadcast_recipients("telegram")
+        count = len(recipients)
+        admin_broadcast_drafts[user_id] = {
+            "step": "confirm",
+            "text": raw_text,
+        }
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text=f"✅ Отправить рассылку ({count})", callback_data="admin:broadcast:send")],
+                [InlineKeyboardButton(text="✏️ Изменить текст", callback_data="admin:broadcast")],
+                [InlineKeyboardButton(text="❌ Отмена", callback_data="admin:broadcast:cancel")],
+            ]
+        )
+        preview = (
+            "📢 <b>Предпросмотр рассылки:</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            f"{raw_text}\n"
+            "━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"👥 <b>Получателей в Telegram:</b> {count} чел.\n\n"
+            "Отправить это сообщение всем клиентам?"
+        )
+        await message.answer(preview, reply_markup=kb, parse_mode="HTML")
+        return
+
+    # 4. Reschedule custom time
+    if admin_resched_drafts.get(user_id, {}).get("step") == "awaiting_custom_time":
+        draft = admin_resched_drafts.pop(user_id)
+        # Parse time string e.g. "08:30" or "8 30"
+        m = re.match(r"^(\d{1,2})[:.-](\d{2})$", raw_text)
+        if not m:
+            await message.answer("⚠️ Неверный формат времени. Введите время в формате <code>08:30</code> или <code>21:00</code>:")
+            admin_resched_drafts[user_id] = draft
+            return
+
+        h, mm = int(m.group(1)), int(m.group(2))
+        time_str = f"{h:02d}:{mm:02d}"
+        day_key = draft["day_key"]
+        appt_id = draft["appt_id"]
+
+        try:
+            new_dt = datetime.datetime.strptime(f"{day_key} {time_str}", "%Y-%m-%d %H:%M").replace(tzinfo=SARATOV_TZ)
+        except Exception:
+            await message.answer("Некорректная дата/время")
+            return
+
+        ok, msg, appt = reschedule_appointment(appt_id, new_dt)
+        if ok and appt and appt.get("platform_user_id") and appt.get("platform") == "telegram":
+            try:
+                await message.bot.send_message(
+                    chat_id=appt["platform_user_id"],
+                    text=(
+                        "🗓 <b>Ваша запись перенесена мастером!</b>\n\n"
+                        f"⏰ Новое время: <b>{format_dt(new_dt)}</b>\n"
+                        f"✂️ Услуга: {appt.get('services')}\n"
+                        f"💰 Стоимость: {appt.get('total_price')} ₽\n\n"
+                        "Ждем вас!"
+                    ),
+                )
+            except Exception as e:
+                logger.warning("Failed to notify client: %s", e)
+
+        await message.answer(
+            f"✅ <b>Запись #{appt_id} успешно перенесена на {format_dt(new_dt)}!</b>",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[[InlineKeyboardButton(text="📋 К календарю", callback_data="admin:appts:today:0")]]
+            ),
+        )
+        return
+
+    # 5. Create appointment steps
+    create_draft = admin_create_drafts.get(user_id)
+    if create_draft:
+        step = create_draft.get("step")
+
+        if step == "awaiting_custom_service":
+            create_draft["service"] = raw_text
+            create_draft["price"] = 1000
+            create_draft["step"] = "day"
+            now = get_current_saratov_time()
+            rows = []
+            for i in range(7):
+                d = now + datetime.timedelta(days=i)
+                day_key = d.strftime("%Y-%m-%d")
+                title = f"{RU_WEEKDAYS[d.weekday()]}, {d.day} {RU_MONTHS[d.month]}"
+                rows.append([InlineKeyboardButton(text=title, callback_data=f"admin:create:day:{day_key}")])
+            rows.append([InlineKeyboardButton(text="⬅️ Отмена", callback_data="admin:menu")])
+            await message.answer(
+                f"✂️ Услуга: <b>{raw_text}</b>\n\n<b>Шаг 2 из 4:</b> Выберите дату записи:",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+            )
+            return
+
+        if step == "awaiting_custom_time":
+            m = re.match(r"^(\d{1,2})[:.-](\d{2})$", raw_text)
+            if not m:
+                await message.answer("⚠️ Неверный формат. Введите время в формате <code>08:30</code> или <code>22:00</code>:")
+                return
+            h, mm = int(m.group(1)), int(m.group(2))
+            create_draft["time_str"] = f"{h:02d}:{mm:02d}"
+            create_draft["step"] = "awaiting_client_info"
+            await message.answer(
+                f"⏰ Время установлено: <b>{create_draft['time_str']}</b>\n\n"
+                "👉 <b>Теперь отправьте в чат телефон и имя клиента:</b>\n"
+                "Например: <code>+79173225155 Борис</code> или с ценой <code>89173225155 Борис 1200</code>",
+                reply_markup=InlineKeyboardMarkup(
+                    inline_keyboard=[[InlineKeyboardButton(text="⬅️ Отмена", callback_data="admin:menu")]]
+                ),
+            )
+            return
+
+        if step == "awaiting_client_info":
+            # Extract phone, optional name, optional price
+            tokens = raw_text.split()
+            phone = ""
+            name = "Клиент"
+            custom_price = create_draft.get("price", 1000)
+
+            for token in tokens:
+                digits = re.sub(r"\D", "", token)
+                if len(digits) >= 10:
+                    phone = normalize_phone(token)
+                elif token.isdigit() and int(token) >= 100:
+                    custom_price = int(token)
+                elif not token.isdigit():
+                    name = token
+
+            if not phone:
+                await message.answer("⚠️ Пожалуйста, укажите номер телефона клиента (например: <code>+79173225155 Иван</code>):")
+                return
+
+            # Combine names if multiple non-digits
+            name_parts = [t for t in tokens if not re.sub(r"\D", "", t).isdigit() or len(re.sub(r"\D", "", t)) < 5]
+            if name_parts:
+                name = " ".join(name_parts)
+
+            create_draft["phone"] = phone
+            create_draft["name"] = name
+            create_draft["price"] = custom_price
+
+            day_key = create_draft["day_key"]
+            time_str = create_draft["time_str"]
+            dt_obj = datetime.datetime.strptime(f"{day_key} {time_str}", "%Y-%m-%d %H:%M").replace(tzinfo=SARATOV_TZ)
+
+            ok, res_msg, appt_id = create_manual_appointment(
+                phone=phone,
+                appointment_time=dt_obj,
+                services=create_draft["service"],
+                total_price=custom_price,
+                client_name=name,
+                platform="manual",
+            )
+
+            admin_create_drafts.pop(user_id, None)
+
+            if ok:
+                await message.answer(
+                    "🎉 <b>Запись успешно создана!</b>\n\n"
+                    f"👤 Клиент: <b>{name}</b> (<code>{phone}</code>)\n"
+                    f"⏰ Дата и время: <b>{format_dt(dt_obj)}</b>\n"
+                    f"✂️ Услуга: <b>{create_draft['service']}</b>\n"
+                    f"💰 Стоимость: <b>{custom_price} ₽</b>\n\n"
+                    "✅ Запись внесена в календарь и синхронизирована с Masters CRM!",
+                    reply_markup=InlineKeyboardMarkup(
+                        inline_keyboard=[
+                            [InlineKeyboardButton(text="📋 К календарю записей", callback_data="admin:appts:today:0")],
+                            [InlineKeyboardButton(text="➕ Создать ещё запись", callback_data="admin:create:start")],
+                            [InlineKeyboardButton(text="⬅️ Главное меню", callback_data="admin:menu")],
+                        ]
+                    ),
+                )
+            else:
+                await message.answer(f"❌ Ошибка создания записи: {res_msg}")
+            return

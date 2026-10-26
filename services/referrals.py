@@ -512,9 +512,95 @@ def get_broadcast_recipients(platform: str) -> list[int]:
             "SELECT DISTINCT platform_user_id FROM appointments WHERE platform = %s AND platform_user_id != 0",
             (platform,),
         ).fetchall()
-        for r in rows2:
-            val = dict(r).get("platform_user_id")
-            if val:
-                user_ids.add(val)
-
         return sorted(user_ids)
+
+
+def get_user_role(platform_user_id: int, platform: str = "telegram") -> str | None:
+    from config import ADMIN_IDS
+    if platform_user_id in ADMIN_IDS:
+        return "admin"
+    try:
+        with get_connection() as conn:
+            val_true = True if conn.is_pg else 1
+            row = conn.execute(
+                "SELECT role FROM user_roles WHERE platform = %s AND platform_user_id = %s AND is_active = %s",
+                (platform, platform_user_id, val_true),
+            ).fetchone()
+            return row["role"] if row else None
+    except Exception as e:
+        logger.debug("Failed checking user role: %s", e)
+        return None
+
+
+def is_admin_user(platform_user_id: int, platform: str = "telegram") -> bool:
+    from config import ADMIN_IDS
+    if platform_user_id in ADMIN_IDS:
+        return True
+    return get_user_role(platform_user_id, platform) == "admin"
+
+
+def is_master_user(platform_user_id: int, platform: str = "telegram") -> bool:
+    if is_admin_user(platform_user_id, platform):
+        return True
+    return get_user_role(platform_user_id, platform) in ("admin", "master")
+
+
+def assign_user_role(platform_or_user_id, user_id_or_platform, role: str = "master", permissions: str = "all") -> bool:
+    if isinstance(platform_or_user_id, int) or (isinstance(platform_or_user_id, str) and platform_or_user_id.isdigit()):
+        platform_user_id = int(platform_or_user_id)
+        platform = str(user_id_or_platform)
+    else:
+        platform = str(platform_or_user_id)
+        platform_user_id = int(user_id_or_platform)
+
+    try:
+        with get_connection() as conn:
+            val_true = True if conn.is_pg else 1
+            existing = conn.execute(
+                "SELECT id FROM user_roles WHERE platform = %s AND platform_user_id = %s",
+                (platform, platform_user_id),
+            ).fetchone()
+            if existing:
+                conn.execute(
+                    """
+                    UPDATE user_roles
+                    SET role = %s, permissions = %s, is_active = %s
+                    WHERE id = %s
+                    """,
+                    (role, permissions, val_true, existing["id"]),
+                )
+            else:
+                conn.execute(
+                    """
+                    INSERT INTO user_roles (platform, platform_user_id, role, permissions, is_active)
+                    VALUES (%s, %s, %s, %s, %s)
+                    """,
+                    (platform, platform_user_id, role, permissions, val_true),
+                )
+            conn.commit()
+            return True
+    except Exception as e:
+        logger.error("Failed to assign role %s to %s: %s", role, platform_user_id, e)
+        return False
+
+
+def revoke_user_role(platform_or_user_id, user_id_or_platform) -> bool:
+    if isinstance(platform_or_user_id, int) or (isinstance(platform_or_user_id, str) and platform_or_user_id.isdigit()):
+        platform_user_id = int(platform_or_user_id)
+        platform = str(user_id_or_platform)
+    else:
+        platform = str(platform_or_user_id)
+        platform_user_id = int(user_id_or_platform)
+
+    try:
+        with get_connection() as conn:
+            val_false = False if conn.is_pg else 0
+            conn.execute(
+                "UPDATE user_roles SET is_active = %s WHERE platform = %s AND platform_user_id = %s",
+                (val_false, platform, platform_user_id),
+            )
+            conn.commit()
+            return True
+    except Exception as e:
+        logger.error("Failed to revoke role from %s: %s", platform_user_id, e)
+        return False
