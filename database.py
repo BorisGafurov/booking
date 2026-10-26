@@ -118,8 +118,13 @@ class DBConnection:
 
 @contextmanager
 def _get_sqlite_connection() -> Generator[DBConnection, None, None]:
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(DB_PATH, timeout=20.0)
+    db_file = DB_PATH
+    try:
+        db_file.parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(db_file, timeout=20.0)
+    except Exception:
+        db_file = Path(__file__).resolve().parent / "bot.db"
+        conn = sqlite3.connect(db_file, timeout=20.0)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     conn.execute("PRAGMA journal_mode = WAL")
