@@ -439,6 +439,62 @@ class TestBookingBot(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(ok_conf_again)
         self.assertIn("отменена", msg_conf)
 
+    def test_masters_confirm_and_cancel_sync(self):
+        from unittest.mock import MagicMock, patch
+        from services.masters_sync import (
+            confirm_masters_appointment,
+            cancel_masters_appointment,
+            disconnect_masters_session,
+        )
+        from database import get_connection
+
+        # Ensure no active session
+        disconnect_masters_session()
+
+        test_appt = {
+            "id": 999111,
+            "masters_id": "test_m_123",
+            "phone": "+79991234567",
+            "appointment_time": datetime.datetime.now(),
+        }
+
+        # Without active session -> returns False with warning
+        ok_c, msg_c = confirm_masters_appointment(test_appt)
+        self.assertFalse(ok_c)
+        self.assertIn("не подключена", msg_c)
+
+        ok_d, msg_d = cancel_masters_appointment(test_appt)
+        self.assertFalse(ok_d)
+        self.assertIn("не подключена", msg_d)
+
+        # Now insert active session
+        with get_connection() as conn:
+            conn.execute(
+                "INSERT INTO masters_session (cookie_phpsessid, cookie_csrf, master_phone, is_active) VALUES (%s, %s, %s, %s)",
+                ("dummy_sess", "dummy_csrf", "+79991234567", True if conn.is_pg else 1),
+            )
+            conn.commit()
+
+        # Mock urllib opener to return successful response
+        mock_resp = MagicMock()
+        mock_resp.status = 200
+        mock_opener = MagicMock()
+        mock_opener.open.return_value.__enter__.return_value = mock_resp
+
+        with patch("services.masters_sync._get_masters_opener", return_value=(mock_opener, "dummy_csrf")):
+            # Test confirm with active session
+            ok_conf, msg_conf = confirm_masters_appointment(test_appt)
+            self.assertTrue(ok_conf)
+            self.assertIn("успешно подтверждена", msg_conf)
+
+            # Test cancel with active session
+            ok_canc, msg_canc = cancel_masters_appointment(test_appt)
+            self.assertTrue(ok_canc)
+            self.assertIn("успешно отменена", msg_canc)
+
+        # Cleanup session
+        disconnect_masters_session()
+
 
 if __name__ == "__main__":
     unittest.main()

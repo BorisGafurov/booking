@@ -163,7 +163,15 @@ def cancel_appointment(appointment_id: int) -> tuple[bool, str, dict | None]:
         conn.commit()
         res = dict(row)
         res["status"] = "cancelled"
-        return True, "Запись успешно отменена", res
+
+    try:
+        from services.masters_sync import cancel_masters_appointment
+        sync_ok, sync_msg = cancel_masters_appointment(res)
+        logger.info("Masters cancel sync for appt %s: %s (%s)", appointment_id, sync_ok, sync_msg)
+    except Exception as e:
+        logger.error("Error executing Masters cancel sync for appt %s: %s", appointment_id, e)
+
+    return True, "Запись успешно отменена", res
 
 
 def confirm_appointment_by_client(appointment_id: int) -> tuple[bool, str, dict | None]:
@@ -184,7 +192,15 @@ def confirm_appointment_by_client(appointment_id: int) -> tuple[bool, str, dict 
         conn.commit()
         res = dict(row)
         res["client_confirmed"] = True
-        return True, "Запись успешно подтверждена", res
+
+    try:
+        from services.masters_sync import confirm_masters_appointment
+        sync_ok, sync_msg = confirm_masters_appointment(res)
+        logger.info("Masters confirm sync for appt %s: %s (%s)", appointment_id, sync_ok, sync_msg)
+    except Exception as e:
+        logger.error("Error executing Masters confirm sync for appt %s: %s", appointment_id, e)
+
+    return True, "Запись успешно подтверждена", res
 
 
 def get_appointment(appointment_id: int) -> dict | None:

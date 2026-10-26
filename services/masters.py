@@ -233,6 +233,17 @@ def confirm_sms_code(session_data: dict[str, Any], code: str) -> tuple[bool, str
         if "неверный код" in html.lower() or "ошибка" in html.lower():
             return False, "Неверный код из СМС. Попробуйте ввести ещё раз."
 
+        # Extract appointment_id from final URL or HTML response
+        final_url = res.geturl()
+        parsed_url = urllib.parse.urlparse(final_url)
+        params = urllib.parse.parse_qs(parsed_url.query)
+        if "id" in params and params["id"]:
+            session_data["appointment_id"] = params["id"][0]
+        else:
+            id_match = re.search(r'(?:appointment_id|record_id|order_id|id)\s*[:=]\s*["\']?([a-zA-Z0-9_-]+)', html)
+            if id_match:
+                session_data["appointment_id"] = id_match.group(1)
+
         return True, "Запись успешно подтверждена!"
     except Exception as e:
         logger.error("Error confirming SMS code in Masters: %s", e)

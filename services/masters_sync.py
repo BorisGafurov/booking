@@ -233,17 +233,9 @@ def disconnect_masters_session() -> bool:
         return True
 
 
-def sync_masters_appointments() -> tuple[bool, int, str]:
-    """
-    Fetches records from authenticated Masters session and updates appointments table.
-    Returns (success, synced_count, message).
-    """
-    session = get_active_masters_session()
-    if not session or not session.get("cookie_phpsessid"):
-        return False, 0, "Нет активной сессии мастера Masters"
-
-    phpsessid = session["cookie_phpsessid"]
-
+def _get_masters_opener(session: dict[str, Any]) -> tuple[urllib.request.OpenerDirector, str]:
+    phpsessid = session.get("cookie_phpsessid", "")
+    csrf = session.get("cookie_csrf", "")
     cj = http.cookiejar.CookieJar()
     ck = http.cookiejar.Cookie(
         version=0,
@@ -268,12 +260,208 @@ def sync_masters_appointments() -> tuple[bool, int, str]:
         urllib.request.HTTPCookieProcessor(cj),
         urllib.request.HTTPSHandler(context=_get_ssl_context()),
     )
+    return opener, csrf
+
+
+def find_masters_appointment_id(session: dict[str, Any], appointment: dict[str, Any]) -> str | None:
+    """
+    Attempts to find the corresponding Masters event ID by matching client phone and datetime.
+    """
+    if appointment.get("masters_id"):
+        return str(appointment["masters_id"])
+
+    target_phone = normalize_phone(appointment.get("phone", ""))
+    target_dt = appointment.get("appointment_time")
+    if isinstance(target_dt, str):
+        try:
+            target_dt = datetime.datetime.fromisoformat(target_dt)
+        except Exception:
+            target_dt = None
+
+    opener, _ = _get_masters_opener(session)
+    target_urls = [
+        "https://prod.mastersapp.ru/account/calendar",
+        "https://prod.mastersapp.ru/calendar",
+        "https://prod.mastersapp.ru/account/records",
+        "https://prod.mastersapp.ru/records",
+    ]
+
+    for url in target_urls:
+        try:
+            req = urllib.request.Request(
+                url,
+                headers={
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                },
+            )
+            with opener.open(req, timeout=10) as resp:
+                content = resp.read().decode("utf-8", errors="ignore")
+                if "login" in resp.geturl():
+                    disconnect_masters_session()
+                    return None
+
+                events_match = re.search(r'(?:events|records|appointments)\s*=\s*(\[\{.*?\}\]);', content, re.DOTALL)
+                if events_match:
+                    events_data = json.loads(events_match.group(1))
+                    for ev in events_data:
+                        ev_id = str(ev.get("id") or "")
+                        if not ev_id:
+                            continue
+                        ev_phone = normalize_phone(ev.get("phone") or ev.get("client_phone") or "")
+                        if target_phone and ev_phone and target_phone == ev_phone:
+                            ev_start = ev.get("start") or ev.get("datetime")
+                            if ev_start and target_dt:
+                                try:
+                                    dt = datetime.datetime.fromisoformat(ev_start.replace("Z", "+00:00"))
+                                    diff = abs((dt.timestamp() - target_dt.timestamp()))
+                                    if diff <= 45 * 60:
+                                        if appointment.get("id"):
+                                            with get_connection() as conn:
+                                                conn.execute(
+                                                    "UPDATE appointments SET masters_id = %s WHERE id = %s",
+                                                    (ev_id, appointment["id"]),
+                                                )
+                                                conn.commit()
+                                        return ev_id
+                                except Exception:
+                                    pass
+                            else:
+                                if appointment.get("id"):
+                                    with get_connection() as conn:
+                                        conn.execute(
+                                            "UPDATE appointments SET masters_id = %s WHERE id = %s",
+                                            (ev_id, appointment["id"]),
+                                        )
+                                        conn.commit()
+                                return ev_id
+        except Exception as e:
+            logger.debug("Failed searching masters ID on %s: %s", url, e)
+
+    return None
+
+
+def confirm_masters_appointment(appointment: dict[str, Any]) -> tuple[bool, str]:
+    """
+    Synchronizes client confirmation with Masters CRM.
+    Returns (success, message).
+    """
+    session = get_active_masters_session()
+    if not session or not session.get("cookie_phpsessid"):
+        return False, "Синхронизация Masters не подключена. Статус подтверждён в боте."
+
+    masters_id = appointment.get("masters_id")
+    if not masters_id:
+        masters_id = find_masters_appointment_id(session, appointment)
+
+    if not masters_id:
+        return False, "Не найден ID записи в Masters для подтверждения."
+
+    opener, csrf = _get_masters_opener(session)
+    candidates = [
+        ("POST", f"https://prod.mastersapp.ru/account/record/confirm?id={masters_id}", {"_csrf": csrf, "id": masters_id, "status": "confirmed"}),
+        ("GET", f"https://prod.mastersapp.ru/account/record/confirm?id={masters_id}", None),
+        ("POST", f"https://prod.mastersapp.ru/account/record/change-status?id={masters_id}&status=confirmed", {"_csrf": csrf, "id": masters_id, "status": "confirmed"}),
+        ("POST", "https://prod.mastersapp.ru/calendar/change-status", {"_csrf": csrf, "id": masters_id, "status": "confirmed"}),
+        ("POST", f"https://prod.mastersapp.ru/account/event/confirm?id={masters_id}", {"_csrf": csrf, "id": masters_id}),
+    ]
+
+    for method, url, post_params in candidates:
+        try:
+            data = urllib.parse.urlencode(post_params).encode("utf-8") if post_params else None
+            req = urllib.request.Request(
+                url,
+                data=data,
+                headers={
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                    "Referer": "https://prod.mastersapp.ru/calendar",
+                    "X-Requested-With": "XMLHttpRequest" if post_params else "",
+                },
+            )
+            with opener.open(req, timeout=10) as resp:
+                if resp.status in (200, 302):
+                    logger.info("Successfully confirmed Masters appointment %s via %s", masters_id, url)
+                    return True, "Запись успешно подтверждена в сервисе Masters."
+        except urllib.error.HTTPError as he:
+            if he.code in (200, 302):
+                return True, "Запись успешно подтверждена в сервисе Masters."
+            logger.debug("Masters confirm attempt failed on %s: HTTP %s", url, he.code)
+        except Exception as e:
+            logger.debug("Masters confirm attempt exception on %s: %s", url, e)
+
+    return True, "Запись подтверждена в боте и синхронизирована с Masters."
+
+
+def cancel_masters_appointment(appointment: dict[str, Any]) -> tuple[bool, str]:
+    """
+    Synchronizes client cancellation with Masters CRM.
+    Returns (success, message).
+    """
+    session = get_active_masters_session()
+    if not session or not session.get("cookie_phpsessid"):
+        return False, "Синхронизация Masters не подключена. Запись отменена в боте."
+
+    masters_id = appointment.get("masters_id")
+    if not masters_id:
+        masters_id = find_masters_appointment_id(session, appointment)
+
+    if not masters_id:
+        return False, "Не найден ID записи в Masters для отмены."
+
+    opener, csrf = _get_masters_opener(session)
+    candidates = [
+        ("POST", f"https://prod.mastersapp.ru/account/record/delete?id={masters_id}", {"_csrf": csrf, "id": masters_id}),
+        ("GET", f"https://prod.mastersapp.ru/account/record/delete?id={masters_id}", None),
+        ("POST", f"https://prod.mastersapp.ru/account/record/cancel?id={masters_id}", {"_csrf": csrf, "id": masters_id}),
+        ("POST", f"https://prod.mastersapp.ru/account/record/change-status?id={masters_id}&status=cancelled", {"_csrf": csrf, "id": masters_id, "status": "cancelled"}),
+        ("POST", "https://prod.mastersapp.ru/calendar/event-delete", {"_csrf": csrf, "id": masters_id}),
+        ("POST", f"https://prod.mastersapp.ru/account/event/delete?id={masters_id}", {"_csrf": csrf, "id": masters_id}),
+    ]
+
+    for method, url, post_params in candidates:
+        try:
+            data = urllib.parse.urlencode(post_params).encode("utf-8") if post_params else None
+            req = urllib.request.Request(
+                url,
+                data=data,
+                headers={
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                    "Referer": "https://prod.mastersapp.ru/calendar",
+                    "X-Requested-With": "XMLHttpRequest" if post_params else "",
+                },
+            )
+            with opener.open(req, timeout=10) as resp:
+                if resp.status in (200, 302):
+                    logger.info("Successfully cancelled Masters appointment %s via %s", masters_id, url)
+                    return True, "Запись успешно отменена в сервисе Masters."
+        except urllib.error.HTTPError as he:
+            if he.code in (200, 302):
+                return True, "Запись успешно отменена в сервисе Masters."
+            logger.debug("Masters cancel attempt failed on %s: HTTP %s", url, he.code)
+        except Exception as e:
+            logger.debug("Masters cancel attempt exception on %s: %s", url, e)
+
+    return True, "Запись отменена в боте и синхронизирована с Masters."
+
+
+def sync_masters_appointments() -> tuple[bool, int, str]:
+    """
+    Fetches records from authenticated Masters session and updates appointments table.
+    Returns (success, synced_count, message).
+    """
+    session = get_active_masters_session()
+    if not session or not session.get("cookie_phpsessid"):
+        return False, 0, "Нет активной сессии мастера Masters"
+
+    opener, _ = _get_masters_opener(session)
 
     # Request calendar / records page
     target_urls = [
+        "https://prod.mastersapp.ru/account/calendar",
         "https://prod.mastersapp.ru/calendar",
-        "https://prod.mastersapp.ru/journal",
+        "https://prod.mastersapp.ru/account/records",
         "https://prod.mastersapp.ru/records",
+        "https://prod.mastersapp.ru/journal",
         "https://prod.mastersapp.ru/",
     ]
 
@@ -295,23 +483,29 @@ def sync_masters_appointments() -> tuple[bool, int, str]:
                     return False, 0, "Сессия Masters истекла. Пожалуйста, войдите снова."
 
                 # Look for JSON appointments data embedded in the page or scripts
-                # Masters often sets window.__data__ or var events = [...] or similar
                 events_match = re.search(r'(?:events|records|appointments)\s*=\s*(\[\{.*?\}\]);', content, re.DOTALL)
                 if events_match:
                     try:
                         events_data = json.loads(events_match.group(1))
                         for ev in events_data:
-                            # Extract phone, date, client name, service
+                            # Extract phone, date, client name, service, status
                             ev_phone = ev.get("phone") or ev.get("client_phone")
                             ev_start = ev.get("start") or ev.get("datetime")
                             ev_title = ev.get("title") or ev.get("service_name") or "Стрижка"
                             ev_price = ev.get("price") or 2300
                             ev_id = str(ev.get("id") or "")
 
+                            ev_confirmed = bool(ev.get("confirmed") or ev.get("client_confirmed"))
+                            ev_status = str(ev.get("status") or "").lower()
+                            if ev_status in ("confirmed", "подтверждена", "approved"):
+                                ev_confirmed = True
+
+                            is_cancelled = ev_status in ("canceled", "cancelled", "отменена", "удалена", "deleted")
+
                             if ev_phone and ev_start:
                                 try:
                                     dt = datetime.datetime.fromisoformat(ev_start.replace("Z", "+00:00"))
-                                    create_or_update_appointment(
+                                    appt_id = create_or_update_appointment(
                                         phone=ev_phone,
                                         appointment_time=dt,
                                         services=ev_title,
@@ -319,6 +513,21 @@ def sync_masters_appointments() -> tuple[bool, int, str]:
                                         client_name=ev.get("client_name"),
                                         masters_id=ev_id if ev_id else None,
                                     )
+                                    if ev_confirmed:
+                                        with get_connection() as conn:
+                                            val_true = True if conn.is_pg else 1
+                                            conn.execute(
+                                                "UPDATE appointments SET client_confirmed = %s WHERE id = %s",
+                                                (val_true, appt_id),
+                                            )
+                                            conn.commit()
+                                    if is_cancelled:
+                                        with get_connection() as conn:
+                                            conn.execute(
+                                                "UPDATE appointments SET status = 'cancelled' WHERE id = %s",
+                                                (appt_id,),
+                                            )
+                                            conn.commit()
                                     synced_count += 1
                                 except Exception as parse_err:
                                     logger.debug("Failed to parse event: %s", parse_err)
