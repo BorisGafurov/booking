@@ -703,17 +703,18 @@ async def admin_create_start(callback: CallbackQuery):
         await callback.answer("Нет доступа.", show_alert=True)
         return
 
+    opts = await asyncio.to_thread(get_service_options_for_creation)
     admin_create_drafts[callback.from_user.id] = {
         "step": "service",
+        "options": opts,
     }
 
-    opts = get_service_options_for_creation()
     rows = []
-    for o in opts:
+    for idx, o in enumerate(opts):
         rows.append([
             InlineKeyboardButton(
                 text=f"{o['name']} ({o['price']} ₽)",
-                callback_data=f"admin:create:svc:{o['name']}:{o['price']}",
+                callback_data=f"admin:create:svc:{idx}",
             )
         ])
     rows.append([InlineKeyboardButton(text="✏️ Другая услуга / своя цена", callback_data="admin:create:svc:custom")])
@@ -724,6 +725,7 @@ async def admin_create_start(callback: CallbackQuery):
             "➕ <b>Создание новой записи мастером</b>\n\n"
             "<b>Шаг 1 из 4:</b> Выберите услугу из Masters или введите другое название:",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+            parse_mode="HTML",
         )
     await callback.answer()
 
@@ -735,10 +737,10 @@ async def admin_create_service_chosen(callback: CallbackQuery):
         return
 
     parts = callback.data.split(":")
-    svc_name = parts[3]
+    svc_code = parts[3]
 
     draft = admin_create_drafts.setdefault(callback.from_user.id, {})
-    if svc_name == "custom":
+    if svc_code == "custom":
         draft["step"] = "awaiting_custom_service"
         if callback.message:
             await callback.message.edit_text(
@@ -746,11 +748,29 @@ async def admin_create_service_chosen(callback: CallbackQuery):
                 reply_markup=InlineKeyboardMarkup(
                     inline_keyboard=[[InlineKeyboardButton(text="⬅️ Отмена", callback_data="admin:create:start")]]
                 ),
+                parse_mode="HTML",
             )
         await callback.answer()
         return
 
-    price = int(parts[4]) if len(parts) > 4 and parts[4].isdigit() else 2300
+    opts = draft.get("options")
+    if not opts:
+        opts = await asyncio.to_thread(get_service_options_for_creation)
+        draft["options"] = opts
+
+    if svc_code.isdigit():
+        idx = int(svc_code)
+        if 0 <= idx < len(opts):
+            selected = opts[idx]
+            svc_name = selected["name"]
+            price = selected["price"]
+        else:
+            svc_name = "Стрижка (МУЖСКАЯ)"
+            price = 2300
+    else:
+        svc_name = svc_code
+        price = int(parts[4]) if len(parts) > 4 and parts[4].isdigit() else 2300
+
     draft["service"] = svc_name
     draft["price"] = price
     draft["step"] = "day"
@@ -776,13 +796,23 @@ async def show_create_day_picker(callback: CallbackQuery):
             )
         ])
 
-    rows.append([InlineKeyboardButton(text="⬅️ Отмена", callback_data="admin:menu")])
+    rows.append([InlineKeyboardButton(text="⬅️ Назад к услугам", callback_data="admin:create:start")])
+    rows.append([InlineKeyboardButton(text="❌ Отмена", callback_data="admin:menu")])
     if callback.message:
         await callback.message.edit_text(
             "➕ <b>Шаг 2 из 4:</b> Выберите дату записи:",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+            parse_mode="HTML",
         )
     await callback.answer()
+
+
+@router.callback_query(F.data == "admin:create:back_to_days")
+async def admin_create_back_to_days(callback: CallbackQuery):
+    if not callback.from_user or not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа.", show_alert=True)
+        return
+    await show_create_day_picker(callback)
 
 
 @router.callback_query(F.data.startswith("admin:create:day:"))
@@ -810,13 +840,15 @@ async def admin_create_day_chosen(callback: CallbackQuery):
     rows.append([
         InlineKeyboardButton(text="✏️ Любое другое время (08:30, 22:00...)", callback_data="admin:create:time:custom")
     ])
-    rows.append([InlineKeyboardButton(text="⬅️ Назад к датам", callback_data="admin:create:start")])
+    rows.append([InlineKeyboardButton(text="⬅️ Назад к датам", callback_data="admin:create:back_to_days")])
+    rows.append([InlineKeyboardButton(text="❌ Отмена", callback_data="admin:menu")])
 
     if callback.message:
         await callback.message.edit_text(
             f"➕ <b>Шаг 3 из 4:</b> Выберите время на <b>{day_key}</b>:\n"
             "<i>(можно записать клиента и вне стандартного рабочего графика)</i>",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+            parse_mode="HTML",
         )
     await callback.answer()
 
@@ -1575,6 +1607,7 @@ def _has_active_admin_draft(message: Message) -> bool:
         or uid in admin_resched_drafts
         or uid in admin_create_drafts
         or uid in admin_edit_client_drafts
+        or uid in admin_edit_price_drafts
         or uid in admin_clients_state
     )
 
