@@ -206,7 +206,7 @@ async def choose_time_slot(callback: CallbackQuery):
 async def _finalize_successful_booking(
     bot,
     user_id: int,
-    session_data: dict[str, Any],
+    session_data: dict,
     client_name: str,
     target_msg_or_cb,
 ):
