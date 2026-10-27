@@ -102,7 +102,7 @@ def create_or_update_appointment(
         # Check existing by masters_id if provided
         if masters_id:
             existing_row = conn.execute(
-                "SELECT id, client_name, phone, services, total_price, platform, platform_user_id, user_id FROM appointments WHERE masters_id = %s", (masters_id,)
+                "SELECT id, client_name, phone, services, total_price, platform, platform_user_id, user_id, status FROM appointments WHERE masters_id = %s", (masters_id,)
             ).fetchone()
             if existing_row:
                 existing = dict(existing_row)
@@ -132,6 +132,11 @@ def create_or_update_appointment(
 
                 eff_user_db_id = user_db_id if user_db_id is not None else existing.get("user_id")
 
+                eff_status = existing.get("status")
+                # Preserve terminal status if already completed or cancelled
+                if eff_status not in ("completed", "cancelled"):
+                    eff_status = "confirmed"
+
                 conn.execute(
                     """
                     UPDATE appointments
@@ -143,7 +148,7 @@ def create_or_update_appointment(
                         services = %s,
                         total_price = %s,
                         appointment_time = %s,
-                        status = 'confirmed',
+                        status = %s,
                         updated_at = CURRENT_TIMESTAMP
                     WHERE id = %s
                     """,
@@ -156,6 +161,7 @@ def create_or_update_appointment(
                         eff_services,
                         eff_price,
                         appointment_time if conn.is_pg else appointment_time.strftime("%Y-%m-%d %H:%M:%S"),
+                        eff_status,
                         existing["id"],
                     ),
                 )
@@ -212,22 +218,59 @@ def create_or_update_appointment(
             return row_id
 
 
-def cancel_appointment(appointment_id: int) -> tuple[bool, str, dict | None]:
+def _check_appointment_access(
+    appt: dict[str, Any],
+    platform: str | None = None,
+    platform_user_id: int | None = None,
+) -> bool:
+    """
+    Checks if caller is authorized to modify the appointment.
+    If platform and platform_user_id are omitted, caller is internal system / worker.
+    """
+    if platform is None or platform_user_id is None:
+        return True
+
+    try:
+        from core_bot.services.referrals import is_master_user, get_user_by_platform_id
+        if is_master_user(platform_user_id, platform):
+            return True
+
+        if appt.get("platform") == platform and appt.get("platform_user_id") == platform_user_id:
+            return True
+
+        user = get_user_by_platform_id(platform_user_id, platform)
+        if user and appt.get("user_id") and user.get("id") == appt["user_id"]:
+            return True
+    except Exception as e:
+        logger.error("Error in _check_appointment_access: %s", e)
+        return False
+
+    return False
+
+
+def cancel_appointment(
+    appointment_id: int,
+    platform: str | None = None,
+    platform_user_id: int | None = None,
+) -> tuple[bool, str, dict | None]:
     with get_connection() as conn:
         row = conn.execute(
             "SELECT * FROM appointments WHERE id = %s", (appointment_id,)
         ).fetchone()
         if not row:
             return False, "Запись не найдена", None
-        if row["status"] == "cancelled":
-            return False, "Запись уже отменена", dict(row)
+        appt = dict(row)
+        if not _check_appointment_access(appt, platform, platform_user_id):
+            return False, "У вас нет прав для изменения этой записи.", None
+        if appt["status"] == "cancelled":
+            return False, "Запись уже отменена", appt
 
         conn.execute(
             "UPDATE appointments SET status = 'cancelled', updated_at = CURRENT_TIMESTAMP WHERE id = %s",
             (appointment_id,),
         )
         conn.commit()
-        res = dict(row)
+        res = dict(appt)
         res["status"] = "cancelled"
 
     try:
@@ -240,15 +283,22 @@ def cancel_appointment(appointment_id: int) -> tuple[bool, str, dict | None]:
     return True, "Запись успешно отменена", res
 
 
-def confirm_appointment_by_client(appointment_id: int) -> tuple[bool, str, dict | None]:
+def confirm_appointment_by_client(
+    appointment_id: int,
+    platform: str | None = None,
+    platform_user_id: int | None = None,
+) -> tuple[bool, str, dict | None]:
     with get_connection() as conn:
         row = conn.execute(
             "SELECT * FROM appointments WHERE id = %s", (appointment_id,)
         ).fetchone()
         if not row:
             return False, "Запись не найдена", None
-        if row["status"] == "cancelled":
-            return False, "Запись уже отменена", dict(row)
+        appt = dict(row)
+        if not _check_appointment_access(appt, platform, platform_user_id):
+            return False, "У вас нет прав для изменения этой записи.", None
+        if appt["status"] == "cancelled":
+            return False, "Запись уже отменена", appt
 
         val = True if conn.is_pg else 1
         conn.execute(
@@ -256,7 +306,7 @@ def confirm_appointment_by_client(appointment_id: int) -> tuple[bool, str, dict 
             (val, appointment_id),
         )
         conn.commit()
-        res = dict(row)
+        res = dict(appt)
         res["client_confirmed"] = True
 
     try:
@@ -363,6 +413,8 @@ def complete_appointment(appointment_id: int) -> tuple[bool, str, dict | None, d
 def reschedule_appointment(
     appointment_id: int,
     new_datetime: datetime.datetime,
+    platform: str | None = None,
+    platform_user_id: int | None = None,
 ) -> tuple[bool, str, dict | None]:
     """
     Reschedules appointment to a new date and time and resets reminder flags.
@@ -377,6 +429,9 @@ def reschedule_appointment(
         row = conn.execute("SELECT * FROM appointments WHERE id = %s", (appointment_id,)).fetchone()
         if not row:
             return False, "Запись не найдена", None
+        appt = dict(row)
+        if not _check_appointment_access(appt, platform, platform_user_id):
+            return False, "У вас нет прав для изменения этой записи.", None
 
         val_false = False if conn.is_pg else 0
         dt_val = new_datetime if conn.is_pg else new_datetime.strftime("%Y-%m-%d %H:%M:%S")
@@ -1025,7 +1080,7 @@ def get_due_retention_reminders(platform: str | None = None) -> list[dict]:
     with get_connection() as conn:
         query = """
             SELECT * FROM appointments
-            WHERE status = 'confirmed'
+            WHERE status IN ('completed', 'confirmed')
               AND retention_18d_sent = FALSE
               AND appointment_time <= %s AND appointment_time >= %s
         """

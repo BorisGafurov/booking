@@ -17,12 +17,19 @@ logger = logging.getLogger(__name__)
 BASE_MASTER_URL = "https://mst.link/boris_gafurov"
 
 
+SARATOV_TZ = datetime.timezone(datetime.timedelta(hours=4))
+
+
 def _get_ssl_context() -> ssl.SSLContext:
     try:
         import certifi
         return ssl.create_default_context(cafile=certifi.where())
     except Exception:
-        return ssl._create_unverified_context()
+        try:
+            return ssl.create_default_context()
+        except Exception:
+            logger.warning("Could not create verified SSL context, falling back to unverified context")
+            return ssl._create_unverified_context()
 
 SERVICES = {
     "hair": {
@@ -173,7 +180,7 @@ def get_schedule(selected_keys: list[str] | set[str] | None) -> dict[str, Any]:
 
         for ts_str, time_str in slots:
             ts = int(ts_str)
-            dt = datetime.datetime.fromtimestamp(ts)
+            dt = datetime.datetime.fromtimestamp(ts, tz=SARATOV_TZ)
             day_key = dt.strftime("%Y-%m-%d")
             wd = ru_weekdays[dt.weekday()]
             full_title = f"{wd}, {dt.day} {months_ru[dt.month]}"

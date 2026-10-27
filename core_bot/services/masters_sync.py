@@ -389,7 +389,7 @@ def confirm_masters_appointment(appointment: dict[str, Any]) -> tuple[bool, str]
         except Exception as e:
             logger.debug("Masters confirm attempt exception on %s: %s", url, e)
 
-    return True, "Запись подтверждена в боте и синхронизирована с Masters."
+    return False, "Не удалось подтвердить запись в сервисе Masters."
 
 
 def cancel_masters_appointment(appointment: dict[str, Any]) -> tuple[bool, str]:
@@ -441,7 +441,7 @@ def cancel_masters_appointment(appointment: dict[str, Any]) -> tuple[bool, str]:
         except Exception as e:
             logger.debug("Masters cancel attempt exception on %s: %s", url, e)
 
-    return True, "Запись отменена в боте и синхронизирована с Masters."
+    return False, "Не удалось отменить запись в сервисе Masters."
 
 
 def complete_masters_appointment(appointment: dict[str, Any]) -> tuple[bool, str]:
@@ -491,7 +491,7 @@ def complete_masters_appointment(appointment: dict[str, Any]) -> tuple[bool, str
         except Exception as e:
             logger.debug("Masters complete attempt exception on %s: %s", url, e)
 
-    return True, "Запись отмечена выполненной в боте и синхронизирована с Masters."
+    return False, "Не удалось отметить запись выполненной в сервисе Masters."
 
 
 def reschedule_masters_appointment(appointment: dict[str, Any], new_datetime: datetime.datetime) -> tuple[bool, str]:
@@ -543,7 +543,7 @@ def reschedule_masters_appointment(appointment: dict[str, Any], new_datetime: da
         except Exception as e:
             logger.debug("Masters reschedule attempt exception on %s: %s", url, e)
 
-    return True, "Запись перенесена в боте и синхронизирована с Masters."
+    return False, "Не удалось перенести запись в сервисе Masters."
 
 
 def create_masters_appointment(
@@ -597,7 +597,7 @@ def create_masters_appointment(
         except Exception as e:
             logger.debug("Failed creating record in Masters on %s: %s", url, e)
 
-    return True, "Запись создана в боте и поставлена в очередь синхронизации Masters.", None
+    return False, "Не удалось создать запись в Masters.", None
 
 
 def sync_schedule_from_masters_link() -> tuple[bool, int, str]:

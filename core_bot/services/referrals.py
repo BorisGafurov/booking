@@ -1,5 +1,7 @@
 import logging
+import os
 import re
+from pathlib import Path
 from typing import Any
 
 try:
@@ -20,6 +22,36 @@ from core_bot.database import get_connection
 logger = logging.getLogger(__name__)
 
 
+def get_current_platform() -> str:
+    env_p = os.getenv("DEFAULT_PLATFORM") or os.getenv("PLATFORM")
+    if env_p:
+        return env_p.lower()
+    try:
+        repo_name = Path(__file__).resolve().parents[2].name.lower()
+        if "vk" in repo_name:
+            return "vk"
+        if "max" in repo_name:
+            return "max"
+        if "booking" in repo_name:
+            return "telegram"
+    except Exception:
+        pass
+    try:
+        import config
+        if hasattr(config, "VK_TOKEN") and config.VK_TOKEN:
+            return "vk"
+        if hasattr(config, "MAX_BOT_TOKEN") and config.MAX_BOT_TOKEN:
+            return "max"
+    except Exception:
+        pass
+    cwd = os.getcwd().lower()
+    if "vk" in cwd:
+        return "vk"
+    if "max" in cwd:
+        return "max"
+    return "telegram"
+
+
 def normalize_phone(raw_phone: str | None) -> str:
     """Normalize phone string to standard +7XXXXXXXXXX format."""
     if not raw_phone:
@@ -35,31 +67,23 @@ def normalize_phone(raw_phone: str | None) -> str:
 
 
 def _find_user(conn, identifier: int, platform: str | None = None) -> dict | None:
+    if platform is None:
+        platform = get_current_platform()
+
     if platform == "telegram":
         row = conn.execute("SELECT * FROM users WHERE telegram_id = %s", (identifier,)).fetchone()
-        if row:
-            return dict(row)
+        return dict(row) if row else None
     elif platform == "vk":
         row = conn.execute("SELECT * FROM users WHERE vk_id = %s", (identifier,)).fetchone()
-        if row:
-            return dict(row)
+        return dict(row) if row else None
     elif platform == "max":
         row = conn.execute("SELECT * FROM users WHERE max_user_id = %s", (identifier,)).fetchone()
-        if row:
-            return dict(row)
+        return dict(row) if row else None
+    elif platform in ("id", "db", "user_id"):
+        row = conn.execute("SELECT * FROM users WHERE id = %s", (identifier,)).fetchone()
+        return dict(row) if row else None
 
-    row = conn.execute("SELECT * FROM users WHERE id = %s", (identifier,)).fetchone()
-    if row:
-        return dict(row)
-
-    row = conn.execute(
-        """
-        SELECT * FROM users
-        WHERE telegram_id = %s OR vk_id = %s OR max_user_id = %s
-        """,
-        (identifier, identifier, identifier),
-    ).fetchone()
-    return dict(row) if row else None
+    return None
 
 
 def _save_user_unified(
@@ -169,7 +193,7 @@ get_referral_link = build_referral_link
 def register_referral(
     new_user_id: int | None = None,
     referrer_id: int | None = None,
-    platform: str = "telegram",
+    platform: str | None = None,
     *,
     new_user_telegram_id: int | None = None,
     referrer_telegram_id: int | None = None,
@@ -191,6 +215,8 @@ def register_referral(
         new_user_id = new_user_max_id
         referrer_id = referrer_max_id
         platform = "max"
+    elif platform is None:
+        platform = get_current_platform()
 
     if new_user_id == referrer_id:
         return False, "Нельзя пригласить самого себя.", None
@@ -262,7 +288,7 @@ def get_referral_stats(
         referrer_platform_id = referrer_max_id
         platform = "max"
     elif platform is None:
-        platform = "telegram"
+        platform = get_current_platform()
 
     with get_connection() as conn:
         referrer = _find_user(conn, referrer_platform_id, platform)
@@ -528,7 +554,9 @@ def mark_reward_used(reward_id: int) -> tuple[bool, str, dict | None]:
     return True, f"Скидка {reward['amount']} ₽ успешно применена.", notify_data
 
 
-def get_user_by_platform_id(platform_user_id: int, platform: str = "telegram") -> dict | None:
+def get_user_by_platform_id(platform_user_id: int, platform: str | None = None) -> dict | None:
+    if platform is None:
+        platform = get_current_platform()
     with get_connection() as conn:
         return _find_user(conn, platform_user_id, platform)
 
@@ -541,6 +569,8 @@ def is_phone_number(text: str) -> bool:
 
 
 def get_user_phone(user_identifier: int, platform: str | None = None) -> str | None:
+    if platform is None:
+        platform = get_current_platform()
     with get_connection() as conn:
         user = _find_user(conn, user_identifier, platform)
         if user and user.get("phone"):
@@ -558,6 +588,8 @@ def get_user_by_phone(phone: str) -> dict | None:
 
 
 def link_user_phone(user_identifier: int, phone: str, platform: str | None = None) -> tuple[bool, str]:
+    if platform is None:
+        platform = get_current_platform()
     clean_phone = normalize_phone(phone)
     digits = "".join(ch for ch in clean_phone if ch.isdigit())
     if len(digits) < 11:
@@ -650,20 +682,25 @@ def get_all_clients(limit: int = 100, offset: int = 0) -> tuple[list[dict], int]
 def search_clients(query: str, limit: int = 20) -> list[dict]:
     q = f"%{query.strip()}%"
     with get_connection() as conn:
-        rows = conn.execute(
-            """
+        if conn.is_pg:
+            where_sql = "WHERE first_name ILIKE %s OR last_name ILIKE %s OR phone ILIKE %s OR username ILIKE %s"
+        else:
+            where_sql = "WHERE LOWER(COALESCE(first_name, '')) LIKE LOWER(%s) OR LOWER(COALESCE(last_name, '')) LIKE LOWER(%s) OR LOWER(COALESCE(phone, '')) LIKE LOWER(%s) OR LOWER(COALESCE(username, '')) LIKE LOWER(%s)"
+
+        sql = f"""
             SELECT id, telegram_id, vk_id, max_user_id, phone, username, first_name, last_name, created_at
             FROM users
-            WHERE first_name ILIKE %s OR last_name ILIKE %s OR phone ILIKE %s OR username ILIKE %s
+            {where_sql}
             ORDER BY created_at DESC
             LIMIT %s;
-            """,
-            (q, q, q, q, limit),
-        ).fetchall()
+        """
+        rows = conn.execute(sql, (q, q, q, q, limit)).fetchall()
         return [dict(r) for r in rows]
 
 
-def get_all_platform_user_ids(platform: str = "telegram") -> list[int]:
+def get_all_platform_user_ids(platform: str | None = None) -> list[int]:
+    if platform is None:
+        platform = get_current_platform()
     col = "telegram_id" if platform == "telegram" else ("vk_id" if platform == "vk" else "max_user_id")
     with get_connection() as conn:
         rows = conn.execute(f"SELECT {col} FROM users WHERE {col} IS NOT NULL").fetchall()
@@ -681,7 +718,9 @@ def get_all_platform_user_ids(platform: str = "telegram") -> list[int]:
         return sorted(user_ids)
 
 
-def get_user_role(platform_user_id: int, platform: str = "telegram") -> str | None:
+def get_user_role(platform_user_id: int, platform: str | None = None) -> str | None:
+    if platform is None:
+        platform = get_current_platform()
     try:
         from config import ADMIN_IDS
         if platform_user_id in ADMIN_IDS:
@@ -703,7 +742,9 @@ def get_user_role(platform_user_id: int, platform: str = "telegram") -> str | No
         return None
 
 
-def is_admin_user(platform_user_id: int, platform: str = "telegram") -> bool:
+def is_admin_user(platform_user_id: int, platform: str | None = None) -> bool:
+    if platform is None:
+        platform = get_current_platform()
     try:
         from config import ADMIN_IDS
         if platform_user_id in ADMIN_IDS:
@@ -713,13 +754,17 @@ def is_admin_user(platform_user_id: int, platform: str = "telegram") -> bool:
     return get_user_role(platform_user_id, platform) == "admin"
 
 
-def is_master_user(platform_user_id: int, platform: str = "telegram") -> bool:
+def is_master_user(platform_user_id: int, platform: str | None = None) -> bool:
+    if platform is None:
+        platform = get_current_platform()
     if is_admin_user(platform_user_id, platform):
         return True
     return get_user_role(platform_user_id, platform) in ("admin", "master")
 
 
-def get_all_master_ids(platform: str = "telegram") -> list[int]:
+def get_all_master_ids(platform: str | None = None) -> list[int]:
+    if platform is None:
+        platform = get_current_platform()
     try:
         from config import ADMIN_IDS
         master_ids = set(ADMIN_IDS)

@@ -1,6 +1,7 @@
 import asyncio
 import datetime
 import logging
+import os
 from aiogram import Bot
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
@@ -71,14 +72,35 @@ def _get_retention_keyboard() -> InlineKeyboardMarkup:
     )
 
 
-MASTER_PHONES = {"+79173225155", "79173225155", "89173225155"}
-MASTER_USER_IDS = {1010373026, 90599236, 503925574}
+MASTER_PHONES = {
+    p.strip() for p in os.getenv("MASTER_PHONES", "+79173225155,79173225155,89173225155").split(",") if p.strip()
+}
+MASTER_TELEGRAM_IDS = {
+    int(x.strip()) for x in (os.getenv("MASTER_TELEGRAM_IDS") or "1010373026,503925574").split(",") if x.strip().isdigit()
+}
+MASTER_VK_IDS = {
+    int(x.strip()) for x in (os.getenv("MASTER_VK_IDS") or "90599236").split(",") if x.strip().isdigit()
+}
+MASTER_MAX_IDS = {
+    int(x.strip()) for x in (os.getenv("MASTER_MAX_IDS") or "").split(",") if x.strip().isdigit()
+}
+MASTER_USER_IDS = {
+    int(x.strip()) for x in (os.getenv("MASTER_USER_IDS") or "").split(",") if x.strip().isdigit()
+}
 
 
 def _is_master_or_admin(user_id: int, platform: str) -> bool:
     if not user_id:
         return False
-    if user_id in ADMIN_IDS or user_id in MASTER_USER_IDS:
+    if user_id in ADMIN_IDS:
+        return True
+    if platform == "telegram" and user_id in MASTER_TELEGRAM_IDS:
+        return True
+    if platform == "vk" and user_id in MASTER_VK_IDS:
+        return True
+    if platform == "max" and user_id in MASTER_MAX_IDS:
+        return True
+    if user_id in MASTER_USER_IDS:
         return True
     try:
         from services.referrals import is_master_user, is_admin_user

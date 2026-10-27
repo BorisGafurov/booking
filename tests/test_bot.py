@@ -272,8 +272,8 @@ class TestBookingBot(unittest.IsolatedAsyncioTestCase):
         save_user(telegram_id=101, first_name="BorisTG")
         _save_user_unified(vk_id=202, first_name="BorisVK")
 
-        save_user(telegram_id=303, first_name="Friend")
-        ok, _, _ = register_referral(303, 202)
+        save_user(vk_id=303, first_name="Friend")
+        ok, _, _ = register_referral(new_user_vk_id=303, referrer_vk_id=202)
         self.assertTrue(ok)
 
         stats_tg = get_referral_stats(101, "telegram")
@@ -966,6 +966,185 @@ class TestBookingBot(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(ok)
             self.assertEqual(msg, "Выбранное время уже занято другим клиентом.")
             self.assertIsNone(session_data)
+
+    def test_idor_protection(self):
+        from services.appointments import (
+            create_or_update_appointment,
+            cancel_appointment,
+            confirm_appointment_by_client,
+            reschedule_appointment,
+        )
+        t_now = datetime.datetime.now(datetime.timezone.utc)
+        appt_id = create_or_update_appointment(
+            phone="+79991112233",
+            appointment_time=t_now,
+            services="Стрижка",
+            total_price=2300,
+            platform="telegram",
+            platform_user_id=111,
+        )
+
+        # Attacker with telegram_id=222 attempts to cancel
+        ok_cancel, msg_cancel, _ = cancel_appointment(appt_id, platform="telegram", platform_user_id=222)
+        self.assertFalse(ok_cancel)
+        self.assertIn("У вас нет прав", msg_cancel)
+
+        # Attacker with telegram_id=222 attempts to confirm
+        ok_conf, msg_conf, _ = confirm_appointment_by_client(appt_id, platform="telegram", platform_user_id=222)
+        self.assertFalse(ok_conf)
+        self.assertIn("У вас нет прав", msg_conf)
+
+        # Attacker with telegram_id=222 attempts to reschedule
+        ok_resched, msg_resched, _ = reschedule_appointment(
+            appt_id, t_now + datetime.timedelta(days=1), platform="telegram", platform_user_id=222
+        )
+        self.assertFalse(ok_resched)
+        self.assertIn("У вас нет прав", msg_resched)
+
+        # Legitimate owner cancels
+        ok_owner, _, appt = cancel_appointment(appt_id, platform="telegram", platform_user_id=111)
+        self.assertTrue(ok_owner)
+        self.assertEqual(appt["status"], "cancelled")
+
+    def test_cross_platform_user_isolation(self):
+        from services.referrals import _find_user, get_user_by_platform_id, link_user_phone
+        from database import get_connection
+
+        # Save user on telegram with ID 77777
+        save_user(telegram_id=77777, first_name="TGUser", phone="+79997777777")
+
+        with get_connection() as conn:
+            # Looking for 77777 on VK must return None
+            vk_user = _find_user(conn, 77777, platform="vk")
+            self.assertIsNone(vk_user)
+
+            # Looking for 77777 on MAX must return None
+            max_user = _find_user(conn, 77777, platform="max")
+            self.assertIsNone(max_user)
+
+            # Looking for 77777 on telegram must find the telegram user
+            tg_user = _find_user(conn, 77777, platform="telegram")
+            self.assertIsNotNone(tg_user)
+            self.assertEqual(tg_user["first_name"], "TGUser")
+
+        # Linking phone for a new VK user who happens to have VK ID 77777
+        ok, msg = link_user_phone(77777, "+79998889900", platform="vk")
+        self.assertTrue(ok)
+
+        # Verify telegram user profile was NOT overwritten
+        with get_connection() as conn:
+            tg_user_after = _find_user(conn, 77777, platform="telegram")
+            self.assertEqual(tg_user_after["phone"], "+79997777777")
+
+            vk_user_after = _find_user(conn, 77777, platform="vk")
+            self.assertEqual(vk_user_after["phone"], "+79998889900")
+            self.assertNotEqual(tg_user_after["id"], vk_user_after["id"])
+
+    def test_retention_reminders_include_completed(self):
+        from services.appointments import (
+            create_or_update_appointment,
+            complete_appointment,
+            cancel_appointment,
+            get_due_retention_reminders,
+            SARATOV_TZ,
+        )
+        from unittest.mock import patch
+
+        mock_now = datetime.datetime(2026, 10, 27, 14, 0, tzinfo=SARATOV_TZ)
+        time_18d_ago = mock_now - datetime.timedelta(days=18)
+        time_future = mock_now + datetime.timedelta(days=2)
+
+        # 1. Completed 18 days ago -> should be included
+        appt_completed_id = create_or_update_appointment(
+            phone="+79991110001",
+            appointment_time=time_18d_ago,
+            services="Стрижка",
+            total_price=2300,
+            platform="telegram",
+            platform_user_id=1001,
+        )
+        complete_appointment(appt_completed_id)
+
+        # 2. Cancelled 18 days ago -> should NOT be included
+        appt_cancelled_id = create_or_update_appointment(
+            phone="+79991110002",
+            appointment_time=time_18d_ago,
+            services="Стрижка",
+            total_price=2300,
+            platform="telegram",
+            platform_user_id=1002,
+        )
+        cancel_appointment(appt_cancelled_id)
+
+        # 3. Future appointment -> should NOT be included
+        appt_future_id = create_or_update_appointment(
+            phone="+79991110003",
+            appointment_time=time_future,
+            services="Стрижка",
+            total_price=2300,
+            platform="telegram",
+            platform_user_id=1003,
+        )
+
+        with patch("core_bot.services.appointments.get_current_saratov_time", return_value=mock_now):
+            due = get_due_retention_reminders(platform="telegram")
+            due_ids = [d["id"] for d in due]
+            self.assertIn(appt_completed_id, due_ids)
+            self.assertNotIn(appt_cancelled_id, due_ids)
+            self.assertNotIn(appt_future_id, due_ids)
+
+    def test_sqlite_search_clients(self):
+        from services.referrals import save_user, search_clients
+
+        save_user(telegram_id=654321, first_name="Константин", last_name="Хабенский", phone="+79170001234")
+        results = search_clients("константин")
+        self.assertGreaterEqual(len(results), 1)
+        found = any(r.get("first_name") == "Константин" for r in results)
+        self.assertTrue(found)
+
+    def test_create_or_update_preserves_terminal_status(self):
+        from services.appointments import (
+            create_or_update_appointment,
+            complete_appointment,
+            get_appointment,
+        )
+        t = datetime.datetime.now(datetime.timezone.utc)
+        appt_id = create_or_update_appointment(
+            phone="+79992223344",
+            appointment_time=t,
+            services="Стрижка",
+            total_price=2300,
+            platform="telegram",
+            platform_user_id=888,
+            masters_id="mst-terminal-test-1",
+        )
+        complete_appointment(appt_id)
+        self.assertEqual(get_appointment(appt_id)["status"], "completed")
+
+        # Sync comes in again with same masters_id
+        create_or_update_appointment(
+            phone="+79992223344",
+            appointment_time=t,
+            services="Стрижка",
+            total_price=2300,
+            platform="masters",
+            masters_id="mst-terminal-test-1",
+        )
+        # Status MUST remain 'completed', not reset to 'confirmed'
+        self.assertEqual(get_appointment(appt_id)["status"], "completed")
+
+    def test_postgres_split_brain_protection(self):
+        from unittest.mock import patch
+        import core_bot.database.connection as conn_mod
+
+        with patch.object(conn_mod, "IS_POSTGRES", True), \
+             patch.object(conn_mod, "ALLOW_SQLITE_FALLBACK", False), \
+             patch.object(conn_mod, "get_pg_pool", return_value=None), \
+             patch("psycopg.connect", side_effect=Exception("Connection refused")):
+            with self.assertRaises(RuntimeError) as ctx:
+                with conn_mod.get_connection():
+                    pass
+            self.assertIn("SQLite fallback disabled", str(ctx.exception))
 
 
 if __name__ == "__main__":

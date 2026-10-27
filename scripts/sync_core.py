@@ -29,6 +29,7 @@ SERVICES_TO_PROXY = [
     "masters_sync",
     "referrals",
     "client_import",
+    "recommendations",
 ]
 
 

@@ -32,6 +32,7 @@ IS_POSTGRES = bool(
         or DATABASE_URL.startswith("postgresql://")
     )
 )
+ALLOW_SQLITE_FALLBACK = os.getenv("ALLOW_SQLITE_FALLBACK", "false").lower() in ("true", "1", "yes")
 
 if IS_POSTGRES:
     if "sslmode=allow" in DATABASE_URL:
@@ -137,6 +138,7 @@ def _get_sqlite_connection() -> Generator[DBConnection, None, None]:
     except Exception:
         db_file = Path(__file__).resolve().parent.parent.parent / "bot.db"
         conn = sqlite3.connect(db_file, timeout=20.0)
+    conn.create_function("lower", 1, lambda s: s.lower() if s is not None else None)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     conn.execute("PRAGMA journal_mode = WAL")
@@ -165,7 +167,10 @@ def get_connection() -> Generator[DBConnection, None, None]:
             except Exception as pe:
                 _pg_unreachable = True
                 _last_pg_check = now
-                logger.debug("PostgreSQL pool connection failed: %s; falling back to SQLite", pe)
+                if not ALLOW_SQLITE_FALLBACK:
+                    logger.critical("PostgreSQL pool connection failed with ALLOW_SQLITE_FALLBACK=False: %s", pe)
+                    raise RuntimeError(f"Database connection error: PostgreSQL unavailable and SQLite fallback disabled: {pe}") from pe
+                logger.warning("PostgreSQL pool connection failed: %s; falling back to SQLite", pe)
         else:
             try:
                 conn = psycopg.connect(
@@ -182,7 +187,10 @@ def get_connection() -> Generator[DBConnection, None, None]:
             except Exception as pe:
                 _pg_unreachable = True
                 _last_pg_check = now
-                logger.debug("PostgreSQL direct connect failed: %s; falling back to SQLite", pe)
+                if not ALLOW_SQLITE_FALLBACK:
+                    logger.critical("PostgreSQL direct connect failed with ALLOW_SQLITE_FALLBACK=False: %s", pe)
+                    raise RuntimeError(f"Database connection error: PostgreSQL unavailable and SQLite fallback disabled: {pe}") from pe
+                logger.warning("PostgreSQL direct connect failed: %s; falling back to SQLite", pe)
 
     with _get_sqlite_connection() as s_conn:
         yield s_conn
@@ -192,16 +200,31 @@ def init_db() -> None:
     """Initialize database schemas via migrations for SQLite and PostgreSQL."""
     from core_bot.database.migrations.runner import run_migrations
 
-    # 1. Always initialize SQLite database to ensure fallback is ready
-    with _get_sqlite_connection() as conn:
-        run_migrations(conn)
-
-    # 2. If Postgres is enabled, also run Postgres migrations
-    if IS_POSTGRES and not _pg_unreachable:
-        try:
-            pool = get_pg_pool()
-            if pool is not None:
+    # If Postgres is configured: run migrations on Postgres
+    if IS_POSTGRES:
+        pool = get_pg_pool()
+        if pool is not None:
+            try:
                 with pool.connection(timeout=3.0) as conn:
                     run_migrations(DBConnection(conn, is_pg=True))
-        except Exception as e:
-            logger.debug("Could not run PG migrations at startup: %s", e)
+            except Exception as e:
+                if not ALLOW_SQLITE_FALLBACK:
+                    raise RuntimeError(f"Could not run PG migrations at startup: {e}") from e
+                logger.warning("Could not run PG migrations at startup: %s", e)
+        else:
+            try:
+                conn = psycopg.connect(DATABASE_URL, row_factory=dict_row, connect_timeout=3)
+                try:
+                    with conn:
+                        run_migrations(DBConnection(conn, is_pg=True))
+                finally:
+                    conn.close()
+            except Exception as e:
+                if not ALLOW_SQLITE_FALLBACK:
+                    raise RuntimeError(f"Could not run PG migrations at startup: {e}") from e
+                logger.warning("Could not run PG migrations at startup: %s", e)
+
+    # Initialize SQLite database if in SQLite mode or fallback is enabled
+    if not IS_POSTGRES or ALLOW_SQLITE_FALLBACK:
+        with _get_sqlite_connection() as conn:
+            run_migrations(conn)

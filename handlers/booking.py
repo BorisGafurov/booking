@@ -1,5 +1,9 @@
+import asyncio
 import datetime
+import html
 import logging
+from typing import Any
+
 from aiogram import F, Router
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command
@@ -55,18 +59,34 @@ def _format_services_text(selected_keys: list[str] | set[str]) -> str:
 
 @router.message(Command("book", "booking"))
 @router.message(F.text.in_({"✂️ Записаться", "Записаться"}))
-async def booking_start(message: Message):
-    if not message.from_user:
+@router.callback_query(F.data.in_({"menu:booking", "book:start"}))
+async def booking_start(event: Message | CallbackQuery):
+    from_user = event.from_user
+    if not from_user:
         return
 
-    user_id = message.from_user.id
+    user_id = from_user.id
     user_selected_services[user_id] = {"hair"}
+    text = _format_services_text(user_selected_services[user_id])
+    kb = get_services_keyboard(user_selected_services[user_id])
 
-    await message.answer(
-        _format_services_text(user_selected_services[user_id]),
-        reply_markup=get_services_keyboard(user_selected_services[user_id]),
-        parse_mode="HTML",
-    )
+    if isinstance(event, CallbackQuery):
+        if event.message:
+            try:
+                await event.message.answer(
+                    text,
+                    reply_markup=kb,
+                    parse_mode="HTML",
+                )
+            except Exception:
+                pass
+        await event.answer()
+    else:
+        await event.answer(
+            text,
+            reply_markup=kb,
+            parse_mode="HTML",
+        )
 
 
 @router.callback_query(F.data.startswith("book:toggle:"))
@@ -127,7 +147,7 @@ async def choose_day(callback: CallbackQuery):
 
     user_id = callback.from_user.id
     current_services = user_selected_services.get(user_id, {"hair"})
-    schedule = get_schedule(current_services)
+    schedule = await asyncio.to_thread(get_schedule, current_services)
 
     if not schedule:
         if callback.message:
@@ -165,7 +185,7 @@ async def choose_time_slot(callback: CallbackQuery):
     user_selected_day[user_id] = day_key
 
     current_services = user_selected_services.get(user_id, {"hair"})
-    schedule = get_schedule(current_services)
+    schedule = await asyncio.to_thread(get_schedule, current_services)
     day_data = schedule.get(day_key)
     slots = day_data["slots"] if day_data else []
 
@@ -245,15 +265,17 @@ async def _finalize_successful_booking(
             parse_mode="HTML",
         )
 
+    c_name_esc = html.escape(str(client_name))
+    srv_names_esc = html.escape(", ".join(calc["names"]))
     for admin_id in ADMIN_IDS:
         try:
             await bot.send_message(
                 chat_id=admin_id,
                 text=(
                     "🔥 <b>Новая онлайн-запись через бота!</b>\n\n"
-                    f"👤 <b>Клиент:</b> {client_name}\n"
+                    f"👤 <b>Клиент:</b> {c_name_esc}\n"
                     f"📱 <b>Телефон:</b> {phone}\n"
-                    f"✂️ <b>Услуги:</b> {', '.join(calc['names'])}\n"
+                    f"✂️ <b>Услуги:</b> {srv_names_esc}\n"
                     f"📅 <b>Время:</b> {dt.strftime('%d.%m.%Y в %H:%M')}\n"
                     f"💰 <b>Сумма:</b> {calc['total_price']} ₽"
                 ),
@@ -292,7 +314,9 @@ async def initiate_slot_booking(callback: CallbackQuery):
 
     current_services = user_selected_services.get(user_id, {"hair"})
     client_name = callback.from_user.full_name or "Клиент"
-    success, msg, session_data = initiate_booking(phone, current_services, timestamp, client_name=client_name)
+    success, msg, session_data = await asyncio.to_thread(
+        initiate_booking, phone, current_services, timestamp, client_name=client_name
+    )
 
     if not success or not session_data:
         try:
@@ -366,7 +390,9 @@ async def _process_phone_provided(message: Message, user_id: int, phone_raw: str
             parse_mode="HTML",
         )
         client_name = message.from_user.full_name if message.from_user else "Клиент"
-        success_init, msg_init, session_data = initiate_booking(eff_phone, current_services, pending_ts, client_name=client_name)
+        success_init, msg_init, session_data = await asyncio.to_thread(
+            initiate_booking, eff_phone, current_services, pending_ts, client_name=client_name
+        )
         if not success_init or not session_data:
             await message.answer(
                 f"⚠️ {msg_init}\n\nВы можете завершить бронирование напрямую через сайт:",
@@ -435,11 +461,11 @@ async def handle_sms_code(message: Message):
         return  # Regular message, not waiting for SMS code
 
     code = message.text.strip()
-    success, msg = confirm_sms_code(session_data, code)
+    success, msg = await asyncio.to_thread(confirm_sms_code, session_data, code)
 
     if not success:
         await message.answer(
-            f"❌ <b>{msg}</b>\n\n"
+            f"❌ <b>{html.escape(msg)}</b>\n\n"
             "Попробуйте ввести 4 цифры ещё раз или завершите запись на сайте:",
             reply_markup=get_sms_keyboard(),
             parse_mode="HTML",
@@ -462,7 +488,9 @@ async def handle_confirm_appointment(callback: CallbackQuery):
         return
 
     appt_id = int(parts[2])
-    success, msg, appt = confirm_appointment_by_client(appt_id)
+    success, msg, appt = confirm_appointment_by_client(
+        appt_id, platform="telegram", platform_user_id=callback.from_user.id
+    )
 
     if not success:
         await callback.answer(msg, show_alert=True)
@@ -505,15 +533,17 @@ async def handle_confirm_appointment(callback: CallbackQuery):
 
     # Notify master
     if appt:
+        c_name = html.escape(str(appt.get('client_name') or 'Клиент'))
+        c_srv = html.escape(str(appt.get('services') or ''))
         for admin_id in ADMIN_IDS:
             try:
                 await callback.bot.send_message(
                     chat_id=admin_id,
                     text=(
                         "✅ <b>Клиент подтвердил запись!</b>\n\n"
-                        f"👤 <b>Клиент:</b> {appt.get('client_name') or 'Клиент'}\n"
+                        f"👤 <b>Клиент:</b> {c_name}\n"
                         f"📱 <b>Телефон:</b> {appt.get('phone')}\n"
-                        f"✂️ <b>Услуги:</b> {appt.get('services')}\n"
+                        f"✂️ <b>Услуги:</b> {c_srv}\n"
                         f"📅 <b>Время:</b> {dt_str}\n"
                         "Клиент точно придёт к назначенному времени."
                     ),
@@ -534,7 +564,9 @@ async def handle_cancel_appointment(callback: CallbackQuery):
         return
 
     appt_id = int(parts[2])
-    success, msg, appt = cancel_appointment(appt_id)
+    success, msg, appt = cancel_appointment(
+        appt_id, platform="telegram", platform_user_id=callback.from_user.id
+    )
 
     if not success:
         await callback.answer(msg, show_alert=True)
@@ -555,15 +587,17 @@ async def handle_cancel_appointment(callback: CallbackQuery):
     # Notify master
     if appt:
         dt_str = str(appt.get("appointment_time", ""))
+        c_name = html.escape(str(appt.get('client_name') or 'Клиент'))
+        c_srv = html.escape(str(appt.get('services') or ''))
         for admin_id in ADMIN_IDS:
             try:
                 await callback.bot.send_message(
                     chat_id=admin_id,
                     text=(
                         "⚠️ <b>Клиент отменил запись!</b>\n\n"
-                        f"👤 <b>Клиент:</b> {appt.get('client_name') or 'Клиент'}\n"
+                        f"👤 <b>Клиент:</b> {c_name}\n"
                         f"📱 <b>Телефон:</b> {appt.get('phone')}\n"
-                        f"✂️ <b>Услуги:</b> {appt.get('services')}\n"
+                        f"✂️ <b>Услуги:</b> {c_srv}\n"
                         f"📅 <b>Время:</b> {dt_str}\n"
                         "Слот снова свободен для других клиентов."
                     ),
