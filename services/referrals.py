@@ -437,7 +437,13 @@ def link_user_phone(user_identifier: int, phone: str, platform: str | None = Non
     with get_connection() as conn:
         current_user = _find_user(conn, user_identifier, platform)
         if not current_user:
-            return False, "Пользователь не найден."
+            _save_user_unified(
+                telegram_id=user_identifier if platform == "telegram" else None,
+                vk_id=user_identifier if platform == "vk" else None,
+                max_user_id=user_identifier if platform == "max" else None,
+                phone=clean_phone,
+            )
+            return True, "Номер телефона успешно привязан."
 
         user_db_id = current_user["id"]
         existing = conn.execute(

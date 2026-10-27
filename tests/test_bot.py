@@ -698,6 +698,21 @@ class TestBookingBot(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(appt_final["total_price"], 700)
         self.assertEqual(appt_final["services"], "Оформление бороды")
 
+    def test_link_user_phone_auto_creation_and_master_phone_prevention(self):
+        from services.referrals import link_user_phone, get_user_phone
+        from services.masters import initiate_booking
+
+        # 1. Non-existent user sends phone -> should auto-create unified user and succeed
+        success, msg = link_user_phone(999888, "+7 (999) 111-22-33", platform="telegram")
+        self.assertTrue(success)
+        self.assertEqual(get_user_phone(999888, platform="telegram"), "+79991112233")
+
+        # 2. Master's own phone prevention
+        ok, error_msg, session_data = initiate_booking("+79173225155", {"hair"}, int(datetime.datetime.now().timestamp()))
+        self.assertFalse(ok)
+        self.assertIn("номер самого мастера", error_msg)
+        self.assertIsNone(session_data)
+
 
 if __name__ == "__main__":
     unittest.main()

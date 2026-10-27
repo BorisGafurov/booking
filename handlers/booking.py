@@ -31,10 +31,11 @@ from services.masters import (
     user_selected_day,
     user_selected_services,
 )
-from services.referrals import get_user_phone, is_phone_number, link_user_phone
+from services.referrals import get_user_phone, is_phone_number, link_user_phone, normalize_phone
 
 logger = logging.getLogger(__name__)
 router = Router()
+user_selected_slot: dict[int, int] = {}
 
 
 def _format_services_text(selected_keys: list[str] | set[str]) -> str:
@@ -125,19 +126,6 @@ async def choose_day(callback: CallbackQuery):
         return
 
     user_id = callback.from_user.id
-    phone = get_user_phone(user_id, platform="telegram")
-
-    if not phone:
-        if callback.message:
-            await callback.message.answer(
-                "📱 <b>Для онлайн-записи нужен номер телефона</b>\n\n"
-                "Нажмите кнопку ниже, чтобы отправить номер в один клик:",
-                reply_markup=get_request_phone_keyboard(),
-                parse_mode="HTML",
-            )
-        await callback.answer()
-        return
-
     current_services = user_selected_services.get(user_id, {"hair"})
     schedule = get_schedule(current_services)
 
@@ -202,13 +190,16 @@ async def initiate_slot_booking(callback: CallbackQuery):
 
     user_id = callback.from_user.id
     timestamp = int(callback.data.split(":")[2])
+    user_selected_slot[user_id] = timestamp
     phone = get_user_phone(user_id, platform="telegram")
 
     if not phone:
         if callback.message:
             await callback.message.answer(
-                "📱 Нажмите кнопку ниже, чтобы подтвердить номер телефона перед бронированием:",
+                "📱 Для завершения записи подтвердите номер телефона:\n\n"
+                "Нажмите кнопку ниже или просто отправьте номер ответным сообщением (например, <code>+79991234567</code>):",
                 reply_markup=get_request_phone_keyboard(),
+                parse_mode="HTML",
             )
         await callback.answer()
         return
@@ -258,6 +249,7 @@ async def cancel_booking(callback: CallbackQuery):
         return
     user_id = callback.from_user.id
     user_pending_booking.pop(user_id, None)
+    user_selected_slot.pop(user_id, None)
 
     try:
         if callback.message:
@@ -267,24 +259,62 @@ async def cancel_booking(callback: CallbackQuery):
     await callback.answer("Запись отменена.")
 
 
-@router.message(F.contact)
-async def handle_contact(message: Message):
-    if not message.contact or not message.from_user:
+async def _process_phone_provided(message: Message, user_id: int, phone_raw: str):
+    from handlers.referrals import _has_active_admin_draft
+
+    if _has_active_admin_draft(message):
         return
-    phone = message.contact.phone_number
-    is_admin_user = message.from_user.id in ADMIN_IDS
-    link_user_phone(message.from_user.id, phone, platform="telegram")
 
-    user_id = message.from_user.id
+    success, _ = link_user_phone(user_id, phone_raw, platform="telegram")
+    if not success:
+        await message.answer("Пожалуйста, введите корректный номер телефона (например, +79991234567).")
+        return
+
+    pending_ts = user_selected_slot.pop(user_id, None)
+    if pending_ts:
+        eff_phone = get_user_phone(user_id, platform="telegram") or normalize_phone(phone_raw)
+        current_services = user_selected_services.get(user_id, {"hair"})
+        dt = datetime.datetime.fromtimestamp(pending_ts, tz=SARATOV_TZ)
+
+        await message.answer(
+            f"⏳ Номер <code>{eff_phone}</code> сохранён. Связываюсь с Masters для записи на <b>{dt.strftime('%d.%m.%Y в %H:%M')}</b>...",
+            parse_mode="HTML",
+        )
+        success_init, msg_init, session_data = initiate_booking(eff_phone, current_services, pending_ts)
+        if not success_init or not session_data:
+            await message.answer(
+                f"⚠️ {msg_init}\n\nВы можете завершить бронирование напрямую через сайт:",
+                reply_markup=get_booking_keyboard(),
+            )
+            return
+
+        user_pending_booking[user_id] = session_data
+        await message.answer(
+            f"📩 <b>Подтверждение записи</b>\n\n"
+            f"Вы выбрали: <b>{dt.strftime('%d.%m.%Y в %H:%M')}</b>\n"
+            f"На ваш номер <code>{eff_phone}</code> отправлено СМС-сообщение с кодом от Masters.\n\n"
+            "👉 <b>Напишите 4 цифры из СМС в ответном сообщении:</b>",
+            reply_markup=get_sms_keyboard(),
+            parse_mode="HTML",
+        )
+        return
+
     user_selected_services[user_id] = {"hair"}
-
     await message.answer(
         "✅ <b>Номер телефона успешно сохранен!</b>\n\n"
         "Теперь выберите услуги для записи:",
         reply_markup=get_services_keyboard(user_selected_services[user_id]),
         parse_mode="HTML",
     )
+    is_admin_user = user_id in ADMIN_IDS
     await message.answer("Главное меню:", reply_markup=get_main_menu(is_admin_user))
+
+
+@router.message(F.contact)
+async def handle_contact(message: Message):
+    if not message.contact or not message.from_user:
+        return
+    await _process_phone_provided(message, message.from_user.id, message.contact.phone_number)
 
 
 @router.message(F.text == "◀️ Назад в меню")
@@ -511,18 +541,4 @@ async def handle_cancel_appointment(callback: CallbackQuery):
 async def handle_text_phone(message: Message):
     if not message.from_user or not message.text:
         return
-    user_id = message.from_user.id
-    if user_id in ADMIN_IDS:
-        return
-    success, _ = link_user_phone(user_id, message.text, platform="telegram")
-    if success:
-        user_selected_services[user_id] = {"hair"}
-        await message.answer(
-            "✅ <b>Номер телефона успешно сохранен!</b>\n\n"
-            "Выберите нужные услуги для записи:",
-            reply_markup=get_services_keyboard(user_selected_services[user_id]),
-            parse_mode="HTML",
-        )
-        await message.answer("Главное меню:", reply_markup=get_main_menu(is_admin=False))
-    else:
-        await message.answer("Пожалуйста, введи корректный номер телефона (например, +79991234567).")
+    await _process_phone_provided(message, message.from_user.id, message.text)

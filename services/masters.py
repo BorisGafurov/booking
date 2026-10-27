@@ -193,6 +193,13 @@ def initiate_booking(phone: str, selected_keys: list[str] | set[str] | None, tim
     if len(clean_digits) == 11 and clean_digits.startswith(("7", "8")):
         clean_digits = clean_digits[1:]
 
+    if clean_digits in ("9173225155", "79173225155"):
+        return (
+            False,
+            "Вы не можете сделать запись на номер самого мастера (+79173225155). Masters запрещает мастеру записывать себя на свой же номер телефона. Для тестирования введите любой другой номер клиента (например: +79991234567).",
+            None,
+        )
+
     calc = calculate_services(selected_keys)
     try:
         cj = http.cookiejar.CookieJar()
