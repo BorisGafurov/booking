@@ -71,10 +71,14 @@ def _get_retention_keyboard() -> InlineKeyboardMarkup:
     )
 
 
+MASTER_PHONES = {"+79173225155", "79173225155", "89173225155"}
+MASTER_USER_IDS = {1010373026, 90599236, 503925574}
+
+
 def _is_master_or_admin(user_id: int, platform: str) -> bool:
     if not user_id:
         return False
-    if user_id in ADMIN_IDS:
+    if user_id in ADMIN_IDS or user_id in MASTER_USER_IDS:
         return True
     try:
         from services.referrals import is_master_user, is_admin_user
@@ -86,8 +90,11 @@ def _is_master_or_admin(user_id: int, platform: str) -> bool:
 
 
 def _resolve_platform_user_id(appt: dict, platform: str) -> int | None:
-    norm_phone = (appt.get("phone") or "").replace(" ", "").replace("-", "")
-    if norm_phone in ("+79173225155", "79173225155", "89173225155"):
+    from services.referrals import normalize_phone
+
+    raw_phone = appt.get("phone") or ""
+    norm_phone = normalize_phone(raw_phone)
+    if norm_phone in MASTER_PHONES or norm_phone == "+79173225155":
         return None
 
     user_id = appt.get("platform_user_id")
@@ -103,20 +110,24 @@ def _resolve_platform_user_id(appt: dict, platform: str) -> int | None:
             return None
         row = None
         if appt.get("user_id"):
-            row = conn.execute(f"SELECT id, {col} FROM users WHERE id = %s", (appt["user_id"],)).fetchone()
-        if not row and appt.get("phone"):
-            row = conn.execute(f"SELECT id, {col} FROM users WHERE phone = %s", (appt["phone"],)).fetchone()
+            row = conn.execute(f"SELECT id, phone, {col} FROM users WHERE id = %s", (appt["user_id"],)).fetchone()
+        if not row and norm_phone:
+            row = conn.execute(f"SELECT id, phone, {col} FROM users WHERE phone = %s", (norm_phone,)).fetchone()
 
-        if row and row[col]:
-            found_id = row[col]
-            if _is_master_or_admin(found_id, platform):
+        if row:
+            row_phone = normalize_phone(row["phone"] or "")
+            if row_phone in MASTER_PHONES or row_phone == "+79173225155":
                 return None
-            conn.execute(
-                "UPDATE appointments SET platform_user_id = %s, platform = %s WHERE id = %s",
-                (found_id, platform, appt["id"]),
-            )
-            conn.commit()
-            return found_id
+            if row[col]:
+                found_id = row[col]
+                if _is_master_or_admin(found_id, platform):
+                    return None
+                conn.execute(
+                    "UPDATE appointments SET platform_user_id = %s, platform = %s WHERE id = %s",
+                    (found_id, platform, appt["id"]),
+                )
+                conn.commit()
+                return found_id
     return None
 
 

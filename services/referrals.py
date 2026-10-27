@@ -492,6 +492,8 @@ def link_user_phone(user_identifier: int, phone: str, platform: str | None = Non
 
             conn.execute("DELETE FROM referrals WHERE referrer_user_id = %s AND invited_user_id = %s", (target_id, target_id))
             conn.execute("UPDATE rewards SET user_id = %s WHERE user_id = %s", (target_id, user_db_id))
+            conn.execute("UPDATE appointments SET user_id = %s WHERE user_id = %s", (target_id, user_db_id))
+            conn.execute("UPDATE user_roles SET user_id = %s WHERE user_id = %s", (target_id, user_db_id))
             conn.execute("DELETE FROM users WHERE id = %s", (user_db_id,))
             return True, "Профиль успешно объединён по номеру телефона."
         else:

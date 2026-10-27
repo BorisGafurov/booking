@@ -623,8 +623,10 @@ def sync_schedule_from_masters_link() -> tuple[bool, int, str]:
     today_key = now.strftime("%Y-%m-%d")
 
     all_standard_slots = [
+        "08:00", "08:30", "09:00", "09:30",
         "10:00", "10:30", "11:00", "11:30", "12:00", "12:30", "13:00", "13:30",
-        "14:00", "14:30", "15:00", "15:30", "16:00", "16:30", "17:00", "17:30"
+        "14:00", "14:30", "15:00", "15:30", "16:00", "16:30", "17:00", "17:30",
+        "18:00", "18:30", "19:00", "19:30", "20:00", "20:30", "21:00", "21:30"
     ]
 
     def _add_minutes_to_time(t_str: str, minutes: int) -> str:
@@ -852,7 +854,15 @@ def sync_masters_appointments() -> tuple[bool, int, str]:
                         ev_title = ev.get("title") or ev.get("service_name") or "Стрижка"
                         ev_price = ev.get("price") or 2300
                         if ev_start:
-                            dt = datetime.datetime.fromisoformat(ev_start.replace("Z", "+00:00"))
+                            try:
+                                dt = datetime.datetime.fromisoformat(ev_start.replace("Z", "+00:00"))
+                                if dt.tzinfo is None:
+                                    dt = dt.replace(tzinfo=SARATOV_TZ)
+                                else:
+                                    dt = dt.astimezone(SARATOV_TZ)
+                            except Exception:
+                                from services.appointments import parse_to_saratov
+                                dt = parse_to_saratov(ev_start)
                             create_or_update_appointment(
                                 phone=ev_phone,
                                 appointment_time=dt,

@@ -21,7 +21,17 @@ def parse_to_saratov(val: Any) -> datetime.datetime:
             return val.replace(tzinfo=SARATOV_TZ)
         return val.astimezone(SARATOV_TZ)
     if isinstance(val, str):
-        val_clean = val.replace("T", " ")
+        val_str = val.strip()
+        try:
+            if "Z" in val_str or "+" in val_str or (len(val_str) > 10 and "-" in val_str[10:]):
+                dt = datetime.datetime.fromisoformat(val_str.replace("Z", "+00:00"))
+                if dt.tzinfo is None:
+                    return dt.replace(tzinfo=SARATOV_TZ)
+                return dt.astimezone(SARATOV_TZ)
+        except Exception:
+            pass
+
+        val_clean = val_str.replace("T", " ")
         if "." in val_clean:
             val_clean = val_clean.split(".")[0]
         try:
@@ -47,13 +57,23 @@ def create_or_update_appointment(
         norm_phone = ""
     if appointment_time.tzinfo is None:
         appointment_time = appointment_time.replace(tzinfo=SARATOV_TZ)
+    else:
+        appointment_time = appointment_time.astimezone(SARATOV_TZ)
 
     with get_connection() as conn:
-        # Check if user already exists in users table by phone
-        user_row = conn.execute(
-            "SELECT id, telegram_id, vk_id, max_user_id, first_name, last_name FROM users WHERE phone = %s",
-            (norm_phone,),
-        ).fetchone()
+        user_row = None
+        if norm_phone:
+            user_row = conn.execute(
+                "SELECT id, telegram_id, vk_id, max_user_id, first_name, last_name FROM users WHERE phone = %s",
+                (norm_phone,),
+            ).fetchone()
+        if not user_row and platform_user_id and platform_user_id != 0:
+            col = {"telegram": "telegram_id", "vk": "vk_id", "max": "max_user_id"}.get(platform)
+            if col:
+                user_row = conn.execute(
+                    f"SELECT id, telegram_id, vk_id, max_user_id, first_name, last_name FROM users WHERE {col} = %s",
+                    (platform_user_id,),
+                ).fetchone()
 
         user_db_id = None
         if user_row:
@@ -81,10 +101,11 @@ def create_or_update_appointment(
 
         # Check existing by masters_id if provided
         if masters_id:
-            existing = conn.execute(
-                "SELECT id, client_name, phone, services, total_price FROM appointments WHERE masters_id = %s", (masters_id,)
+            existing_row = conn.execute(
+                "SELECT id, client_name, phone, services, total_price, platform, platform_user_id, user_id FROM appointments WHERE masters_id = %s", (masters_id,)
             ).fetchone()
-            if existing:
+            if existing_row:
+                existing = dict(existing_row)
                 eff_name = client_name or ""
                 if eff_name in ("Клиент (Masters)", "Клиент", "") and existing["client_name"] and existing["client_name"] not in ("Клиент (Masters)", "Клиент"):
                     eff_name = existing["client_name"]
@@ -101,10 +122,20 @@ def create_or_update_appointment(
                         eff_price = existing["total_price"]
                         eff_services = existing["services"] or services
 
+                eff_platform = platform
+                eff_p_user_id = platform_user_id
+                if platform == "masters":
+                    if existing.get("platform") and existing["platform"] != "masters":
+                        eff_platform = existing["platform"]
+                    if existing.get("platform_user_id") and existing["platform_user_id"] != 0:
+                        eff_p_user_id = existing["platform_user_id"]
+
+                eff_user_db_id = user_db_id if user_db_id is not None else existing.get("user_id")
+
                 conn.execute(
                     """
                     UPDATE appointments
-                    SET user_id = COALESCE(%s, user_id),
+                    SET user_id = %s,
                         platform = %s,
                         platform_user_id = %s,
                         client_name = %s,
@@ -117,9 +148,9 @@ def create_or_update_appointment(
                     WHERE id = %s
                     """,
                     (
-                        user_db_id,
-                        platform,
-                        platform_user_id,
+                        eff_user_db_id,
+                        eff_platform,
+                        eff_p_user_id,
                         eff_name,
                         eff_phone,
                         eff_services,
@@ -339,6 +370,8 @@ def reschedule_appointment(
     """
     if new_datetime.tzinfo is None:
         new_datetime = new_datetime.replace(tzinfo=SARATOV_TZ)
+    else:
+        new_datetime = new_datetime.astimezone(SARATOV_TZ)
 
     with get_connection() as conn:
         row = conn.execute("SELECT * FROM appointments WHERE id = %s", (appointment_id,)).fetchone()
@@ -586,6 +619,8 @@ def create_manual_appointment(
     """
     if appointment_time.tzinfo is None:
         appointment_time = appointment_time.replace(tzinfo=SARATOV_TZ)
+    else:
+        appointment_time = appointment_time.astimezone(SARATOV_TZ)
 
     appt_id = create_or_update_appointment(
         phone=phone,
@@ -753,8 +788,10 @@ def get_day_time_slots_status(day_key: str) -> dict[str, Any]:
         logger.debug("Masters schedule check failed for %s: %s", day_key, e)
 
     standard_slots = [
+        "08:30", "09:00", "09:30",
         "10:00", "10:30", "11:00", "11:30", "12:00", "12:30", "13:00", "13:30",
-        "14:00", "14:30", "15:00", "15:30", "16:00", "16:30", "17:00", "17:30", "18:00", "18:30"
+        "14:00", "14:30", "15:00", "15:30", "16:00", "16:30", "17:00", "17:30",
+        "18:00", "18:30", "19:00", "19:30", "20:00", "20:30", "21:00"
     ]
 
     free_slots: list[str] = []

@@ -713,6 +713,130 @@ class TestBookingBot(unittest.IsolatedAsyncioTestCase):
         self.assertIn("номер самого мастера", error_msg)
         self.assertIsNone(session_data)
 
+    def test_timezone_conversion_precision(self):
+        from services.appointments import SARATOV_TZ, parse_to_saratov, create_or_update_appointment, get_appointment
+        from zoneinfo import ZoneInfo
+
+        # 1. UTC timestamp: 11:00 UTC = 15:00 Saratov (UTC+4)
+        dt_utc = parse_to_saratov("2026-10-31T11:00:00Z")
+        self.assertEqual(dt_utc.tzinfo, SARATOV_TZ)
+        self.assertEqual(dt_utc.hour, 15)
+        self.assertEqual(dt_utc.minute, 0)
+
+        # 2. Moscow timestamp: 14:00 MSK (UTC+3) = 15:00 Saratov (UTC+4)
+        dt_msk = parse_to_saratov("2026-10-31T14:00:00+03:00")
+        self.assertEqual(dt_msk.tzinfo, SARATOV_TZ)
+        self.assertEqual(dt_msk.hour, 15)
+        self.assertEqual(dt_msk.minute, 0)
+
+        # 3. Naive timestamp: 15:00 naive = 15:00 Saratov
+        dt_naive = parse_to_saratov("2026-10-31 15:00:00")
+        self.assertEqual(dt_naive.tzinfo, SARATOV_TZ)
+        self.assertEqual(dt_naive.hour, 15)
+        self.assertEqual(dt_naive.minute, 0)
+
+        # 4. Save appointment with aware Moscow datetime -> ensure retrieved time is 15:00 Saratov
+        moscow_tz = ZoneInfo("Europe/Moscow")
+        dt_in_msk = datetime.datetime(2026, 10, 31, 14, 0, 0, tzinfo=moscow_tz)
+        appt_id = create_or_update_appointment(
+            phone="+79998887766",
+            appointment_time=dt_in_msk,
+            services="Стрижка",
+            total_price=2300,
+            client_name="Тест Часового Пояса",
+            platform="telegram",
+            masters_id="mst_tz_test_1",
+        )
+        saved = get_appointment(appt_id)
+        saved_dt = parse_to_saratov(saved["appointment_time"])
+        self.assertEqual(saved_dt.hour, 15)
+
+    def test_masters_sync_platform_and_user_preservation(self):
+        from services.appointments import create_or_update_appointment, get_appointment
+
+        # 1. Book appointment via Telegram with user_id=123456
+        appt_time = datetime.datetime(2026, 11, 5, 14, 0, 0)
+        appt_id = create_or_update_appointment(
+            phone="+79271112233",
+            appointment_time=appt_time,
+            services="Стрижка",
+            total_price=2300,
+            client_name="Иван Клиент",
+            platform="telegram",
+            platform_user_id=123456,
+            masters_id="mst_sync_preserve_99",
+        )
+        first_state = get_appointment(appt_id)
+        self.assertEqual(first_state["platform"], "telegram")
+        self.assertEqual(first_state["platform_user_id"], 123456)
+
+        # 2. Background Masters sync runs with platform='masters' and platform_user_id=0
+        create_or_update_appointment(
+            phone="",
+            appointment_time=appt_time,
+            services="Стрижка",
+            total_price=2300,
+            client_name="Клиент (Masters)",
+            platform="masters",
+            platform_user_id=0,
+            masters_id="mst_sync_preserve_99",
+        )
+        second_state = get_appointment(appt_id)
+        # Platform and user_id must remain preserved for Telegram reminders!
+        self.assertEqual(second_state["platform"], "telegram")
+        self.assertEqual(second_state["platform_user_id"], 123456)
+        self.assertEqual(second_state["client_name"], "Иван Клиент")
+
+    def test_user_merge_transfers_appointments_and_roles(self):
+        from services.referrals import save_user, link_user_phone
+        from services.appointments import create_or_update_appointment, get_appointment
+
+        # Create user A (e.g. registered via TG without phone)
+        user_a_id, _ = save_user(telegram_id=777001, first_name="UserA")
+        # User A has an appointment
+        appt_id = create_or_update_appointment(
+            phone="",
+            appointment_time=datetime.datetime(2026, 11, 10, 12, 0, 0),
+            services="Стрижка",
+            total_price=2300,
+            client_name="UserA",
+            platform="telegram",
+            platform_user_id=777001,
+        )
+        # Create user B (has phone from Masters or VK)
+        user_b_id, _ = save_user(telegram_id=888002, phone="+79997778899", first_name="UserB")
+
+        # Now User A enters phone +79997778899 -> User A must merge into User B
+        ok, msg = link_user_phone(777001, "+79997778899", platform="telegram")
+        self.assertTrue(ok)
+
+        # The appointment must now belong to User B (target_id), not be orphaned!
+        appt = get_appointment(appt_id)
+        self.assertEqual(appt["user_id"], user_b_id)
+
+    def test_reminder_worker_excludes_master(self):
+        from services.reminder_worker import _resolve_platform_user_id
+
+        # 1. Appointment with master phone with spaces/brackets
+        appt_master = {
+            "id": 1,
+            "phone": "+7 (917) 322-51-55",
+            "platform": "telegram",
+            "platform_user_id": 1010373026,
+            "user_id": None,
+        }
+        self.assertIsNone(_resolve_platform_user_id(appt_master, "telegram"))
+
+        # 2. Appointment with VK master ID
+        appt_vk_master = {
+            "id": 2,
+            "phone": "",
+            "platform": "vk",
+            "platform_user_id": 90599236,
+            "user_id": None,
+        }
+        self.assertIsNone(_resolve_platform_user_id(appt_vk_master, "vk"))
+
 
 if __name__ == "__main__":
     unittest.main()
