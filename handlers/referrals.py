@@ -421,6 +421,11 @@ async def admin_appt_detail(callback: CallbackQuery):
         await callback.answer("Нет доступа.", show_alert=True)
         return
 
+    try:
+        await callback.answer()
+    except Exception:
+        pass
+
     parts = callback.data.split(":")
     appt_id = int(parts[2])
     current_filter = parts[3] if len(parts) > 3 else "today"
