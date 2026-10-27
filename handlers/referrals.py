@@ -197,7 +197,7 @@ def admin_appt_card_keyboard(appt: dict, current_filter: str, offset: int) -> In
                 InlineKeyboardButton(text="✅ Подтвердить запись", callback_data=f"admin:confirm_appt:{appt_id}:{current_filter}:{offset}")
             ])
         rows.append([
-            InlineKeyboardButton(text="✏️ Указать имя", callback_data=f"admin:edit_client:{appt_id}:{current_filter}:{offset}"),
+            InlineKeyboardButton(text="✏️ Изменить клиента (имя / тел.)", callback_data=f"admin:edit_client:{appt_id}:{current_filter}:{offset}"),
             InlineKeyboardButton(text="💰 Изменить цену / услугу", callback_data=f"admin:edit_price:{appt_id}:{current_filter}:{offset}"),
         ])
         rows.append([
@@ -206,7 +206,7 @@ def admin_appt_card_keyboard(appt: dict, current_filter: str, offset: int) -> In
         ])
     else:
         rows.append([
-            InlineKeyboardButton(text="✏️ Указать имя", callback_data=f"admin:edit_client:{appt_id}:{current_filter}:{offset}"),
+            InlineKeyboardButton(text="✏️ Изменить клиента (имя / тел.)", callback_data=f"admin:edit_client:{appt_id}:{current_filter}:{offset}"),
             InlineKeyboardButton(text="💰 Изменить цену / услугу", callback_data=f"admin:edit_price:{appt_id}:{current_filter}:{offset}"),
         ])
 
@@ -949,8 +949,8 @@ async def admin_create_time_chosen(callback: CallbackQuery):
             f"⏰ Время: <b>{day_key} {time_val}</b>\n"
             f"💰 Цена: <b>{curr_price} ₽</b>\n\n"
             "👉 <b>Отправьте в чат телефон и имя клиента:</b>\n"
-            "Например: <code>+79173225155 Борис</code> или просто номер <code>89991234567</code>.\n\n"
-            "<i>Если хотите изменить цену, укажите её в конце сообщения, например: <code>89173225155 Борис 1200</code></i>",
+            "Например: <code>+79991234567 Иван</code> или просто номер <code>89991234567</code>.\n\n"
+            "<i>Если хотите изменить цену, укажите её в конце сообщения, например: <code>89991234567 Иван 1200</code></i>",
             reply_markup=InlineKeyboardMarkup(
                 inline_keyboard=[[InlineKeyboardButton(text="⬅️ Отмена", callback_data="admin:menu")]]
             ),
@@ -1502,12 +1502,12 @@ async def admin_edit_client_start(callback: CallbackQuery):
     cur_phone = appt.get("phone") or "—"
 
     text = (
-        f"✏️ <b>Указание имени клиента для записи #{appt_id}</b>\n\n"
+        f"✏️ <b>Изменение данных клиента для записи #{appt_id}</b>\n\n"
         f"Текущее имя: <b>{html.escape(cur_name)}</b>\n"
         f"Текущий телефон: <code>{cur_phone}</code>\n\n"
-        "👉 <b>Отправьте в чат имя (или имя и номер телефона) клиента:</b>\n"
-        "Например: <code>Алексей</code> или <code>Алексей +79271234567</code>\n\n"
-        "<i>Запись мгновенно обновится и свяжется с клиентом.</i>"
+        "👉 <b>Отправьте в чат имя и/или номер телефона клиента:</b>\n"
+        "Например: <code>Иван +79271234567</code> или просто номер <code>+79271234567</code>, или имя <code>Иван</code>\n\n"
+        "<i>Запись мгновенно обновится в базе данных.</i>"
     )
     kb = InlineKeyboardMarkup(
         inline_keyboard=[[InlineKeyboardButton(text="⬅️ Отмена", callback_data=f"admin:appt:{appt_id}:{current_filter}:{offset}")]]
@@ -1738,12 +1738,14 @@ async def handle_admin_text_inputs(message: Message):
             client_name = "Клиент"
 
         ok, msg = update_appointment_client_details(appt_id, client_name, client_phone)
-        appt = get_appointment(appt_id)
+        appt = get_appointment(appt_id) or {}
+        fresh_name = appt.get("client_name") or client_name
+        fresh_phone = appt.get("phone") or "—"
 
         await message.answer(
-            f"✅ <b>Имя клиента обновлено!</b>\n\n"
-            f"👤 Клиент: <b>{html.escape(client_name)}</b>\n"
-            f"📱 Телефон: <code>{appt.get('phone', '—')}</code>",
+            f"✅ <b>Данные клиента обновлены!</b>\n\n"
+            f"👤 Клиент: <b>{html.escape(fresh_name)}</b>\n"
+            f"📱 Телефон: <code>{fresh_phone}</code>",
             reply_markup=InlineKeyboardMarkup(
                 inline_keyboard=[
                     [InlineKeyboardButton(text="📋 К карточке записи", callback_data=f"admin:appt:{appt_id}:{current_filter}:{offset}")],
@@ -1929,7 +1931,7 @@ async def handle_admin_text_inputs(message: Message):
             await message.answer(
                 f"⏰ Время установлено: <b>{create_draft['time_str']}</b>\n\n"
                 "👉 <b>Теперь отправьте в чат телефон и имя клиента:</b>\n"
-                "Например: <code>+79173225155 Борис</code> или с ценой <code>89173225155 Борис 1200</code>",
+                "Например: <code>+79991234567 Иван</code> или с ценой <code>89991234567 Иван 1200</code>",
                 reply_markup=InlineKeyboardMarkup(
                     inline_keyboard=[[InlineKeyboardButton(text="⬅️ Отмена", callback_data="admin:menu")]]
                 ),
@@ -1953,7 +1955,7 @@ async def handle_admin_text_inputs(message: Message):
                     name = token
 
             if not phone:
-                await message.answer("⚠️ Пожалуйста, укажите номер телефона клиента (например: <code>+79173225155 Иван</code>):")
+                await message.answer("⚠️ Пожалуйста, укажите номер телефона клиента (например: <code>+79991234567 Иван</code>):")
                 return
 
             # Combine names if multiple non-digits

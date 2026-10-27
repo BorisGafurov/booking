@@ -43,7 +43,7 @@ def create_or_update_appointment(
     masters_id: str | None = None,
 ) -> int:
     norm_phone = normalize_phone(phone) if phone else ""
-    if norm_phone in ("+79173225155", "79173225155", "89173225155") and platform == "masters":
+    if norm_phone in ("+79173225155", "79173225155", "89173225155") and (platform == "masters" or not client_name or "Клиент" in client_name):
         norm_phone = ""
     if appointment_time.tzinfo is None:
         appointment_time = appointment_time.replace(tzinfo=SARATOV_TZ)
@@ -89,8 +89,10 @@ def create_or_update_appointment(
                 if eff_name in ("Клиент (Masters)", "Клиент", "") and existing["client_name"] and existing["client_name"] not in ("Клиент (Masters)", "Клиент"):
                     eff_name = existing["client_name"]
                 eff_phone = norm_phone
-                if norm_phone == "+79173225155" and existing["phone"] and existing["phone"] != "+79173225155":
+                if not eff_phone and existing["phone"] and existing["phone"] not in ("+79173225155", "79173225155", "89173225155"):
                     eff_phone = existing["phone"]
+                elif eff_phone in ("+79173225155", "79173225155", "89173225155"):
+                    eff_phone = existing["phone"] if (existing["phone"] and existing["phone"] not in ("+79173225155", "79173225155", "89173225155")) else ""
 
                 eff_price = total_price
                 eff_services = services

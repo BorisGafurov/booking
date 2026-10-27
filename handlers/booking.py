@@ -511,10 +511,11 @@ async def handle_cancel_appointment(callback: CallbackQuery):
 async def handle_text_phone(message: Message):
     if not message.from_user or not message.text:
         return
-    is_admin_user = message.from_user.id in ADMIN_IDS
-    success, _ = link_user_phone(message.from_user.id, message.text, platform="telegram")
+    user_id = message.from_user.id
+    if user_id in ADMIN_IDS:
+        return
+    success, _ = link_user_phone(user_id, message.text, platform="telegram")
     if success:
-        user_id = message.from_user.id
         user_selected_services[user_id] = {"hair"}
         await message.answer(
             "✅ <b>Номер телефона успешно сохранен!</b>\n\n"
@@ -522,6 +523,6 @@ async def handle_text_phone(message: Message):
             reply_markup=get_services_keyboard(user_selected_services[user_id]),
             parse_mode="HTML",
         )
-        await message.answer("Главное меню:", reply_markup=get_main_menu(is_admin_user))
+        await message.answer("Главное меню:", reply_markup=get_main_menu(is_admin=False))
     else:
         await message.answer("Пожалуйста, введи корректный номер телефона (например, +79991234567).")

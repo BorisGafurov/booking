@@ -788,7 +788,9 @@ def sync_masters_appointments() -> tuple[bool, int, str]:
                     events_data = json.loads(events_match.group(1))
                     for ev in events_data:
                         ev_id = str(ev.get("id") or "")
-                        ev_phone = ev.get("phone") or ev.get("client_phone") or "+79173225155"
+                        ev_phone = ev.get("phone") or ev.get("client_phone") or ""
+                        if ev_phone in ("+79173225155", "79173225155", "89173225155"):
+                            ev_phone = ""
                         ev_name = ev.get("client_name") or ev.get("name") or "Клиент"
                         ev_start = ev.get("start") or ev.get("datetime")
                         ev_title = ev.get("title") or ev.get("service_name") or "Стрижка"
@@ -801,6 +803,7 @@ def sync_masters_appointments() -> tuple[bool, int, str]:
                                 services=ev_title,
                                 total_price=int(ev_price),
                                 client_name=ev_name,
+                                platform="masters",
                                 masters_id=ev_id if ev_id else None,
                             )
                             synced_web += 1

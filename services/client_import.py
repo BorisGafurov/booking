@@ -320,11 +320,17 @@ def update_appointment_client_details(
 ) -> tuple[bool, str]:
     client_name = client_name.strip()
     norm_phone = normalize_client_phone(phone) if phone else None
+    if norm_phone in ("+79173225155", "79173225155", "89173225155"):
+        norm_phone = None
 
     with get_connection() as conn:
         appt = conn.execute("SELECT * FROM appointments WHERE id = %s", (appt_id,)).fetchone()
         if not appt:
             return False, "Запись не найдена."
+
+        existing_name = appt["client_name"] or ""
+        if (not client_name or client_name in ("Клиент", "Клиент (Masters)")) and existing_name and existing_name not in ("Клиент", "Клиент (Masters)"):
+            client_name = existing_name
 
         user_id = appt["user_id"]
         if norm_phone:
@@ -352,7 +358,11 @@ def update_appointment_client_details(
                     )
                     user_id = cur.lastrowid
 
-        effective_phone = norm_phone or appt["phone"]
+        existing_phone = appt["phone"] or ""
+        if existing_phone in ("+79173225155", "79173225155", "89173225155"):
+            existing_phone = ""
+
+        effective_phone = norm_phone if norm_phone is not None else existing_phone
         conn.execute(
             """
             UPDATE appointments

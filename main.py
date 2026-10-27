@@ -45,10 +45,10 @@ async def main():
     dp = Dispatcher()
 
     dp.include_router(start_router)
+    dp.include_router(referrals_router)
     dp.include_router(booking_router)
     dp.include_router(navigation_router)
     dp.include_router(advice_router)
-    dp.include_router(referrals_router)
     dp.include_router(fallback_router)
 
     default_properties = DefaultBotProperties(parse_mode=ParseMode.HTML)

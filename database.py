@@ -444,3 +444,16 @@ def _init_db_schema(conn: DBConnection) -> None:
             conn.execute("CREATE INDEX IF NOT EXISTS idx_appointments_client_confirmed ON appointments(client_confirmed)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_user_roles_platform ON user_roles(platform, platform_user_id)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_master_schedule_day ON master_schedule(day_key)")
+
+            try:
+                conn.execute(
+                    """
+                    UPDATE appointments
+                    SET phone = '', platform_user_id = 0
+                    WHERE phone IN ('+79173225155', '79173225155', '89173225155')
+                      AND (client_name LIKE '%Клиент%' OR platform = 'masters')
+                    """
+                )
+                conn.commit()
+            except Exception:
+                pass
