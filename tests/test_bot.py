@@ -61,6 +61,7 @@ class TestBookingBot(unittest.IsolatedAsyncioTestCase):
             conn.execute("DELETE FROM rewards")
             conn.execute("DELETE FROM referrals")
             conn.execute("DELETE FROM users")
+            conn.execute("DELETE FROM masters_session")
 
     def test_database_and_referral_cycle(self):
         # 1. Save referrer
@@ -1145,6 +1146,79 @@ class TestBookingBot(unittest.IsolatedAsyncioTestCase):
                 with conn_mod.get_connection():
                     pass
             self.assertIn("SQLite fallback disabled", str(ctx.exception))
+
+    def test_suggested_master_phone(self):
+        from services.masters_sync import get_suggested_master_phone, DEFAULT_MASTER_PHONE
+        # Default fallback
+        self.assertEqual(get_suggested_master_phone(), "+79173225155")
+
+        # After saving a session in masters_session
+        with get_connection() as conn:
+            conn.execute(
+                "INSERT INTO masters_session (master_phone, cookie_phpsessid, is_active) VALUES (%s, %s, %s)",
+                ("+79173225155", "test_phpsessid", 1),
+            )
+            conn.commit()
+
+        self.assertEqual(get_suggested_master_phone(), "+79173225155")
+
+    async def test_admin_masters_flow(self):
+        from handlers.referrals import (
+            admin_masters_status,
+            admin_masters_enter_phone,
+            admin_masters_request_code,
+            handle_admin_text_inputs,
+            pending_master_logins,
+        )
+        from unittest.mock import patch
+
+        admin_id = 802560333  # from ADMIN_IDS
+        pending_master_logins.clear()
+
+        # 1. Open admin:masters
+        cb = MagicMock()
+        cb.from_user.id = admin_id
+        cb.data = "admin:masters"
+        cb.message.edit_text = AsyncMock()
+        cb.answer = AsyncMock()
+
+        await admin_masters_status(cb)
+        cb.message.edit_text.assert_called_once()
+        text_arg = cb.message.edit_text.call_args[0][0]
+        self.assertIn("+79173225155", text_arg)
+        kb_arg = cb.message.edit_text.call_args[1]["reply_markup"]
+        btn_texts = [btn.text for row in kb_arg.inline_keyboard for btn in row]
+        self.assertTrue(any("Ввести другой номер" in t for t in btn_texts))
+        self.assertTrue(any("+79173225155" in t for t in btn_texts))
+
+        # 2. Click "Ввести другой номер"
+        cb_enter = MagicMock()
+        cb_enter.from_user.id = admin_id
+        cb_enter.data = "admin:masters_enter_phone"
+        cb_enter.message.edit_text = AsyncMock()
+        cb_enter.answer = AsyncMock()
+
+        await admin_masters_enter_phone(cb_enter)
+        self.assertTrue(pending_master_logins.get(admin_id, {}).get("awaiting_phone"))
+
+        # 3. Type valid phone in chat
+        msg = MagicMock()
+        msg.from_user.id = admin_id
+        msg.text = "+7 917 322 51 55"
+        msg.answer = AsyncMock()
+
+        with patch("handlers.referrals.request_master_login") as mock_req:
+            mock_req.return_value = (
+                True,
+                "OK",
+                {"phone": "+79173225155", "phone_formatted": "(917) 322-51-55", "csrf": "c1", "cookies": {}},
+            )
+            await handle_admin_text_inputs(msg)
+            mock_req.assert_called_once_with("+7 917 322 51 55")
+
+        self.assertFalse(pending_master_logins[admin_id].get("awaiting_phone"))
+        self.assertEqual(msg.answer.call_count, 2)
+        self.assertIn("Код подтверждения отправлен", msg.answer.call_args_list[1][0][0])
 
 
 if __name__ == "__main__":

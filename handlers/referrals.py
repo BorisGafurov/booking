@@ -41,6 +41,7 @@ from services.masters_sync import (
     confirm_master_login,
     disconnect_masters_session,
     get_active_masters_session,
+    get_suggested_master_phone,
     pending_master_logins,
     request_master_login,
     sync_masters_appointments,
@@ -1212,15 +1213,18 @@ async def admin_masters_status(callback: CallbackQuery):
             ]
         )
     else:
+        suggested_phone = get_suggested_master_phone()
         text = (
             "🔗 <b>Подключение аккаунта Masters</b>\n\n"
             "Бот может автоматически забирать все записи из твоего личного кабинета Masters "
             "и бесплатно рассылать клиентам напоминания о визите накануне вечером и за 2 часа.\n\n"
-            "Нажми кнопку ниже, чтобы отправить проверочный код на твой номер:"
+            f"📱 <b>Номер мастера для входа:</b> <code>{suggested_phone}</code>\n\n"
+            "Нажмите кнопку ниже, чтобы отправить проверочный код по СМС, или укажите другой номер:"
         )
         kb = InlineKeyboardMarkup(
             inline_keyboard=[
-                [InlineKeyboardButton(text="📲 Запросить СМС-код для входа", callback_data="admin:masters_request")],
+                [InlineKeyboardButton(text=f"📲 Запросить СМС на {suggested_phone}", callback_data=f"admin:masters_request:{suggested_phone}")],
+                [InlineKeyboardButton(text="✏️ Ввести другой номер", callback_data="admin:masters_enter_phone")],
                 [InlineKeyboardButton(text="⬅️ Меню админки", callback_data="admin:menu")],
             ]
         )
@@ -1233,14 +1237,41 @@ async def admin_masters_status(callback: CallbackQuery):
     await callback.answer()
 
 
-@router.callback_query(F.data == "admin:masters_request")
+@router.callback_query(F.data == "admin:masters_enter_phone")
+async def admin_masters_enter_phone(callback: CallbackQuery):
+    if not callback.from_user or not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа.", show_alert=True)
+        return
+
+    user_id = callback.from_user.id
+    pending_master_logins[user_id] = {"awaiting_phone": True}
+    text = (
+        "📱 <b>Введите номер телефона мастера</b>\n\n"
+        "Напишите в ответном сообщении номер, зарегистрированный в сервисе Masters "
+        "(например, <code>+79173225155</code>):"
+    )
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data="admin:masters")],
+        ]
+    )
+    try:
+        if callback.message:
+            await callback.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+    except TelegramBadRequest:
+        pass
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admin:masters_request"))
 async def admin_masters_request_code(callback: CallbackQuery):
     if not callback.from_user or not is_admin(callback.from_user.id):
         await callback.answer("Нет доступа.", show_alert=True)
         return
 
     user_id = callback.from_user.id
-    phone = get_user_phone(user_id, platform="telegram")
+    parts = (callback.data or "").split(":", 2)
+    phone = parts[2] if len(parts) > 2 and parts[2] else get_suggested_master_phone()
 
     if not phone:
         pending_master_logins[user_id] = {"awaiting_phone": True}
@@ -1248,7 +1279,10 @@ async def admin_masters_request_code(callback: CallbackQuery):
             if callback.message:
                 await callback.message.edit_text(
                     "📱 <b>Введите номер телефона мастера</b>\n\n"
-                    "Напишите номер, зарегистрированный в сервисе Masters (например, <code>+79991234567</code>):",
+                    "Напишите номер, зарегистрированный в сервисе Masters (например, <code>+79173225155</code>):",
+                    reply_markup=InlineKeyboardMarkup(
+                        inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="admin:masters")]]
+                    ),
                     parse_mode="HTML",
                 )
         except TelegramBadRequest:
@@ -1260,12 +1294,18 @@ async def admin_masters_request_code(callback: CallbackQuery):
     success, msg, session_data = request_master_login(phone)
 
     if not success:
+        pending_master_logins[user_id] = {"awaiting_phone": True}
         try:
             if callback.message:
                 await callback.message.edit_text(
-                    f"❌ <b>{msg}</b>\n\nПопробуйте ещё раз:",
+                    f"❌ <b>{msg}</b>\n\n"
+                    f"Проверьте номер или напишите другой номер телефона мастера в ответном сообщении:\n"
+                    f"<i>(например, <code>+79173225155</code>)</i>",
                     reply_markup=InlineKeyboardMarkup(
-                        inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="admin:masters")]]
+                        inline_keyboard=[
+                            [InlineKeyboardButton(text="✏️ Ввести номер вручную", callback_data="admin:masters_enter_phone")],
+                            [InlineKeyboardButton(text="⬅️ Назад", callback_data="admin:masters")],
+                        ]
                     ),
                     parse_mode="HTML",
                 )
@@ -1280,6 +1320,12 @@ async def admin_masters_request_code(callback: CallbackQuery):
                 f"📩 <b>Код подтверждения отправлен</b>\n\n"
                 f"На номер <code>{session_data['phone_formatted']}</code> отправлено СМС от Masters.\n\n"
                 "👉 <b>Напишите 4 цифры из СМС в ответном сообщении:</b>",
+                reply_markup=InlineKeyboardMarkup(
+                    inline_keyboard=[
+                        [InlineKeyboardButton(text="✏️ Ввести другой номер", callback_data="admin:masters_enter_phone")],
+                        [InlineKeyboardButton(text="⬅️ Отмена", callback_data="admin:masters")],
+                    ]
+                ),
                 parse_mode="HTML",
             )
     except TelegramBadRequest:
@@ -1692,7 +1738,16 @@ async def handle_admin_text_inputs(message: Message):
         if session_data and not session_data.get("awaiting_phone"):
             success, msg = confirm_master_login(session_data, raw_text)
             if not success:
-                await message.answer(f"❌ <b>{msg}</b>\n\nПопробуйте ввести код ещё раз:")
+                await message.answer(
+                    f"❌ <b>{msg}</b>\n\nПопробуйте ввести код ещё раз:",
+                    reply_markup=InlineKeyboardMarkup(
+                        inline_keyboard=[
+                            [InlineKeyboardButton(text="✏️ Ввести другой номер", callback_data="admin:masters_enter_phone")],
+                            [InlineKeyboardButton(text="⬅️ Меню админки", callback_data="admin:menu")],
+                        ]
+                    ),
+                    parse_mode="HTML",
+                )
                 return
             pending_master_logins.pop(user_id, None)
             ok, count, sync_msg = sync_masters_appointments()
@@ -1706,19 +1761,44 @@ async def handle_admin_text_inputs(message: Message):
             return
 
     # 2. Master phone input
-    if user_id in pending_master_logins and pending_master_logins.get(user_id, {}).get("awaiting_phone") and is_phone_number(raw_text):
-        success, msg, session_data = request_master_login(raw_text)
-        if not success:
-            await message.answer(f"❌ <b>{msg}</b>\n\nПопробуйте ввести другой номер телефона:")
+    if user_id in pending_master_logins and pending_master_logins.get(user_id, {}).get("awaiting_phone"):
+        if is_phone_number(raw_text):
+            await message.answer("⏳ Запрашиваю проверочный код в Masters...")
+            success, msg, session_data = request_master_login(raw_text)
+            if not success:
+                pending_master_logins[user_id] = {"awaiting_phone": True}
+                await message.answer(
+                    f"❌ <b>{msg}</b>\n\n"
+                    "Попробуйте ввести номер телефона мастера ещё раз (например, <code>+79173225155</code>):",
+                    reply_markup=InlineKeyboardMarkup(
+                        inline_keyboard=[[InlineKeyboardButton(text="⬅️ Меню админки", callback_data="admin:menu")]]
+                    ),
+                    parse_mode="HTML",
+                )
+                return
+            pending_master_logins[user_id] = session_data
+            await message.answer(
+                f"📩 <b>Код подтверждения отправлен</b>\n\n"
+                f"На номер <code>{session_data['phone_formatted']}</code> отправлено СМС от Masters.\n\n"
+                "👉 <b>Напишите 4 цифры из СМС в ответном сообщении:</b>",
+                reply_markup=InlineKeyboardMarkup(
+                    inline_keyboard=[
+                        [InlineKeyboardButton(text="✏️ Ввести другой номер", callback_data="admin:masters_enter_phone")],
+                        [InlineKeyboardButton(text="⬅️ Меню админки", callback_data="admin:menu")],
+                    ]
+                ),
+                parse_mode="HTML",
+            )
             return
-        pending_master_logins[user_id] = session_data
-        await message.answer(
-            f"📩 <b>Код подтверждения отправлен</b>\n\n"
-            f"На номер <code>{session_data['phone_formatted']}</code> отправлено СМС от Masters.\n\n"
-            "👉 <b>Напишите 4 цифры из СМС в ответном сообщении:</b>",
-            parse_mode="HTML",
-        )
-        return
+        else:
+            await message.answer(
+                "⚠️ Пожалуйста, введите корректный номер телефона мастера (например, <code>+79173225155</code>):",
+                reply_markup=InlineKeyboardMarkup(
+                    inline_keyboard=[[InlineKeyboardButton(text="⬅️ Меню админки", callback_data="admin:menu")]]
+                ),
+                parse_mode="HTML",
+            )
+            return
 
     if not is_admin(user_id):
         return

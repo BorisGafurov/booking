@@ -2,6 +2,7 @@ import datetime
 import http.cookiejar
 import json
 import logging
+import os
 import re
 import ssl
 import urllib.parse
@@ -17,9 +18,27 @@ logger = logging.getLogger(__name__)
 
 MASTERS_LOGIN_URL = "https://prod.mastersapp.ru/account/auth/login"
 SARATOV_TZ = ZoneInfo("Europe/Saratov")
+DEFAULT_MASTER_PHONE = os.getenv("MASTER_PHONE", "+79173225155")
 
 # In-memory storage for pending master login flows: admin_id -> login_state
 pending_master_logins: dict[int, dict[str, Any]] = {}
+
+
+def get_suggested_master_phone() -> str:
+    """Return default or last used master phone for Masters CRM authentication."""
+    try:
+        with get_connection() as conn:
+            cur = conn.execute(
+                "SELECT master_phone FROM masters_session WHERE master_phone IS NOT NULL AND master_phone != '' ORDER BY id DESC LIMIT 1"
+            )
+            row = cur.fetchone()
+            if row:
+                phone = row["master_phone"] if isinstance(row, dict) else row[0]
+                if phone:
+                    return str(phone).strip()
+    except Exception:
+        pass
+    return DEFAULT_MASTER_PHONE
 
 
 def _get_ssl_context() -> ssl.SSLContext:
@@ -104,8 +123,9 @@ def request_master_login(raw_phone: str) -> tuple[bool, str, dict[str, Any]]:
         new_csrf_match = re.search(r'name="_csrf"\s+value="([^"]+)"', post_html)
         new_csrf = new_csrf_match.group(1) if new_csrf_match else csrf
 
+        norm_phone = normalize_phone(raw_phone) or raw_phone
         session_data = {
-            "phone": raw_phone,
+            "phone": norm_phone,
             "phone_formatted": phone_formatted,
             "csrf": new_csrf,
             "cookies": cookie_dict,
