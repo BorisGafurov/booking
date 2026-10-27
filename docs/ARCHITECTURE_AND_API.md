@@ -169,11 +169,18 @@ def rollback(conn):
 ---
 
 ### 3.3. `core_bot.services.masters` и `core_bot.services.masters_sync`
-Интеграция с Masters CRM (`prod.mastersapp.ru`).
+Интеграция с Masters CRM (`prod.mastersapp.ru` и `mst.link`).
 
 - `SERVICES`: единый словарь услуг, их длительности и стоимости.
 - `calculate_services(selected_keys) -> dict`: суммирует время и стоимость выбранного набора процедур.
 - `get_schedule(selected_keys) -> dict`: обращается к API Masters CRM для получения свободных слотов.
+- `initiate_booking(phone, selected_keys, timestamp, client_name="") -> tuple[bool, str, dict | None]`:
+  Инициирует процесс бронирования слота в Masters:
+  - Защита от самозаписи: блокирует попытки записи на телефон самого мастера (`+79173225155`).
+  - **Существующие клиенты CRM (`move_to_url`)**: Masters автоматически распознает зарегистрированных клиентов и перенаправляет на шаг комментария без отправки СМС. Бот автоматически отправляет форму с сохранением имени клиента из CRM, возвращая `session_data["needs_sms"] = False` и `appointment_id`. Клиент записывается мгновенно в 1 клик!
+  - **Новые клиенты (`verify_url`)**: Masters отправляет 4-значный СМС-код. Бот возвращает `session_data["needs_sms"] = True` и запрашивает код у пользователя.
+- `confirm_sms_code(session_data, code) -> tuple[bool, str]`:
+  Подтверждает 4-значный код СМС на странице `/verify`. При редиректе на форму комментария (`/comment`) автоматически финализирует её, извлекая `appointment_id` со страницы подтверждения (`/finish`).
 - `sync_masters_appointments() -> tuple[int, int]`:
   Периодический воркер (каждые 15 минут), выгружающий новые и измененные записи из Masters CRM в базу данных ботов с сохранением связей платформ.
 - `confirm_masters_appointment`, `cancel_masters_appointment`, `complete_masters_appointment`, `reschedule_masters_appointment`:
@@ -193,13 +200,13 @@ def rollback(conn):
 
 Все тесты изолированы, используют временные базы данных и независимы от внешней сети:
 ```bash
-# Запуск полного набора тестов в Telegram-боте (24 теста)
+# Запуск полного набора тестов в Telegram-боте (27 тестов)
 bot_booking/.venv/bin/python3 -m unittest discover tests
 
-# Запуск полного набора тестов в VK-боте (24 теста)
+# Запуск полного набора тестов в VK-боте (27 тестов)
 bot_VK_booking/.venv/bin/python3 -m unittest discover tests
 
-# Запуск полного набора тестов в MAX-боте (25 тестов)
+# Запуск полного набора тестов в MAX-боте (28 тестов)
 bot_Max_booking/.venv/bin/python3 -m unittest discover tests
 ```
 
@@ -208,4 +215,5 @@ bot_Max_booking/.venv/bin/python3 -m unittest discover tests
 - Сохранение платформы и идентификатора клиента при синхронизации Masters CRM;
 - Корректное объединение профилей с переносом записей, бонусов и ролей;
 - Исключение мастера из клиентских напоминаний;
-- Идемпотентность и динамическое применение миграций БД.
+- Идемпотентность и динамическое применение миграций БД;
+- Обработку сценариев бронирования: без СМС (`move_to_url`), с подтверждением по СМС и обработку ошибок занятости слотов.

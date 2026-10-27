@@ -838,6 +838,136 @@ class TestBookingBot(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(_resolve_platform_user_id(appt_vk_master, "vk"))
 
 
+    def test_initiate_booking_existing_client_move_to_url(self):
+        from unittest.mock import patch, MagicMock
+        from services.masters import initiate_booking
+
+        class DummyResponse:
+            def __init__(self, data: bytes, url: str):
+                self._data = data
+                self._url = url
+
+            def read(self):
+                return self._data
+
+            def geturl(self):
+                return self._url
+
+        mock_opener = MagicMock()
+
+        def fake_open(req, timeout=10):
+            url = req.get_full_url() if hasattr(req, "get_full_url") else str(req)
+            if "/price" in url and "services=" not in url:
+                return DummyResponse(b'var ONLINE_CID = "test_cid";', url)
+            elif "/price" in url:
+                return DummyResponse(b"OK", url)
+            elif "/times" in url:
+                return DummyResponse(b'<form action="/boris_gafurov/phone?test_cid"></form>', url)
+            elif "/phone" in url:
+                return DummyResponse(b'{"move_to_url": "/boris_gafurov/comment?cid=test_cid"}', url)
+            elif "/comment" in url:
+                if hasattr(req, "data") and req.data:
+                    return DummyResponse(b"<html>Done</html>", "https://mst.link/boris_gafurov/finish?id=APPT-TEST-123")
+                else:
+                    return DummyResponse(b'<form id="online-info-form"><input name="_csrf" value="csrf123"/><input name="OnlineInfoForm[firstname]" value="Alexander"/></form>', url)
+            return DummyResponse(b"", url)
+
+        mock_opener.open.side_effect = fake_open
+
+        with patch("urllib.request.build_opener", return_value=mock_opener):
+            ok, msg, session_data = initiate_booking("+79991234567", {"hair"}, 1700000000, client_name="Alexander")
+            self.assertTrue(ok)
+            self.assertIsNotNone(session_data)
+            self.assertFalse(session_data.get("needs_sms"))
+            self.assertEqual(session_data.get("appointment_id"), "APPT-TEST-123")
+
+    def test_initiate_booking_new_client_sms_flow_and_confirmation(self):
+        from unittest.mock import patch, MagicMock
+        from services.masters import initiate_booking, confirm_sms_code
+
+        class DummyResponse:
+            def __init__(self, data: bytes, url: str):
+                self._data = data
+                self._url = url
+
+            def read(self):
+                return self._data
+
+            def geturl(self):
+                return self._url
+
+        mock_opener = MagicMock()
+
+        def fake_open(req, timeout=10):
+            url = req.get_full_url() if hasattr(req, "get_full_url") else str(req)
+            if "/price" in url and "services=" not in url:
+                return DummyResponse(b'var ONLINE_CID = "test_cid";', url)
+            elif "/price" in url:
+                return DummyResponse(b"OK", url)
+            elif "/times" in url:
+                return DummyResponse(b'<form action="/boris_gafurov/phone?test_cid"></form>', url)
+            elif "/phone" in url:
+                return DummyResponse(b'{"success": true, "verify_url": "/boris_gafurov/verify?v=123&cid=test_cid"}', url)
+            elif "/verify" in url:
+                if hasattr(req, "data") and req.data:
+                    return DummyResponse(b'<form id="online-info-form"><input name="_csrf" value="csrf456"/><input name="OnlineInfoForm[firstname]" value=""/></form>', "https://mst.link/boris_gafurov/comment?cid=test_cid")
+                else:
+                    return DummyResponse(b'<form id="js-form-online-code"><input name="_csrf" value="csrf456"/></form>', url)
+            elif "/comment" in url:
+                return DummyResponse(b"<html>Done</html>", "https://mst.link/boris_gafurov/finish?id=APPT-SMS-456")
+            return DummyResponse(b"", url)
+
+        mock_opener.open.side_effect = fake_open
+
+        with patch("urllib.request.build_opener", return_value=mock_opener):
+            ok, msg, session_data = initiate_booking("+79998887766", {"hair"}, 1700000000, client_name="NewClient")
+            self.assertTrue(ok)
+            self.assertIsNotNone(session_data)
+            self.assertTrue(session_data.get("needs_sms"))
+
+            # Now confirm code
+            confirm_ok, confirm_msg = confirm_sms_code(session_data, "1234")
+            self.assertTrue(confirm_ok)
+            self.assertEqual(session_data.get("appointment_id"), "APPT-SMS-456")
+
+    def test_initiate_booking_masters_error_handling(self):
+        from unittest.mock import patch, MagicMock
+        from services.masters import initiate_booking
+
+        class DummyResponse:
+            def __init__(self, data: bytes, url: str):
+                self._data = data
+                self._url = url
+
+            def read(self):
+                return self._data
+
+            def geturl(self):
+                return self._url
+
+        mock_opener = MagicMock()
+
+        def fake_open(req, timeout=10):
+            url = req.get_full_url() if hasattr(req, "get_full_url") else str(req)
+            if "/price" in url and "services=" not in url:
+                return DummyResponse(b'var ONLINE_CID = "test_cid";', url)
+            elif "/price" in url:
+                return DummyResponse(b"OK", url)
+            elif "/times" in url:
+                return DummyResponse(b'<form action="/boris_gafurov/phone?test_cid"></form>', url)
+            elif "/phone" in url:
+                return DummyResponse('{"error": "Выбранное время уже занято другим клиентом."}'.encode("utf-8"), url)
+            return DummyResponse(b"", url)
+
+        mock_opener.open.side_effect = fake_open
+
+        with patch("urllib.request.build_opener", return_value=mock_opener):
+            ok, msg, session_data = initiate_booking("+79990001122", {"hair"}, 1700000000)
+            self.assertFalse(ok)
+            self.assertEqual(msg, "Выбранное время уже занято другим клиентом.")
+            self.assertIsNone(session_data)
+
+
 if __name__ == "__main__":
     unittest.main()
 

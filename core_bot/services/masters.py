@@ -1,4 +1,5 @@
 import datetime
+import html as html_module
 import http.cookiejar
 import json
 import logging
@@ -188,7 +189,106 @@ def get_schedule(selected_keys: list[str] | set[str] | None) -> dict[str, Any]:
     return days_map
 
 
-def initiate_booking(phone: str, selected_keys: list[str] | set[str] | None, timestamp: int) -> tuple[bool, str, dict[str, Any] | None]:
+def _submit_masters_comment_form(
+    opener: urllib.request.OpenerDirector,
+    comment_url: str,
+    client_name: str = "",
+) -> tuple[bool, str, str | None]:
+    """Fetch the comment page, fill client details if needed, and submit to finalize the booking."""
+    headers = {"User-Agent": "Mozilla/5.0"}
+    try:
+        res = opener.open(urllib.request.Request(comment_url, headers=headers), timeout=10)
+        page_html = res.read().decode("utf-8")
+        current_url = res.geturl()
+
+        # If already at finish page
+        if "/finish" in current_url:
+            parsed = urllib.parse.urlparse(current_url)
+            params = urllib.parse.parse_qs(parsed.query)
+            appt_id = params.get("id", [None])[0]
+            return True, "Запись успешно подтверждена!", appt_id
+
+        # Extract CSRF token
+        csrf_m = (
+            re.search(r'name=["\']_csrf["\']\s+value=["\']([^"\']+)["\']', page_html)
+            or re.search(r'value=["\']([^"\']+)["\']\s+name=["\']_csrf["\']', page_html)
+            or re.search(r'<meta\s+name=["\']csrf-token["\']\s+content=["\']([^"\']+)["\']', page_html)
+        )
+        csrf = csrf_m.group(1) if csrf_m else ""
+
+        # Extract existing names from form inputs if prefilled by CRM
+        fn_m = (
+            re.search(r'name=[\'"]OnlineInfoForm\[firstname\][\'"][^>]*value=[\'"]([^\'"]*)[\'"]', page_html)
+            or re.search(r'value=[\'"]([^\'"]*)[\'"][^>]*name=[\'"]OnlineInfoForm\[firstname\][\'"]', page_html)
+        )
+        ln_m = (
+            re.search(r'name=[\'"]OnlineInfoForm\[lastname\][\'"][^>]*value=[\'"]([^\'"]*)[\'"]', page_html)
+            or re.search(r'value=[\'"]([^\'"]*)[\'"][^>]*name=[\'"]OnlineInfoForm\[lastname\][\'"]', page_html)
+        )
+
+        fn = html_module.unescape(fn_m.group(1).strip()) if fn_m else ""
+        ln = html_module.unescape(ln_m.group(1).strip()) if ln_m else ""
+
+        if not fn:
+            if client_name:
+                parts = client_name.strip().split(maxsplit=1)
+                fn = parts[0]
+                ln = parts[1] if len(parts) > 1 else (ln or "")
+            else:
+                fn = "Клиент"
+
+        # Determine submit URL
+        action_m = re.search(r'<form[^>]*id=[\'"]online-info-form[\'"][^>]*action=[\'"]([^\'"]+)[\'"]', page_html)
+        if action_m and action_m.group(1):
+            action = action_m.group(1)
+            post_url = f"https://mst.link{action}" if action.startswith("/") else action
+        else:
+            post_url = current_url
+
+        payload = {
+            "_csrf": csrf,
+            "OnlineInfoForm[firstname]": fn,
+            "OnlineInfoForm[lastname]": ln,
+            "OnlineInfoForm[comment]": "Запись через чат-бота",
+            "OnlineInfoForm[email]": "",
+            "OnlineInfoForm[isMasterPersonalData]": "1",
+        }
+
+        post_data = urllib.parse.urlencode(payload).encode("utf-8")
+        req = urllib.request.Request(
+            post_url,
+            data=post_data,
+            headers={
+                "User-Agent": "Mozilla/5.0",
+                "Referer": current_url,
+                "Origin": "https://mst.link",
+            },
+        )
+        res_post = opener.open(req, timeout=10)
+        final_url = res_post.geturl()
+        final_html = res_post.read().decode("utf-8")
+
+        parsed = urllib.parse.urlparse(final_url)
+        params = urllib.parse.parse_qs(parsed.query)
+        appt_id = params.get("id", [None])[0]
+
+        if not appt_id:
+            id_match = re.search(r'(?:appointment_id|record_id|order_id|id)\s*[:=]\s*["\']?([a-zA-Z0-9_-]+)', final_html)
+            if id_match:
+                appt_id = id_match.group(1)
+
+        return True, "Запись успешно подтверждена!", appt_id
+    except Exception as e:
+        logger.error("Error submitting Masters comment form: %s", e)
+        return False, f"Ошибка при оформлении записи в Masters: {e}", None
+
+
+def initiate_booking(
+    phone: str,
+    selected_keys: list[str] | set[str] | None,
+    timestamp: int,
+    client_name: str = "",
+) -> tuple[bool, str, dict[str, Any] | None]:
     clean_digits = "".join(ch for ch in phone if ch.isdigit())
     if len(clean_digits) == 11 and clean_digits.startswith(("7", "8")):
         clean_digits = clean_digits[1:]
@@ -242,27 +342,55 @@ def initiate_booking(phone: str, selected_keys: list[str] | set[str] | None, tim
         res_phone = opener.open(req_phone, timeout=10)
         data = json.loads(res_phone.read().decode("utf-8"))
 
-        if not data.get("success"):
-            err_msg = data.get("error") or "Не удалось отправить проверочный код. Попробуйте записаться через сайт."
-            return False, err_msg, None
+        # Case A: Existing client recognized by Masters (moves directly to comment page, NO SMS needed)
+        if data.get("move_to_url"):
+            comment_path = data["move_to_url"]
+            comment_url = f"https://mst.link{comment_path}" if comment_path.startswith("/") else comment_path
+            ok, res_msg, appt_id = _submit_masters_comment_form(opener, comment_url, client_name=client_name)
+            if not ok:
+                return False, res_msg, None
+            session_data = {
+                "needs_sms": False,
+                "phone": phone,
+                "timestamp": timestamp,
+                "calc": calc,
+                "appointment_id": appt_id,
+            }
+            return True, "Запись успешно подтверждена!", session_data
 
-        verify_url = "https://mst.link" + data["verify_url"]
+        # Case B: SMS verification required
+        if data.get("success") and data.get("verify_url"):
+            verify_path = data["verify_url"]
+            verify_url = f"https://mst.link{verify_path}" if verify_path.startswith("/") else verify_path
 
-        # Load verify page to fetch CSRF token
-        v_res = opener.open(urllib.request.Request(verify_url, headers=headers), timeout=10)
-        v_html = v_res.read().decode("utf-8")
-        csrf_m = re.search(r'name="_csrf"\s+value="([^"]+)"', v_html)
-        csrf = csrf_m.group(1) if csrf_m else ""
+            # Load verify page to fetch CSRF token
+            v_res = opener.open(urllib.request.Request(verify_url, headers=headers), timeout=10)
+            v_html = v_res.read().decode("utf-8")
+            csrf_m = (
+                re.search(r'name=["\']_csrf["\']\s+value=["\']([^"\']+)["\']', v_html)
+                or re.search(r'value=["\']([^"\']+)["\']\s+name=["\']_csrf["\']', v_html)
+            )
+            csrf = csrf_m.group(1) if csrf_m else ""
 
-        session_data = {
-            "opener": opener,
-            "verify_url": verify_url,
-            "csrf": csrf,
-            "phone": phone,
-            "timestamp": timestamp,
-            "calc": calc,
-        }
-        return True, "Код подтверждения отправлен по СМС.", session_data
+            session_data = {
+                "needs_sms": True,
+                "opener": opener,
+                "verify_url": verify_url,
+                "csrf": csrf,
+                "phone": phone,
+                "timestamp": timestamp,
+                "calc": calc,
+                "client_name": client_name,
+            }
+            return True, "Код подтверждения отправлен по СМС.", session_data
+
+        # Case C: Error returned by Masters
+        err_msg = data.get("error") or data.get("message") or data.get("msg")
+        if not err_msg and isinstance(data.get("errors"), dict):
+            err_msg = "; ".join(str(v) for v in data["errors"].values())
+        if not err_msg:
+            err_msg = "Не удалось отправить проверочный код. Попробуйте записаться через сайт."
+        return False, err_msg, None
     except Exception as e:
         logger.error("Error initiating Masters booking: %s", e)
         return False, f"Ошибка при подключении к сервису записи: {e}", None
@@ -291,13 +419,25 @@ def confirm_sms_code(session_data: dict[str, Any], code: str) -> tuple[bool, str
             },
         )
         res = opener.open(req, timeout=10)
+        final_url = res.geturl()
         html = res.read().decode("utf-8")
 
         if "неверный код" in html.lower() or "ошибка" in html.lower():
             return False, "Неверный код из СМС. Попробуйте ввести ещё раз."
 
+        # If redirected to comment page, submit the final comment form
+        if "/comment" in final_url:
+            ok, msg, appt_id = _submit_masters_comment_form(
+                opener,
+                final_url,
+                client_name=session_data.get("client_name", ""),
+            )
+            if not ok:
+                return False, msg
+            session_data["appointment_id"] = appt_id
+            return True, "Запись успешно подтверждена!"
+
         # Extract appointment_id from final URL or HTML response
-        final_url = res.geturl()
         parsed_url = urllib.parse.urlparse(final_url)
         params = urllib.parse.parse_qs(parsed_url.query)
         if "id" in params and params["id"]:

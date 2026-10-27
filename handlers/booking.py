@@ -183,6 +183,86 @@ async def choose_time_slot(callback: CallbackQuery):
     await callback.answer()
 
 
+async def _finalize_successful_booking(
+    bot,
+    user_id: int,
+    session_data: dict[str, Any],
+    client_name: str,
+    target_msg_or_cb,
+):
+    user_pending_booking.pop(user_id, None)
+    user_selected_slot.pop(user_id, None)
+    calc = session_data["calc"]
+    dt = datetime.datetime.fromtimestamp(session_data["timestamp"], tz=SARATOV_TZ)
+    phone = session_data["phone"]
+
+    appt_id = create_or_update_appointment(
+        phone=phone,
+        appointment_time=dt,
+        services=", ".join(calc["names"]),
+        total_price=calc["total_price"],
+        client_name=client_name,
+        platform="telegram",
+        platform_user_id=user_id,
+        masters_id=session_data.get("appointment_id"),
+    )
+
+    cancel_markup = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="❌ Отменить запись",
+                    callback_data=f"appt:cancel:{appt_id}",
+                )
+            ]
+        ]
+    )
+
+    text = (
+        f"🎉 <b>Запись успешно подтверждена!</b>\n\n"
+        f"✂️ <b>Услуги:</b> {', '.join(calc['names'])}\n"
+        f"💰 <b>Стоимость:</b> {calc['total_price']} ₽ ({calc['duration_text']})\n"
+        f"📅 <b>Дата и время:</b> {dt.strftime('%d.%m.%Y в %H:%M')}\n"
+        f"📍 <b>Адрес:</b> Саратов, ул. имени Е.И. Пугачёва, 110\n\n"
+        "Ждём вас! Мы пришлём напоминание накануне вечером и за 2 часа до визита."
+    )
+
+    if isinstance(target_msg_or_cb, CallbackQuery):
+        try:
+            if target_msg_or_cb.message:
+                await target_msg_or_cb.message.edit_text(
+                    text,
+                    reply_markup=cancel_markup,
+                    parse_mode="HTML",
+                )
+        except TelegramBadRequest:
+            pass
+        await target_msg_or_cb.answer()
+    else:
+        await target_msg_or_cb.answer(
+            text,
+            reply_markup=cancel_markup,
+            parse_mode="HTML",
+        )
+
+    for admin_id in ADMIN_IDS:
+        try:
+            await bot.send_message(
+                chat_id=admin_id,
+                text=(
+                    "🔥 <b>Новая онлайн-запись через бота!</b>\n\n"
+                    f"👤 <b>Клиент:</b> {client_name}\n"
+                    f"📱 <b>Телефон:</b> {phone}\n"
+                    f"✂️ <b>Услуги:</b> {', '.join(calc['names'])}\n"
+                    f"📅 <b>Время:</b> {dt.strftime('%d.%m.%Y в %H:%M')}\n"
+                    f"💰 <b>Сумма:</b> {calc['total_price']} ₽"
+                ),
+                parse_mode="HTML",
+            )
+        except Exception as e:
+            logger.error("Failed to notify admin %s: %s", admin_id, e)
+
+
 @router.callback_query(F.data.startswith("book:slot:"))
 async def initiate_slot_booking(callback: CallbackQuery):
     if not callback.from_user:
@@ -206,12 +286,13 @@ async def initiate_slot_booking(callback: CallbackQuery):
 
     try:
         if callback.message:
-            await callback.message.edit_text("⏳ Бронирую слот в Masters и отправляю проверочный код...")
+            await callback.message.edit_text("⏳ Бронирую слот в Masters...")
     except TelegramBadRequest:
         pass
 
     current_services = user_selected_services.get(user_id, {"hair"})
-    success, msg, session_data = initiate_booking(phone, current_services, timestamp)
+    client_name = callback.from_user.full_name or "Клиент"
+    success, msg, session_data = initiate_booking(phone, current_services, timestamp, client_name=client_name)
 
     if not success or not session_data:
         try:
@@ -225,8 +306,12 @@ async def initiate_slot_booking(callback: CallbackQuery):
         await callback.answer()
         return
 
+    if not session_data.get("needs_sms", True):
+        await _finalize_successful_booking(callback.bot, user_id, session_data, client_name, callback)
+        return
+
     user_pending_booking[user_id] = session_data
-    dt = datetime.datetime.fromtimestamp(timestamp)
+    dt = datetime.datetime.fromtimestamp(timestamp, tz=SARATOV_TZ)
 
     try:
         if callback.message:
@@ -280,12 +365,17 @@ async def _process_phone_provided(message: Message, user_id: int, phone_raw: str
             f"⏳ Номер <code>{eff_phone}</code> сохранён. Связываюсь с Masters для записи на <b>{dt.strftime('%d.%m.%Y в %H:%M')}</b>...",
             parse_mode="HTML",
         )
-        success_init, msg_init, session_data = initiate_booking(eff_phone, current_services, pending_ts)
+        client_name = message.from_user.full_name if message.from_user else "Клиент"
+        success_init, msg_init, session_data = initiate_booking(eff_phone, current_services, pending_ts, client_name=client_name)
         if not success_init or not session_data:
             await message.answer(
                 f"⚠️ {msg_init}\n\nВы можете завершить бронирование напрямую через сайт:",
                 reply_markup=get_booking_keyboard(),
             )
+            return
+
+        if not session_data.get("needs_sms", True):
+            await _finalize_successful_booking(message.bot, user_id, session_data, client_name, message)
             return
 
         user_pending_booking[user_id] = session_data
@@ -357,62 +447,8 @@ async def handle_sms_code(message: Message):
         return
 
     # Successfully booked!
-    user_pending_booking.pop(user_id, None)
-    calc = session_data["calc"]
-    dt = datetime.datetime.fromtimestamp(session_data["timestamp"], tz=SARATOV_TZ)
-    phone = session_data["phone"]
     client_name = message.from_user.full_name or "Клиент"
-
-    appt_id = create_or_update_appointment(
-        phone=phone,
-        appointment_time=dt,
-        services=", ".join(calc["names"]),
-        total_price=calc["total_price"],
-        client_name=client_name,
-        platform="telegram",
-        platform_user_id=user_id,
-        masters_id=session_data.get("appointment_id"),
-    )
-
-    cancel_markup = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="❌ Отменить запись",
-                    callback_data=f"appt:cancel:{appt_id}",
-                )
-            ]
-        ]
-    )
-
-    await message.answer(
-        f"🎉 <b>Запись успешно подтверждена!</b>\n\n"
-        f"✂️ <b>Услуги:</b> {', '.join(calc['names'])}\n"
-        f"💰 <b>Стоимость:</b> {calc['total_price']} ₽ ({calc['duration_text']})\n"
-        f"📅 <b>Дата и время:</b> {dt.strftime('%d.%m.%Y в %H:%M')}\n"
-        f"📍 <b>Адрес:</b> Саратов, ул. имени Е.И. Пугачёва, 110\n\n"
-        "Ждём вас! Мы пришлём напоминание накануне вечером и за 2 часа до визита.",
-        reply_markup=cancel_markup,
-        parse_mode="HTML",
-    )
-
-    # Notify master
-    for admin_id in ADMIN_IDS:
-        try:
-            await message.bot.send_message(
-                chat_id=admin_id,
-                text=(
-                    "🔥 <b>Новая онлайн-запись через бота!</b>\n\n"
-                    f"👤 <b>Клиент:</b> {client_name}\n"
-                    f"📱 <b>Телефон:</b> {phone}\n"
-                    f"✂️ <b>Услуги:</b> {', '.join(calc['names'])}\n"
-                    f"📅 <b>Время:</b> {dt.strftime('%d.%m.%Y в %H:%M')}\n"
-                    f"💰 <b>Сумма:</b> {calc['total_price']} ₽"
-                ),
-                parse_mode="HTML",
-            )
-        except Exception as e:
-            logger.error("Failed to notify admin %s: %s", admin_id, e)
+    await _finalize_successful_booking(message.bot, user_id, session_data, client_name, message)
 
 
 @router.callback_query(F.data.startswith("appt:confirm:"))
