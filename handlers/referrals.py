@@ -1679,7 +1679,7 @@ def _has_active_admin_draft(message: Message) -> bool:
 
 
 # Message dispatcher for text inputs (SMS, Broadcast, Reschedule, Create appointment)
-@router.message(F.text & ~F.text.startswith("/") & _has_active_admin_draft)
+@router.message(F.text, ~F.text.startswith("/"), _has_active_admin_draft)
 async def handle_admin_text_inputs(message: Message):
     if not message.from_user:
         return
