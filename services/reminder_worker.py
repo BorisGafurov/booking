@@ -71,9 +71,29 @@ def _get_retention_keyboard() -> InlineKeyboardMarkup:
     )
 
 
+def _is_master_or_admin(user_id: int, platform: str) -> bool:
+    if not user_id:
+        return False
+    if user_id in ADMIN_IDS:
+        return True
+    try:
+        from services.referrals import is_master_user, is_admin_user
+        if is_master_user(user_id, platform=platform) or is_admin_user(user_id, platform=platform):
+            return True
+    except Exception:
+        pass
+    return False
+
+
 def _resolve_platform_user_id(appt: dict, platform: str) -> int | None:
+    norm_phone = (appt.get("phone") or "").replace(" ", "").replace("-", "")
+    if norm_phone in ("+79173225155", "79173225155", "89173225155"):
+        return None
+
     user_id = appt.get("platform_user_id")
     if user_id and user_id != 0:
+        if _is_master_or_admin(user_id, platform):
+            return None
         return user_id
 
     from database import get_connection
@@ -83,12 +103,14 @@ def _resolve_platform_user_id(appt: dict, platform: str) -> int | None:
             return None
         row = None
         if appt.get("user_id"):
-            row = conn.execute(f"SELECT {col} FROM users WHERE id = %s", (appt["user_id"],)).fetchone()
+            row = conn.execute(f"SELECT id, {col} FROM users WHERE id = %s", (appt["user_id"],)).fetchone()
         if not row and appt.get("phone"):
-            row = conn.execute(f"SELECT {col} FROM users WHERE phone = %s", (appt["phone"],)).fetchone()
+            row = conn.execute(f"SELECT id, {col} FROM users WHERE phone = %s", (appt["phone"],)).fetchone()
 
         if row and row[col]:
             found_id = row[col]
+            if _is_master_or_admin(found_id, platform):
+                return None
             conn.execute(
                 "UPDATE appointments SET platform_user_id = %s, platform = %s WHERE id = %s",
                 (found_id, platform, appt["id"]),

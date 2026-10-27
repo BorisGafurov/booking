@@ -15,6 +15,23 @@ def get_current_saratov_time() -> datetime.datetime:
     return datetime.datetime.now(SARATOV_TZ)
 
 
+def parse_to_saratov(val: Any) -> datetime.datetime:
+    if isinstance(val, datetime.datetime):
+        if val.tzinfo is None:
+            return val.replace(tzinfo=SARATOV_TZ)
+        return val.astimezone(SARATOV_TZ)
+    if isinstance(val, str):
+        val_clean = val.replace("T", " ")
+        if "." in val_clean:
+            val_clean = val_clean.split(".")[0]
+        try:
+            dt = datetime.datetime.strptime(val_clean[:19], "%Y-%m-%d %H:%M:%S")
+            return dt.replace(tzinfo=SARATOV_TZ)
+        except Exception:
+            pass
+    return get_current_saratov_time()
+
+
 def create_or_update_appointment(
     phone: str,
     appointment_time: datetime.datetime,
@@ -25,7 +42,9 @@ def create_or_update_appointment(
     platform_user_id: int = 0,
     masters_id: str | None = None,
 ) -> int:
-    norm_phone = normalize_phone(phone)
+    norm_phone = normalize_phone(phone) if phone else ""
+    if norm_phone in ("+79173225155", "79173225155", "89173225155") and platform == "masters":
+        norm_phone = ""
     if appointment_time.tzinfo is None:
         appointment_time = appointment_time.replace(tzinfo=SARATOV_TZ)
 
@@ -663,6 +682,127 @@ def get_master_day_schedule(day_key: str) -> dict:
         "start_time": "10:00",
         "end_time": "19:00",
         "note": None if is_working_day else "Выходной день",
+    }
+
+
+def get_day_time_slots_status(day_key: str) -> dict[str, Any]:
+    """
+    Returns time slots breakdown for day_key:
+    - free_slots: list of free time strings (e.g. ['13:30', '16:30', '17:00'])
+    - busy_appts: list of unique booked appointments from DB on that day
+    - all_slots: list of slot dicts: [{'time': '10:00', 'is_busy': bool, 'badge': '🟢'|'🔴', ...}]
+    - sched: schedule dictionary
+    """
+    sched = get_master_day_schedule(day_key)
+
+    with get_connection() as conn:
+        dt_start = f"{day_key} 00:00:00"
+        dt_end = f"{day_key} 23:59:59"
+        p_start = dt_start if conn.is_pg else dt_start
+        p_end = dt_end if conn.is_pg else dt_end
+        rows = conn.execute(
+            """
+            SELECT id, appointment_time, client_name, phone, services, total_price, status
+            FROM appointments
+            WHERE appointment_time >= %s AND appointment_time <= %s
+              AND (status IS NULL OR status != 'cancelled')
+            ORDER BY appointment_time ASC
+            """,
+            (p_start, p_end),
+        ).fetchall()
+        db_appts = [dict(r) for r in rows]
+
+    busy_slots_map: dict[str, dict] = {}
+    busy_appts: list[dict] = []
+
+    for a in db_appts:
+        appt_dt = parse_to_saratov(a["appointment_time"])
+        start_hm = appt_dt.strftime("%H:%M")
+        svc_lower = (a.get("services") or "").lower()
+        if "бород" in svc_lower and "стрижк" not in svc_lower:
+            duration_min = 60
+        elif "стрижк" in svc_lower and "бород" in svc_lower:
+            duration_min = 135
+        else:
+            duration_min = 75
+
+        busy_appts.append({
+            "id": a["id"],
+            "time": start_hm,
+            "client_name": a.get("client_name") or "Клиент",
+            "services": a.get("services") or "Стрижка",
+            "phone": a.get("phone") or "",
+            "price": a.get("total_price") or 0,
+        })
+
+        cur_dt = appt_dt
+        end_dt = appt_dt + datetime.timedelta(minutes=duration_min)
+        while cur_dt < end_dt:
+            busy_slots_map[cur_dt.strftime("%H:%M")] = a
+            cur_dt += datetime.timedelta(minutes=30)
+
+    masters_free_slots: set[str] | None = None
+    try:
+        from services.masters import get_schedule
+        masters_map = get_schedule(["hair"])
+        if masters_map and day_key in masters_map:
+            masters_free_slots = set(s["time"].strip() for s in masters_map[day_key].get("slots", []))
+    except Exception as e:
+        logger.debug("Masters schedule check failed for %s: %s", day_key, e)
+
+    standard_slots = [
+        "10:00", "10:30", "11:00", "11:30", "12:00", "12:30", "13:00", "13:30",
+        "14:00", "14:30", "15:00", "15:30", "16:00", "16:30", "17:00", "17:30", "18:00", "18:30"
+    ]
+
+    free_slots: list[str] = []
+    if masters_free_slots is not None:
+        for s in masters_free_slots:
+            if s not in busy_slots_map:
+                free_slots.append(s)
+        free_slots = sorted(free_slots)
+    else:
+        for s in standard_slots:
+            if s not in busy_slots_map:
+                free_slots.append(s)
+
+    all_slots: list[dict] = []
+    for s in standard_slots:
+        if s in busy_slots_map:
+            appt_info = busy_slots_map[s]
+            all_slots.append({
+                "time": s,
+                "is_busy": True,
+                "badge": "🔴",
+                "client_name": appt_info.get("client_name"),
+                "services": appt_info.get("services"),
+                "appt_id": appt_info.get("id"),
+            })
+        elif s in free_slots:
+            all_slots.append({
+                "time": s,
+                "is_busy": False,
+                "badge": "🟢",
+                "client_name": None,
+                "services": None,
+                "appt_id": None,
+            })
+        elif masters_free_slots is not None and s not in masters_free_slots:
+            all_slots.append({
+                "time": s,
+                "is_busy": True,
+                "badge": "🔴",
+                "client_name": "Занято в Masters",
+                "services": None,
+                "appt_id": None,
+            })
+
+    return {
+        "day_key": day_key,
+        "sched": sched,
+        "free_slots": free_slots,
+        "busy_appts": busy_appts,
+        "all_slots": all_slots,
     }
 
 

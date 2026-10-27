@@ -21,6 +21,7 @@ from services.appointments import (
     get_appointment,
     get_appointments_counts,
     get_current_saratov_time,
+    get_day_time_slots_status,
     get_master_appointments,
     get_master_day_schedule,
     get_upcoming_days_schedule,
@@ -826,16 +827,47 @@ async def admin_create_day_chosen(callback: CallbackQuery):
     draft["day_key"] = day_key
     draft["step"] = "time"
 
-    hours = ["09:00", "10:00", "11:00", "12:00", "13:00", "14:00", "15:00", "16:00", "17:00", "18:00", "19:00", "20:00", "21:00"]
+    slots_info = await asyncio.to_thread(get_day_time_slots_status, day_key)
+    free_slots = slots_info.get("free_slots", [])
+    busy_appts = slots_info.get("busy_appts", [])
+
+    lines = [f"➕ <b>Шаг 3 из 4: Выберите время на {day_key}</b>\n"]
+    if free_slots:
+        lines.append(f"🟢 <b>Свободные окна:</b> {', '.join(free_slots)}")
+    else:
+        lines.append("⚠️ <i>На этот день нет свободных окон в Masters</i>")
+
+    if busy_appts:
+        lines.append("\n🔴 <b>Уже занято в расписании:</b>")
+        for b in busy_appts:
+            c_name = b["client_name"] or "Клиент"
+            lines.append(f"• <b>{b['time']}</b> — {c_name} (<i>{b['services']}</i>)")
+
+    lines.append("\n<i>Выберите свободное окно 🟢 или занятое 🔴 для овербукинга:</i>")
+    text = "\n".join(lines)
+
     rows = []
-    row = []
-    for h in hours:
-        row.append(InlineKeyboardButton(text=h, callback_data=f"admin:create:time:{h}"))
-        if len(row) == 3:
+    # 1. Free slots in rows of 3
+    if free_slots:
+        row = []
+        for s in free_slots:
+            row.append(InlineKeyboardButton(text=f"🟢 {s}", callback_data=f"admin:create:time:{s}"))
+            if len(row) == 3:
+                rows.append(row)
+                row = []
+        if row:
             rows.append(row)
-            row = []
-    if row:
-        rows.append(row)
+
+    # 2. Busy appointments buttons
+    if busy_appts:
+        row = []
+        for b in busy_appts:
+            row.append(InlineKeyboardButton(text=f"🔴 {b['time']} (занято)", callback_data=f"admin:create:busy:{b['time']}"))
+            if len(row) == 2:
+                rows.append(row)
+                row = []
+        if row:
+            rows.append(row)
 
     rows.append([
         InlineKeyboardButton(text="✏️ Любое другое время (08:30, 22:00...)", callback_data="admin:create:time:custom")
@@ -845,11 +877,40 @@ async def admin_create_day_chosen(callback: CallbackQuery):
 
     if callback.message:
         await callback.message.edit_text(
-            f"➕ <b>Шаг 3 из 4:</b> Выберите время на <b>{day_key}</b>:\n"
-            "<i>(можно записать клиента и вне стандартного рабочего графика)</i>",
+            text,
             reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
             parse_mode="HTML",
         )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admin:create:busy:"))
+async def admin_create_busy_clicked(callback: CallbackQuery):
+    if not callback.from_user or not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа.", show_alert=True)
+        return
+
+    time_val = callback.data.split(":")[3]
+    draft = admin_create_drafts.setdefault(callback.from_user.id, {})
+    day_key = draft.get("day_key", "")
+
+    slots_info = await asyncio.to_thread(get_day_time_slots_status, day_key)
+    b_appt = next((b for b in slots_info.get("busy_appts", []) if b["time"] == time_val), None)
+    details = f"{b_appt['client_name']} ({b_appt['services']})" if b_appt else "запись из Masters"
+
+    text = (
+        f"⚠️ <b>Внимание: на {day_key} в {time_val} уже есть запись!</b>\n\n"
+        f"• <b>{time_val}</b> — {details}\n\n"
+        "Вы действительно хотите записать ещё одного клиента на это же время (овербукинг)?"
+    )
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=f"⚠️ Да, записать на {time_val}", callback_data=f"admin:create:time:{time_val}")],
+            [InlineKeyboardButton(text="⬅️ Выбрать другое время", callback_data=f"admin:create:day:{day_key}")],
+        ]
+    )
+    if callback.message:
+        await callback.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
     await callback.answer()
 
 

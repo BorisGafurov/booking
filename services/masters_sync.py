@@ -688,7 +688,7 @@ def sync_schedule_from_masters_link() -> tuple[bool, int, str]:
                         price = 2300
 
                     create_or_update_appointment(
-                        phone="+79173225155",
+                        phone="",
                         appointment_time=dt,
                         services=svc_name,
                         total_price=price,
