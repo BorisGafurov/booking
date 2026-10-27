@@ -80,6 +80,15 @@ def sync():
         shutil.copy2(ROOT / "scripts" / "sync_core.py", scripts_dst / "sync_core.py")
         print(f"  [✓] Copied scripts/sync_core.py -> {scripts_dst}")
 
+        # 6. Copy docs directory
+        docs_src = ROOT / "docs"
+        if docs_src.exists():
+            docs_dst = target / "docs"
+            docs_dst.mkdir(exist_ok=True)
+            for doc_file in docs_src.glob("*.md"):
+                shutil.copy2(doc_file, docs_dst / doc_file.name)
+            print(f"  [✓] Copied docs/ -> {docs_dst}")
+
     print("\nSync completed successfully.")
 
 
