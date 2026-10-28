@@ -231,10 +231,16 @@ async def _finalize_successful_booking(
         inline_keyboard=[
             [
                 InlineKeyboardButton(
+                    text="📋 Мои записи",
+                    callback_data="my:list",
+                )
+            ],
+            [
+                InlineKeyboardButton(
                     text="❌ Отменить запись",
                     callback_data=f"appt:cancel:{appt_id}",
                 )
-            ]
+            ],
         ]
     )
 
@@ -244,7 +250,9 @@ async def _finalize_successful_booking(
         f"💰 <b>Стоимость:</b> {calc['total_price']} ₽ ({calc['duration_text']})\n"
         f"📅 <b>Дата и время:</b> {dt.strftime('%d.%m.%Y в %H:%M')}\n"
         f"📍 <b>Адрес:</b> Саратов, ул. имени Е.И. Пугачёва, 110\n\n"
-        "Ждём вас! Мы пришлём напоминание накануне вечером и за 2 часа до визита."
+        "Ждём вас! Мы пришлём напоминание накануне вечером и за 2 часа до визита.\n\n"
+        "💡 Все свои записи вы всегда найдёте в разделе «📋 Мои записи» в меню — "
+        "там можно посмотреть детали, перенести или отменить визит."
     )
 
     if isinstance(target_msg_or_cb, CallbackQuery):
@@ -521,7 +529,13 @@ async def handle_confirm_appointment(callback: CallbackQuery):
                                 text="❌ Отменить запись",
                                 callback_data=f"appt:cancel:{appt_id}",
                             ),
-                        ]
+                        ],
+                        [
+                            InlineKeyboardButton(
+                                text="📋 Мои записи",
+                                callback_data="my:list",
+                            )
+                        ],
                     ]
                 ),
                 parse_mode="HTML",
@@ -576,7 +590,14 @@ async def handle_cancel_appointment(callback: CallbackQuery):
         if callback.message:
             await callback.message.edit_text(
                 "❌ <b>Запись успешно отменена</b>\n\n"
-                "Будем рады видеть вас в другой раз! Чтобы выбрать новую дату, нажмите «✂️ Записаться».",
+                "Будем рады видеть вас в другой раз! Чтобы выбрать новую дату, нажмите «✂️ Записаться».\n\n"
+                "💡 Остальные ваши записи — в разделе «📋 Мои записи».",
+                reply_markup=InlineKeyboardMarkup(
+                    inline_keyboard=[
+                        [InlineKeyboardButton(text="📋 Мои записи", callback_data="my:list")],
+                        [InlineKeyboardButton(text="✂️ Записаться", callback_data="menu:booking")],
+                    ]
+                ),
                 parse_mode="HTML",
             )
     except TelegramBadRequest:
