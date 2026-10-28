@@ -75,11 +75,12 @@ def sync():
             shutil.copy2(ROOT / "tests" / "test_migrations.py", tests_dir / "test_migrations.py")
             print(f"  [✓] Copied tests/test_migrations.py -> {tests_dir}")
 
-        # 5. Copy scripts directory
+        # 5. Copy scripts directory (all scripts, keeping them identical across bots)
         scripts_dst = target / "scripts"
         scripts_dst.mkdir(exist_ok=True)
-        shutil.copy2(ROOT / "scripts" / "sync_core.py", scripts_dst / "sync_core.py")
-        print(f"  [✓] Copied scripts/sync_core.py -> {scripts_dst}")
+        for script_file in sorted(ROOT.glob("scripts/*.py")):
+            shutil.copy2(script_file, scripts_dst / script_file.name)
+            print(f"  [✓] Copied scripts/{script_file.name} -> {scripts_dst}")
 
         # 6. Copy docs directory
         docs_src = ROOT / "docs"

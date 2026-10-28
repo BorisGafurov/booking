@@ -609,6 +609,123 @@ class TestBookingBot(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(ok_sms)
         self.assertIn("ожидающей", msg_sms)
 
+    def test_masters_clients_import(self):
+        import io
+        import zipfile
+
+        from services.client_import import (
+            import_masters_clients,
+            parse_masters_clients_xlsx,
+        )
+
+        def col_letter(idx: int) -> str:
+            s = ""
+            idx += 1
+            while idx:
+                idx, r = divmod(idx - 1, 26)
+                s = chr(65 + r) + s
+            return s
+
+        grid = [
+            ["№", "Фамилия", "Имя", "Телефон", "Группы", "Email"],
+            ["1", "Тестов", "Пётр", "79990001122", "“Спящие” клиенты", "test@example.com"],
+            ["2", "", "Ольга", "79990003344", "", ""],
+        ]
+
+        rows_xml = []
+        for r, row in enumerate(grid, start=1):
+            cells = []
+            for c, val in enumerate(row):
+                ref = f"{col_letter(c)}{r}"
+                val_esc = (
+                    val.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+                )
+                cells.append(f'<c r="{ref}" t="inlineStr"><is><t>{val_esc}</t></is></c>')
+            rows_xml.append(f'<row r="{r}">{"".join(cells)}</row>')
+
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as zf:
+            zf.writestr(
+                "[Content_Types].xml",
+                '<?xml version="1.0" encoding="UTF-8"?>'
+                '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+                '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+                '<Default Extension="xml" ContentType="application/xml"/>'
+                '<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>'
+                '<Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>'
+                "</Types>",
+            )
+            zf.writestr(
+                "_rels/.rels",
+                '<?xml version="1.0" encoding="UTF-8"?>'
+                '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+                '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>'
+                "</Relationships>",
+            )
+            zf.writestr(
+                "xl/workbook.xml",
+                '<?xml version="1.0" encoding="UTF-8"?>'
+                '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
+                'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+                '<sheets><sheet name="Клиенты" sheetId="1" r:id="rId1"/></sheets>'
+                "</workbook>",
+            )
+            zf.writestr(
+                "xl/_rels/workbook.xml.rels",
+                '<?xml version="1.0" encoding="UTF-8"?>'
+                '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+                '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>'
+                "</Relationships>",
+            )
+            zf.writestr(
+                "xl/worksheets/sheet1.xml",
+                '<?xml version="1.0" encoding="UTF-8"?>'
+                '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+                f'<sheetData>{"".join(rows_xml)}</sheetData></worksheet>',
+            )
+
+        clients = parse_masters_clients_xlsx(buf.getvalue())
+        self.assertEqual(len(clients), 2)
+        self.assertEqual(clients[0]["first_name"], "Пётр")
+        self.assertEqual(clients[0]["last_name"], "Тестов")
+        self.assertEqual(clients[0]["phone"], "79990001122")
+        self.assertEqual(clients[0]["masters_group"], "“Спящие” клиенты")
+        self.assertEqual(clients[0]["email"], "test@example.com")
+        self.assertEqual(clients[1]["first_name"], "Ольга")
+
+        # Pre-create a user with junk numeric name (as left by a bad CSV import)
+        with get_connection() as conn:
+            conn.execute("DELETE FROM users WHERE phone = %s", ("+79990001122",))
+            conn.execute(
+                "INSERT INTO users (phone, first_name, last_name) VALUES (%s, %s, %s)",
+                ("+79990001122", "77", "Тестов"),
+            )
+            conn.commit()
+
+        added, updated, msg = import_masters_clients(clients)
+        self.assertEqual(added, 1)
+        self.assertEqual(updated, 1)
+
+        with get_connection() as conn:
+            row = conn.execute(
+                "SELECT first_name, last_name, masters_group, email FROM users WHERE phone = %s",
+                ("+79990001122",),
+            ).fetchone()
+        # Junk numeric first_name must be replaced with the Masters value
+        self.assertEqual(row["first_name"], "Пётр")
+        self.assertEqual(row["masters_group"], "“Спящие” клиенты")
+        self.assertEqual(row["email"], "test@example.com")
+
+        row2_exists = False
+        with get_connection() as conn:
+            row2_exists = conn.execute(
+                "SELECT id FROM users WHERE phone = %s", ("+79990003344",)
+            ).fetchone() is not None
+            # cleanup
+            conn.execute("DELETE FROM users WHERE phone IN (%s, %s)", ("+79990001122", "+79990003344"))
+            conn.commit()
+        self.assertTrue(row2_exists)
+
     def test_master_reschedule_appointment(self):
         from services.appointments import create_manual_appointment, get_appointment, reschedule_appointment
 

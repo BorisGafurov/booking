@@ -233,6 +233,16 @@ def import_clients_from_text(raw_text: str) -> tuple[int, int, str]:
 
 def import_clients_from_file(filename: str, file_bytes: bytes) -> tuple[int, int, str]:
     name_low = filename.lower()
+
+    # Masters CRM statistics export: keep all its fields (birthday, groups,
+    # socials, email, comment, statistics), not just name + phone.
+    try:
+        masters_clients = parse_masters_clients_xlsx(file_bytes)
+        if masters_clients:
+            return import_masters_clients(masters_clients)
+    except Exception as e:
+        logger.debug("Masters export parse attempt failed for %s: %s", filename, e)
+
     if name_low.endswith(".xlsx"):
         rows = parse_simple_xlsx(file_bytes)
         return import_clients_from_rows(rows)
@@ -252,6 +262,336 @@ def import_clients_from_file(filename: str, file_bytes: bytes) -> tuple[int, int
             pass
         rows = parse_csv_bytes(file_bytes)
         return import_clients_from_rows(rows)
+
+
+# ---------------------------------------------------------------------------
+# Masters CRM client export ("Клиенты" sheet) import
+# ---------------------------------------------------------------------------
+
+_XLSNS = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
+_RELSNS = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}"
+_PKGRELNS = "{http://schemas.openxmlformats.org/package/2006/relationships}"
+
+
+def _cell_col_index(cell_ref: str) -> int:
+    """Converts a cell reference like 'D5' into a 0-based column index."""
+    idx = 0
+    for ch in cell_ref:
+        if not ch.isalpha():
+            break
+        idx = idx * 26 + (ord(ch.upper()) - 64)
+    return max(idx - 1, 0)
+
+
+def _find_masters_sheet_path(zf: zipfile.ZipFile) -> str | None:
+    """Locates the worksheet named 'Клиенты' (falls back to the first sheet)."""
+    try:
+        wb = ET.fromstring(zf.read("xl/workbook.xml"))
+        rels = ET.fromstring(zf.read("xl/_rels/workbook.xml.rels"))
+        rel_map = {
+            rel.get("Id"): rel.get("Target", "")
+            for rel in rels.findall(f"{_PKGRELNS}Relationship")
+        }
+        sheets = wb.findall(f".//{_XLSNS}sheet")
+        first_target = None
+        for sheet in sheets:
+            name = (sheet.get("name") or "").strip().lower()
+            target = rel_map.get(sheet.get(f"{_RELSNS}id") or "", "")
+            if target and not target.startswith("/"):
+                target = "xl/" + target.lstrip("/")
+            if first_target is None:
+                first_target = target
+            if "клиент" in name and "запис" not in name:
+                return target
+        return first_target
+    except Exception:
+        return None
+
+
+def _xlsx_shared_strings(zf: zipfile.ZipFile) -> list[str]:
+    if "xl/sharedStrings.xml" not in zf.namelist():
+        return []
+    tree = ET.fromstring(zf.read("xl/sharedStrings.xml"))
+    shared: list[str] = []
+    for si in tree.findall(f"{_XLSNS}si"):
+        shared.append("".join(t.text or "" for t in si.iter(f"{_XLSNS}t")))
+    return shared
+
+
+def _xlsx_cell_text(cell: ET.Element, shared: list[str]) -> str:
+    cell_type = cell.get("t")
+    if cell_type == "inlineStr":
+        is_el = cell.find(f"{_XLSNS}is")
+        if is_el is None:
+            return ""
+        return "".join(t.text or "" for t in is_el.iter(f"{_XLSNS}t")).strip()
+    v = cell.find(f"{_XLSNS}v")
+    if v is None or v.text is None:
+        return ""
+    val = v.text
+    if cell_type == "s":
+        try:
+            idx = int(val)
+        except ValueError:
+            return val.strip()
+        return shared[idx].strip() if idx < len(shared) else ""
+    return val.strip()
+
+
+def _masters_field_for_header(header: str) -> str | None:
+    """Maps a Masters export header ('Фамилия', 'Записей всего', ...) to a field."""
+    h = header.strip().lower().rstrip(":").strip()
+    if not h or h.startswith("№"):
+        return None
+    if "фамили" in h:
+        return "last_name"
+    if h == "имя" or h.startswith("имя "):
+        return "first_name"
+    if "тел" in h:
+        return "phone"
+    if "рожд" in h:
+        return "birthday"
+    if "регистрац" in h:
+        return "masters_registered"
+    if "отмен" in h:
+        return "masters_cancelled_total"
+    if "записей" in h:
+        return "masters_appointments_total"
+    if "оказано" in h:
+        return "masters_revenue"
+    if "групп" in h:
+        return "masters_group"
+    if h == "vk" or h.startswith("vk "):
+        return "social_vk"
+    if "instagram" in h:
+        return "social_instagram"
+    if "facebook" in h:
+        return "social_facebook"
+    if "email" in h or "почт" in h:
+        return "email"
+    if "коммент" in h:
+        return "comment"
+    return None
+
+
+def parse_masters_clients_xlsx(file_bytes: bytes) -> list[dict[str, str]]:
+    """
+    Parses the 'Клиенты' sheet of a Masters CRM statistics export (.xlsx)
+    into a list of dicts with keys: last_name, first_name, phone, birthday,
+    masters_registered, masters_appointments_total, masters_cancelled_total,
+    masters_revenue, masters_group, social_instagram, social_facebook,
+    social_vk, email, comment.
+    Uses only the standard library (zipfile/xml), no openpyxl dependency.
+    """
+    zf = zipfile.ZipFile(io.BytesIO(file_bytes))
+    sheet_path = _find_masters_sheet_path(zf)
+    if not sheet_path or sheet_path not in zf.namelist():
+        sheets = sorted(
+            n for n in zf.namelist()
+            if n.startswith("xl/worksheets/sheet") and n.endswith(".xml")
+        )
+        if not sheets:
+            return []
+        sheet_path = sheets[0]
+
+    shared = _xlsx_shared_strings(zf)
+    tree = ET.fromstring(zf.read(sheet_path))
+    sheet_data = tree.find(f"{_XLSNS}sheetData")
+    if sheet_data is None:
+        return []
+
+    # rows: {row_number: {col_index: text}}
+    rows: dict[int, dict[int, str]] = {}
+    for row_node in sheet_data.findall(f"{_XLSNS}row"):
+        try:
+            row_no = int(row_node.get("r") or "0")
+        except ValueError:
+            row_no = len(rows) + 1
+        cells: dict[int, str] = {}
+        for c in row_node.findall(f"{_XLSNS}c"):
+            ref = c.get("r")
+            col = _cell_col_index(ref) if ref else len(cells)
+            text = _xlsx_cell_text(c, shared)
+            if text:
+                cells[col] = text
+        if cells:
+            rows[row_no] = cells
+
+    # Find the header row: must contain phone and name columns.
+    header_row_no = None
+    col_map: dict[int, str] = {}
+    for row_no in sorted(rows):
+        candidate: dict[int, str] = {}
+        for col, text in rows[row_no].items():
+            field = _masters_field_for_header(text)
+            if field:
+                candidate[col] = field
+        if "phone" in candidate.values() and (
+            "first_name" in candidate.values() or "last_name" in candidate.values()
+        ):
+            header_row_no = row_no
+            col_map = candidate
+            break
+    if header_row_no is None:
+        return []
+
+    clients: list[dict[str, str]] = []
+    for row_no in sorted(rows):
+        if row_no <= header_row_no:
+            continue
+        cells = rows[row_no]
+        item: dict[str, str] = {}
+        for col, field in col_map.items():
+            val = cells.get(col, "").strip()
+            if val:
+                item[field] = val
+        if item.get("phone"):
+            clients.append(item)
+    return clients
+
+
+def _masters_int(val: Any) -> int:
+    try:
+        return int(round(float(str(val).replace(",", "."))))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _name_is_meaningful(name: str | None) -> bool:
+    """True if the name is a real name (contains a letter, not a placeholder like 'Клиент')."""
+    if not name:
+        return False
+    if name in ("Клиент", "Клиент (Masters)"):
+        return False
+    return bool(re.search(r"[^\W\d_]", name))
+
+
+def import_masters_clients(clients: list[dict[str, Any]]) -> tuple[int, int, str]:
+    """
+    Upserts clients parsed from a Masters CRM export into the users table,
+    matching by normalized phone. Masters-specific fields (birthday, groups,
+    socials, email, comment, statistics) are stored as new columns of users.
+    Returns (added, updated, message).
+    """
+    if not clients:
+        return 0, 0, "Нет клиентов для импорта."
+
+    text_fields = {
+        "birthday": "birthday",
+        "masters_registered": "masters_registered",
+        "masters_group": "masters_group",
+        "social_instagram": "social_instagram",
+        "social_facebook": "social_facebook",
+        "social_vk": "social_vk",
+        "email": "email",
+        "comment": "comment",
+    }
+    stat_fields = {
+        "masters_appointments_total": "masters_appointments_total",
+        "masters_cancelled_total": "masters_cancelled_total",
+        "masters_revenue": "masters_revenue",
+    }
+
+    added = 0
+    updated = 0
+    skipped = 0
+
+    with get_connection() as conn:
+        for client in clients:
+            norm_phone = normalize_client_phone(str(client.get("phone", "")))
+            if not norm_phone:
+                skipped += 1
+                continue
+
+            first_name = str(client.get("first_name", "")).strip()
+            last_name = str(client.get("last_name", "")).strip()
+            if not first_name and not last_name:
+                first_name = "Клиент"
+            if not first_name:
+                first_name = last_name.split()[0] if last_name else "Клиент"
+                if last_name.startswith(first_name):
+                    last_name = last_name[len(first_name):].strip()
+
+            # Text fields: only non-empty export values are written.
+            text_vals = {
+                col: str(client.get(field, "")).strip()
+                for field, col in text_fields.items()
+            }
+            stat_vals = {col: _masters_int(client.get(field)) for field, col in stat_fields.items()}
+
+            existing = conn.execute(
+                "SELECT id, first_name, last_name FROM users WHERE phone = %s",
+                (norm_phone,),
+            ).fetchone()
+
+            if existing:
+                user_id = existing["id"]
+                cur_first = (existing["first_name"] or "").strip()
+                cur_last = (existing["last_name"] or "").strip()
+                new_first = cur_first if _name_is_meaningful(cur_first) else (first_name or cur_first)
+                new_last = cur_last if _name_is_meaningful(cur_last) else (last_name or cur_last)
+
+                sets = ["first_name = %s", "last_name = %s"]
+                params: list[Any] = [new_first, new_last]
+                for col, val in text_vals.items():
+                    if val:
+                        sets.append(f"{col} = %s")
+                        params.append(val)
+                for col, val in stat_vals.items():
+                    sets.append(f"{col} = %s")
+                    params.append(val)
+                sets.append("masters_imported_at = CURRENT_TIMESTAMP")
+                sets.append("updated_at = CURRENT_TIMESTAMP")
+                params.append(user_id)
+                conn.execute(
+                    f"UPDATE users SET {', '.join(sets)} WHERE id = %s",
+                    tuple(params),
+                )
+                updated += 1
+            else:
+                cols = ["phone", "first_name", "last_name"]
+                vals: list[Any] = [norm_phone, first_name, last_name]
+                for col, val in text_vals.items():
+                    if val:
+                        cols.append(col)
+                        vals.append(val)
+                for col, val in stat_vals.items():
+                    cols.append(col)
+                    vals.append(val)
+                cols.append("masters_imported_at")
+                placeholders = ", ".join(["%s"] * (len(cols) - 1) + ["CURRENT_TIMESTAMP"])
+                if conn.is_pg:
+                    row = conn.execute(
+                        f"INSERT INTO users ({', '.join(cols)}) VALUES ({placeholders}) RETURNING id",
+                        tuple(vals),
+                    ).fetchone()
+                    user_id = row["id"] if row else None
+                else:
+                    cur = conn.execute(
+                        f"INSERT INTO users ({', '.join(cols)}) VALUES ({placeholders})",
+                        tuple(vals),
+                    )
+                    user_id = cur.lastrowid
+                added += 1
+
+            # Link appointments that still have a generic client name.
+            full_name = f"{first_name} {last_name}".strip()
+            conn.execute(
+                """
+                UPDATE appointments
+                SET client_name = %s, user_id = COALESCE(user_id, %s)
+                WHERE phone = %s AND (client_name IS NULL OR client_name IN ('Клиент (Masters)', 'Клиент', ''))
+                """,
+                (full_name, user_id, norm_phone),
+            )
+
+        conn.commit()
+
+    total = added + updated
+    msg = f"Masters: обработано {total} клиентов (новых: {added}, обновлено: {updated})"
+    if skipped:
+        msg += f", пропущено без телефона: {skipped}"
+    return added, updated, msg
 
 
 def get_clients_stats() -> dict[str, int]:
