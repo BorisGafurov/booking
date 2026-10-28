@@ -1248,7 +1248,7 @@ async def admin_masters_enter_phone(callback: CallbackQuery):
     text = (
         "📱 <b>Введите номер телефона мастера</b>\n\n"
         "Напишите в ответном сообщении номер, зарегистрированный в сервисе Masters "
-        "(например, <code>+79173225155</code>):"
+        "(например, <code>+79991234567</code>):"
     )
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
@@ -1279,7 +1279,7 @@ async def admin_masters_request_code(callback: CallbackQuery):
             if callback.message:
                 await callback.message.edit_text(
                     "📱 <b>Введите номер телефона мастера</b>\n\n"
-                    "Напишите номер, зарегистрированный в сервисе Masters (например, <code>+79173225155</code>):",
+                    "Напишите номер, зарегистрированный в сервисе Masters (например, <code>+79991234567</code>):",
                     reply_markup=InlineKeyboardMarkup(
                         inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="admin:masters")]]
                     ),
@@ -1300,7 +1300,7 @@ async def admin_masters_request_code(callback: CallbackQuery):
                 await callback.message.edit_text(
                     f"❌ <b>{msg}</b>\n\n"
                     f"Проверьте номер или напишите другой номер телефона мастера в ответном сообщении:\n"
-                    f"<i>(например, <code>+79173225155</code>)</i>",
+                    f"<i>(например, <code>+79991234567</code>)</i>",
                     reply_markup=InlineKeyboardMarkup(
                         inline_keyboard=[
                             [InlineKeyboardButton(text="✏️ Ввести номер вручную", callback_data="admin:masters_enter_phone")],
@@ -1769,7 +1769,7 @@ async def handle_admin_text_inputs(message: Message):
                 pending_master_logins[user_id] = {"awaiting_phone": True}
                 await message.answer(
                     f"❌ <b>{msg}</b>\n\n"
-                    "Попробуйте ввести номер телефона мастера ещё раз (например, <code>+79173225155</code>):",
+                    "Попробуйте ввести номер телефона мастера ещё раз (например, <code>+79991234567</code>):",
                     reply_markup=InlineKeyboardMarkup(
                         inline_keyboard=[[InlineKeyboardButton(text="⬅️ Меню админки", callback_data="admin:menu")]]
                     ),
@@ -1792,7 +1792,7 @@ async def handle_admin_text_inputs(message: Message):
             return
         else:
             await message.answer(
-                "⚠️ Пожалуйста, введите корректный номер телефона мастера (например, <code>+79173225155</code>):",
+                "⚠️ Пожалуйста, введите корректный номер телефона мастера (например, <code>+79991234567</code>):",
                 reply_markup=InlineKeyboardMarkup(
                     inline_keyboard=[[InlineKeyboardButton(text="⬅️ Меню админки", callback_data="admin:menu")]]
                 ),

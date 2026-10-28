@@ -1,3 +1,4 @@
+import html
 import logging
 import re
 from pathlib import Path
@@ -315,12 +316,56 @@ def load_items(subpath: str, fallback: dict[str, dict]) -> dict[str, dict]:
     return items if items else fallback
 
 
+def format_vk_text(text: str) -> str:
+    """Convert the shared HTML/Markdown recommendation text to plain VK text."""
+    if not text:
+        return ""
+    text = re.sub(r"\[([^\]]+)\]\((https?://[^\)]+)\)", r"\1 (\2)", text)
+    text = re.sub(
+        r'<a\s+href=["\']([^"\']+)["\']>([^<]+)</a>',
+        r"\2 (\1)",
+        text,
+        flags=re.IGNORECASE,
+    )
+    text = re.sub(r"<br\s*/?>", "\n", text, flags=re.IGNORECASE)
+    text = re.sub(
+        r"</?(?:b|i|code|strong|em|p|div|span|u|s|ul|ol|li)>",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
+    text = re.sub(r"<[^>]+>", "", text)
+    return html.unescape(text).strip()
+
+
+def _format_item_for_platform(item: dict) -> dict:
+    try:
+        from core_bot.services.referrals import get_current_platform
+
+        platform = get_current_platform()
+    except Exception:
+        platform = "telegram"
+
+    if platform != "vk" or not isinstance(item, dict):
+        return item
+
+    result = dict(item)
+    for key in ("title", "text"):
+        if isinstance(result.get(key), str):
+            result[key] = format_vk_text(result[key])
+    return result
+
+
+def _format_items_for_platform(items: dict[str, dict]) -> dict[str, dict]:
+    return {key: _format_item_for_platform(value) for key, value in items.items()}
+
+
 def get_articles() -> dict[str, dict]:
-    return load_items("articles", FALLBACK_ARTICLES)
+    return _format_items_for_platform(load_items("articles", FALLBACK_ARTICLES))
 
 
 def get_products() -> dict[str, dict]:
-    return load_items("products", FALLBACK_PRODUCTS)
+    return _format_items_for_platform(load_items("products", FALLBACK_PRODUCTS))
 
 
 def get_article(slug: str) -> dict | None:

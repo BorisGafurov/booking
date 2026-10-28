@@ -7,6 +7,7 @@ import zipfile
 from typing import Any
 
 from core_bot.database import get_connection
+from core_bot.services.referrals import is_master_phone
 
 logger = logging.getLogger(__name__)
 
@@ -320,7 +321,7 @@ def update_appointment_client_details(
 ) -> tuple[bool, str]:
     client_name = client_name.strip()
     norm_phone = normalize_client_phone(phone) if phone else None
-    if norm_phone in ("+79173225155", "79173225155", "89173225155"):
+    if is_master_phone(norm_phone):
         norm_phone = None
 
     with get_connection() as conn:
@@ -359,7 +360,7 @@ def update_appointment_client_details(
                     user_id = cur.lastrowid
 
         existing_phone = appt["phone"] or ""
-        if existing_phone in ("+79173225155", "79173225155", "89173225155"):
+        if is_master_phone(existing_phone):
             existing_phone = ""
 
         effective_phone = norm_phone if norm_phone is not None else existing_phone

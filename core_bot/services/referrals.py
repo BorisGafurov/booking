@@ -23,9 +23,9 @@ logger = logging.getLogger(__name__)
 
 
 def get_current_platform() -> str:
-    env_p = os.getenv("DEFAULT_PLATFORM") or os.getenv("PLATFORM")
-    if env_p:
-        return env_p.lower()
+    env_p = (os.getenv("DEFAULT_PLATFORM") or os.getenv("PLATFORM") or "").strip().lower()
+    if env_p in ("telegram", "vk", "max"):
+        return env_p
     try:
         repo_name = Path(__file__).resolve().parents[2].name.lower()
         if "vk" in repo_name:
@@ -64,6 +64,22 @@ def normalize_phone(raw_phone: str | None) -> str:
     elif len(digits) == 10:
         digits = "7" + digits
     return f"+{digits}" if digits else ""
+
+
+def get_master_phones() -> set[str]:
+    """Return normalized master phone numbers configured via MASTER_PHONES/MASTER_PHONE."""
+    raw = os.getenv("MASTER_PHONES") or os.getenv("MASTER_PHONE") or ""
+    phones: set[str] = set()
+    for item in raw.split(","):
+        norm = normalize_phone(item.strip())
+        if norm:
+            phones.add(norm)
+    return phones
+
+
+def is_master_phone(phone: str | None) -> bool:
+    norm = normalize_phone(phone)
+    return bool(norm and norm in get_master_phones())
 
 
 def _find_user(conn, identifier: int, platform: str | None = None) -> dict | None:
@@ -587,7 +603,20 @@ def get_user_by_phone(phone: str) -> dict | None:
         return dict(row) if row else None
 
 
+PHONE_CONFLICT_MESSAGE = (
+    "Этот номер уже привязан к другому профилю. "
+    "Аккаунты не объединены; запись можно оформить на этот номер. "
+    "Для объединения профилей обратитесь к мастеру."
+)
+
+
 def link_user_phone(user_identifier: int, phone: str, platform: str | None = None) -> tuple[bool, str]:
+    """Attach a phone to the current platform profile.
+
+    A phone number is NOT proof of identity: it can be entered by anyone. Therefore
+    profiles are never merged automatically. A conflicting number is reported to the
+    user and left untouched; the booking flow may still use it for the appointment.
+    """
     if platform is None:
         platform = get_current_platform()
     clean_phone = normalize_phone(phone)
@@ -597,71 +626,47 @@ def link_user_phone(user_identifier: int, phone: str, platform: str | None = Non
 
     with get_connection() as conn:
         current_user = _find_user(conn, user_identifier, platform)
-        if not current_user:
-            _save_user_unified(
-                telegram_id=user_identifier if platform == "telegram" else None,
-                vk_id=user_identifier if platform == "vk" else None,
-                max_user_id=user_identifier if platform == "max" else None,
-                phone=clean_phone,
-            )
-            return True, "Номер телефона успешно привязан."
-
-        user_db_id = current_user["id"]
         existing = conn.execute(
-            "SELECT * FROM users WHERE phone = %s AND id != %s",
-            (clean_phone, user_db_id),
+            "SELECT id FROM users WHERE phone = %s",
+            (clean_phone,),
         ).fetchone()
 
-        if existing:
-            target_id = existing["id"]
-            # Clear unique fields on old record first to prevent UNIQUE constraint conflict during transfer
-            conn.execute(
-                "UPDATE users SET telegram_id = NULL, vk_id = NULL, max_user_id = NULL, phone = NULL WHERE id = %s",
-                (user_db_id,),
+        if existing and (not current_user or existing["id"] != current_user["id"]):
+            logger.warning(
+                "Phone conflict: refusing to merge accounts for platform=%s user=%s",
+                platform,
+                user_identifier,
             )
-            conn.execute(
-                """
-                UPDATE users
-                SET telegram_id = COALESCE(telegram_id, %s),
-                    vk_id = COALESCE(vk_id, %s),
-                    max_user_id = COALESCE(max_user_id, %s),
-                    username = COALESCE(username, %s),
-                    first_name = COALESCE(first_name, %s),
-                    last_name = COALESCE(last_name, %s),
-                    phone = %s,
-                    updated_at = CURRENT_TIMESTAMP
-                WHERE id = %s
-                """,
-                (
-                    current_user.get("telegram_id"),
-                    current_user.get("vk_id"),
-                    current_user.get("max_user_id"),
-                    current_user.get("username"),
-                    current_user.get("first_name"),
-                    current_user.get("last_name"),
-                    clean_phone,
-                    target_id,
-                ),
-            )
-            conn.execute("UPDATE referrals SET referrer_user_id = %s WHERE referrer_user_id = %s", (target_id, user_db_id))
-            
-            existing_invite = conn.execute("SELECT id FROM referrals WHERE invited_user_id = %s", (target_id,)).fetchone()
-            if existing_invite:
-                conn.execute("DELETE FROM referrals WHERE invited_user_id = %s", (user_db_id,))
-            else:
-                conn.execute("UPDATE referrals SET invited_user_id = %s WHERE invited_user_id = %s", (target_id, user_db_id))
+            return True, PHONE_CONFLICT_MESSAGE
 
-            conn.execute("DELETE FROM referrals WHERE referrer_user_id = %s AND invited_user_id = %s", (target_id, target_id))
-            conn.execute("UPDATE rewards SET user_id = %s WHERE user_id = %s", (target_id, user_db_id))
-            conn.execute("UPDATE appointments SET user_id = %s WHERE user_id = %s", (target_id, user_db_id))
-            conn.execute("UPDATE user_roles SET user_id = %s WHERE user_id = %s", (target_id, user_db_id))
-            conn.execute("DELETE FROM users WHERE id = %s", (user_db_id,))
-            conn.commit()
-            return True, "Профиль успешно объединён по номеру телефона."
-        else:
-            conn.execute("UPDATE users SET phone = %s WHERE id = %s", (clean_phone, user_db_id))
-            conn.commit()
-            return True, "Номер телефона сохранён."
+        if not current_user:
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO users (telegram_id, vk_id, max_user_id, phone)
+                    VALUES (%s, %s, %s, %s)
+                    """,
+                    (
+                        user_identifier if platform == "telegram" else None,
+                        user_identifier if platform == "vk" else None,
+                        user_identifier if platform == "max" else None,
+                        clean_phone,
+                    ),
+                )
+                conn.commit()
+            except Exception:
+                conn.raw_conn.rollback()
+                logger.warning(
+                    "Phone conflict while creating profile for platform=%s user=%s",
+                    platform,
+                    user_identifier,
+                )
+                return True, PHONE_CONFLICT_MESSAGE
+            return True, "Номер телефона успешно привязан."
+
+        conn.execute("UPDATE users SET phone = %s WHERE id = %s", (clean_phone, current_user["id"]))
+        conn.commit()
+        return True, "Номер телефона сохранён."
 
 
 def get_all_clients(limit: int = 100, offset: int = 0) -> tuple[list[dict], int]:

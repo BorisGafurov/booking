@@ -42,6 +42,7 @@ from core_bot.services.masters_sync import (
     sync_masters_appointments,
 )
 from core_bot.services.recommendations import (
+    format_vk_text,
     get_article,
     get_articles,
     get_product,
@@ -130,6 +131,7 @@ __all__ = [
     "get_article",
     "get_products",
     "get_product",
+    "format_vk_text",
     # Referrals & Users
     "normalize_phone",
     "save_user",

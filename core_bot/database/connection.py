@@ -153,9 +153,18 @@ def _get_sqlite_connection() -> Generator[DBConnection, None, None]:
 def get_connection() -> Generator[DBConnection, None, None]:
     global _pg_unreachable, _last_pg_check
     now = time.time()
-    if _pg_unreachable and (now - _last_pg_check > 60):
-        _pg_unreachable = False
-        _last_pg_check = now
+    if _pg_unreachable:
+        # Fail closed: never silently switch to SQLite when the fallback is disabled.
+        if not ALLOW_SQLITE_FALLBACK:
+            logger.critical(
+                "PostgreSQL is marked unreachable and SQLite fallback is disabled; refusing connection"
+            )
+            raise RuntimeError(
+                "Database connection error: PostgreSQL unavailable and SQLite fallback disabled"
+            )
+        if now - _last_pg_check > 60:
+            _pg_unreachable = False
+            _last_pg_check = now
 
     if IS_POSTGRES and not _pg_unreachable:
         pool = get_pg_pool()

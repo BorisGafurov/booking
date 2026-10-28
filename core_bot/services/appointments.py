@@ -4,7 +4,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from core_bot.database import get_connection
-from core_bot.services.referrals import normalize_phone
+from core_bot.services.referrals import is_master_phone, normalize_phone
 
 logger = logging.getLogger(__name__)
 
@@ -53,7 +53,7 @@ def create_or_update_appointment(
     masters_id: str | None = None,
 ) -> int:
     norm_phone = normalize_phone(phone) if phone else ""
-    if norm_phone in ("+79173225155", "79173225155", "89173225155") and (platform == "masters" or not client_name or "Клиент" in client_name):
+    if is_master_phone(norm_phone) and (platform == "masters" or not client_name or "Клиент" in client_name):
         norm_phone = ""
     if appointment_time.tzinfo is None:
         appointment_time = appointment_time.replace(tzinfo=SARATOV_TZ)
@@ -110,10 +110,10 @@ def create_or_update_appointment(
                 if eff_name in ("Клиент (Masters)", "Клиент", "") and existing["client_name"] and existing["client_name"] not in ("Клиент (Masters)", "Клиент"):
                     eff_name = existing["client_name"]
                 eff_phone = norm_phone
-                if not eff_phone and existing["phone"] and existing["phone"] not in ("+79173225155", "79173225155", "89173225155"):
+                if not eff_phone and existing["phone"] and not is_master_phone(existing["phone"]):
                     eff_phone = existing["phone"]
-                elif eff_phone in ("+79173225155", "79173225155", "89173225155"):
-                    eff_phone = existing["phone"] if (existing["phone"] and existing["phone"] not in ("+79173225155", "79173225155", "89173225155")) else ""
+                elif is_master_phone(eff_phone):
+                    eff_phone = existing["phone"] if (existing["phone"] and not is_master_phone(existing["phone"])) else ""
 
                 eff_price = total_price
                 eff_services = services
@@ -238,9 +238,14 @@ def _check_appointment_access(
         if appt.get("platform") == platform and appt.get("platform_user_id") == platform_user_id:
             return True
 
-        user = get_user_by_platform_id(platform_user_id, platform)
-        if user and appt.get("user_id") and user.get("id") == appt["user_id"]:
-            return True
+        # Masters-imported appointments are created without a client platform id,
+        # so allow the linked user to manage only those rows. Never apply this
+        # fallback to bot-created appointments: it would bypass the platform+id
+        # check after an account was linked to a phone.
+        if appt.get("platform") == "masters":
+            user = get_user_by_platform_id(platform_user_id, platform)
+            if user and appt.get("user_id") and user.get("id") == appt["user_id"]:
+                return True
     except Exception as e:
         logger.error("Error in _check_appointment_access: %s", e)
         return False
@@ -1080,7 +1085,7 @@ def get_due_retention_reminders(platform: str | None = None) -> list[dict]:
     with get_connection() as conn:
         query = """
             SELECT * FROM appointments
-            WHERE status IN ('completed', 'confirmed')
+            WHERE status = 'completed'
               AND retention_18d_sent = FALSE
               AND appointment_time <= %s AND appointment_time >= %s
         """

@@ -12,13 +12,13 @@ from zoneinfo import ZoneInfo
 
 from core_bot.database import get_connection
 from core_bot.services.appointments import create_or_update_appointment
-from core_bot.services.referrals import normalize_phone
+from core_bot.services.referrals import is_master_phone, normalize_phone
 
 logger = logging.getLogger(__name__)
 
 MASTERS_LOGIN_URL = "https://prod.mastersapp.ru/account/auth/login"
 SARATOV_TZ = ZoneInfo("Europe/Saratov")
-DEFAULT_MASTER_PHONE = os.getenv("MASTER_PHONE", "+79173225155")
+DEFAULT_MASTER_PHONE = os.getenv("MASTER_PHONE", "")
 
 # In-memory storage for pending master login flows: admin_id -> login_state
 pending_master_logins: dict[int, dict[str, Any]] = {}
@@ -46,7 +46,14 @@ def _get_ssl_context() -> ssl.SSLContext:
         import certifi
         return ssl.create_default_context(cafile=certifi.where())
     except Exception:
-        return ssl._create_unverified_context()
+        pass
+    try:
+        return ssl.create_default_context()
+    except Exception as exc:
+        if os.getenv("MASTERS_ALLOW_INSECURE_SSL", "").lower() in ("1", "true", "yes"):
+            logger.warning("Could not create verified SSL context, using unverified context (allowed by env)")
+            return ssl._create_unverified_context()
+        raise RuntimeError("Cannot create a verified SSL context for Masters") from exc
 
 
 def format_master_phone(raw_phone: str) -> str:
@@ -867,7 +874,7 @@ def sync_masters_appointments() -> tuple[bool, int, str]:
                     for ev in events_data:
                         ev_id = str(ev.get("id") or "")
                         ev_phone = ev.get("phone") or ev.get("client_phone") or ""
-                        if ev_phone in ("+79173225155", "79173225155", "89173225155"):
+                        if is_master_phone(ev_phone):
                             ev_phone = ""
                         ev_name = ev.get("client_name") or ev.get("name") or "Клиент"
                         ev_start = ev.get("start") or ev.get("datetime")

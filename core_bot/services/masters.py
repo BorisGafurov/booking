@@ -3,6 +3,7 @@ import html as html_module
 import http.cookiejar
 import json
 import logging
+import os
 import re
 import ssl
 import time
@@ -11,6 +12,7 @@ import urllib.request
 from typing import Any
 
 from config import BOOKING_URL
+from core_bot.services.referrals import is_master_phone
 
 logger = logging.getLogger(__name__)
 
@@ -25,11 +27,14 @@ def _get_ssl_context() -> ssl.SSLContext:
         import certifi
         return ssl.create_default_context(cafile=certifi.where())
     except Exception:
-        try:
-            return ssl.create_default_context()
-        except Exception:
-            logger.warning("Could not create verified SSL context, falling back to unverified context")
+        pass
+    try:
+        return ssl.create_default_context()
+    except Exception as exc:
+        if os.getenv("MASTERS_ALLOW_INSECURE_SSL", "").lower() in ("1", "true", "yes"):
+            logger.warning("Could not create verified SSL context, using unverified context (allowed by env)")
             return ssl._create_unverified_context()
+        raise RuntimeError("Cannot create a verified SSL context for Masters") from exc
 
 SERVICES = {
     "hair": {
@@ -300,10 +305,10 @@ def initiate_booking(
     if len(clean_digits) == 11 and clean_digits.startswith(("7", "8")):
         clean_digits = clean_digits[1:]
 
-    if clean_digits in ("9173225155", "79173225155"):
+    if is_master_phone(phone):
         return (
             False,
-            "Вы не можете сделать запись на номер самого мастера (+79173225155). Masters запрещает мастеру записывать себя на свой же номер телефона. Для тестирования введите любой другой номер клиента (например: +79991234567).",
+            "Вы не можете сделать запись на номер самого мастера. Masters запрещает мастеру записывать себя на свой же номер телефона. Для тестирования введите любой другой номер клиента (например: +79991234567).",
             None,
         )
 

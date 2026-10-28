@@ -374,9 +374,9 @@ async def _process_phone_provided(message: Message, user_id: int, phone_raw: str
     if _has_active_admin_draft(message):
         return
 
-    success, _ = link_user_phone(user_id, phone_raw, platform="telegram")
+    success, link_msg = link_user_phone(user_id, phone_raw, platform="telegram")
     if not success:
-        await message.answer("Пожалуйста, введите корректный номер телефона (например, +79991234567).")
+        await message.answer(link_msg or "Пожалуйста, введите корректный номер телефона (например, +79991234567).")
         return
 
     pending_ts = user_selected_slot.pop(user_id, None)
@@ -417,7 +417,7 @@ async def _process_phone_provided(message: Message, user_id: int, phone_raw: str
 
     user_selected_services[user_id] = {"hair"}
     await message.answer(
-        "✅ <b>Номер телефона успешно сохранен!</b>\n\n"
+        f"✅ <b>{html.escape(link_msg)}</b>\n\n"
         "Теперь выберите услуги для записи:",
         reply_markup=get_services_keyboard(user_selected_services[user_id]),
         parse_mode="HTML",

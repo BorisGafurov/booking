@@ -9,6 +9,14 @@ from unittest.mock import AsyncMock, MagicMock
 test_dir = tempfile.mkdtemp()
 os.environ["DATA_DIR"] = test_dir
 os.environ["DATABASE_URL"] = ""
+os.environ["PLATFORM"] = "telegram"
+TEST_MASTER_PHONE = "+79990000000"
+TEST_MASTER_PHONE_FORMATTED = "(999) 000-00-00"
+os.environ["MASTER_PHONE"] = TEST_MASTER_PHONE
+os.environ["MASTER_PHONES"] = TEST_MASTER_PHONE
+os.environ["MASTER_TELEGRAM_IDS"] = "900000001,900000002"
+os.environ["MASTER_VK_IDS"] = "900000003"
+os.environ["MASTER_MAX_IDS"] = "900000004"
 
 import database
 from database import get_connection, init_db
@@ -163,6 +171,8 @@ class TestBookingBot(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(stats_final["active_rewards_sum"], 0)
 
     def test_recommendations(self):
+        from services.recommendations import format_vk_text
+
         articles = get_articles()
         self.assertIn("styling", articles)
         self.assertIn("beard", articles)
@@ -170,6 +180,9 @@ class TestBookingBot(unittest.IsolatedAsyncioTestCase):
         styling = get_article("styling")
         self.assertIsNotNone(styling)
         self.assertIn("укладывать", styling["title"].lower())
+        self.assertIn("<b>", styling["text"])
+        self.assertNotIn("<b>", format_vk_text(styling["text"]))
+        self.assertNotIn("<a href", format_vk_text(styling["text"]))
 
         products = get_products()
         self.assertIn("paste", products)
@@ -254,7 +267,7 @@ class TestBookingBot(unittest.IsolatedAsyncioTestCase):
         mock_message.answer.assert_called_once()
         mock_bot.send_message.assert_called_once()
 
-    def test_phone_linking_and_account_merging(self):
+    def test_phone_linking_and_account_isolation(self):
         from services.referrals import (
             _save_user_unified,
             get_referral_stats,
@@ -285,14 +298,16 @@ class TestBookingBot(unittest.IsolatedAsyncioTestCase):
         link_user_phone(202, "+79991112233", platform="vk")
         self.assertEqual(get_user_phone(202, "vk"), "+79991112233")
 
-        ok_merge, _ = link_user_phone(101, "89991112233", platform="telegram")
-        self.assertTrue(ok_merge)
+        ok_conflict, conflict_msg = link_user_phone(101, "89991112233", platform="telegram")
+        self.assertTrue(ok_conflict)
+        self.assertIn("не объединены", conflict_msg)
+        self.assertIsNone(get_user_phone(101, "telegram"))
 
         stats_tg_after = get_referral_stats(101, "telegram")
         stats_vk_after = get_referral_stats(202, "vk")
-        self.assertEqual(stats_tg_after["started"], 1)
+        self.assertEqual(stats_tg_after["started"], 0)
         self.assertEqual(stats_vk_after["started"], 1)
-        self.assertEqual(stats_tg_after["started"], stats_vk_after["started"])
+        self.assertNotEqual(stats_tg_after["started"], stats_vk_after["started"])
 
     def test_appointment_lifecycle_and_reminders(self):
         import datetime
@@ -671,7 +686,7 @@ class TestBookingBot(unittest.IsolatedAsyncioTestCase):
             services="Стрижка (МУЖСКАЯ)",
             total_price=2300,
             client_name="Клиент (Masters)",
-            phone="+79173225155",
+            phone=TEST_MASTER_PHONE,
             platform="telegram",
         )
         appt_after = get_appointment(appt_id)
@@ -692,7 +707,7 @@ class TestBookingBot(unittest.IsolatedAsyncioTestCase):
             services="Стрижка (МУЖСКАЯ)",
             total_price=2300,
             client_name="Клиент (Masters)",
-            phone="+79173225155",
+            phone=TEST_MASTER_PHONE,
             platform="masters",
         )
         appt_final = get_appointment(appt_id)
@@ -709,7 +724,7 @@ class TestBookingBot(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(get_user_phone(999888, platform="telegram"), "+79991112233")
 
         # 2. Master's own phone prevention
-        ok, error_msg, session_data = initiate_booking("+79173225155", {"hair"}, int(datetime.datetime.now().timestamp()))
+        ok, error_msg, session_data = initiate_booking(TEST_MASTER_PHONE, {"hair"}, int(datetime.datetime.now().timestamp()))
         self.assertFalse(ok)
         self.assertIn("номер самого мастера", error_msg)
         self.assertIsNone(session_data)
@@ -788,7 +803,7 @@ class TestBookingBot(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(second_state["platform_user_id"], 123456)
         self.assertEqual(second_state["client_name"], "Иван Клиент")
 
-    def test_user_merge_transfers_appointments_and_roles(self):
+    def test_phone_conflict_keeps_appointments_isolated(self):
         from services.referrals import save_user, link_user_phone
         from services.appointments import create_or_update_appointment, get_appointment
 
@@ -807,13 +822,16 @@ class TestBookingBot(unittest.IsolatedAsyncioTestCase):
         # Create user B (has phone from Masters or VK)
         user_b_id, _ = save_user(telegram_id=888002, phone="+79997778899", first_name="UserB")
 
-        # Now User A enters phone +79997778899 -> User A must merge into User B
+        # User A enters a phone that belongs to User B. Accounts must NOT be merged
+        # automatically because phone ownership was not verified.
         ok, msg = link_user_phone(777001, "+79997778899", platform="telegram")
         self.assertTrue(ok)
+        self.assertIn("не объединены", msg)
 
-        # The appointment must now belong to User B (target_id), not be orphaned!
+        # User A keeps their own appointment; nothing is transferred to User B.
         appt = get_appointment(appt_id)
-        self.assertEqual(appt["user_id"], user_b_id)
+        self.assertEqual(appt["user_id"], user_a_id)
+        self.assertNotEqual(appt["user_id"], user_b_id)
 
     def test_reminder_worker_excludes_master(self):
         from services.reminder_worker import _resolve_platform_user_id
@@ -821,9 +839,9 @@ class TestBookingBot(unittest.IsolatedAsyncioTestCase):
         # 1. Appointment with master phone with spaces/brackets
         appt_master = {
             "id": 1,
-            "phone": "+7 (917) 322-51-55",
+            "phone": TEST_MASTER_PHONE_FORMATTED,
             "platform": "telegram",
-            "platform_user_id": 1010373026,
+            "platform_user_id": 900000001,
             "user_id": None,
         }
         self.assertIsNone(_resolve_platform_user_id(appt_master, "telegram"))
@@ -833,7 +851,7 @@ class TestBookingBot(unittest.IsolatedAsyncioTestCase):
             "id": 2,
             "phone": "",
             "platform": "vk",
-            "platform_user_id": 90599236,
+            "platform_user_id": 900000003,
             "user_id": None,
         }
         self.assertIsNone(_resolve_platform_user_id(appt_vk_master, "vk"))
@@ -1041,7 +1059,7 @@ class TestBookingBot(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(vk_user_after["phone"], "+79998889900")
             self.assertNotEqual(tg_user_after["id"], vk_user_after["id"])
 
-    def test_retention_reminders_include_completed(self):
+    def test_retention_reminders_only_completed(self):
         from services.appointments import (
             create_or_update_appointment,
             complete_appointment,
@@ -1087,12 +1105,23 @@ class TestBookingBot(unittest.IsolatedAsyncioTestCase):
             platform_user_id=1003,
         )
 
+        # 4. Past appointment that stayed 'confirmed' (no-show) -> should NOT be included
+        appt_no_show_id = create_or_update_appointment(
+            phone="+79991110004",
+            appointment_time=time_18d_ago,
+            services="Стрижка",
+            total_price=2300,
+            platform="telegram",
+            platform_user_id=1004,
+        )
+
         with patch("core_bot.services.appointments.get_current_saratov_time", return_value=mock_now):
             due = get_due_retention_reminders(platform="telegram")
             due_ids = [d["id"] for d in due]
             self.assertIn(appt_completed_id, due_ids)
             self.assertNotIn(appt_cancelled_id, due_ids)
             self.assertNotIn(appt_future_id, due_ids)
+            self.assertNotIn(appt_no_show_id, due_ids)
 
     def test_sqlite_search_clients(self):
         from services.referrals import save_user, search_clients
@@ -1138,29 +1167,43 @@ class TestBookingBot(unittest.IsolatedAsyncioTestCase):
         from unittest.mock import patch
         import core_bot.database.connection as conn_mod
 
-        with patch.object(conn_mod, "IS_POSTGRES", True), \
-             patch.object(conn_mod, "ALLOW_SQLITE_FALLBACK", False), \
-             patch.object(conn_mod, "get_pg_pool", return_value=None), \
-             patch("psycopg.connect", side_effect=Exception("Connection refused")):
-            with self.assertRaises(RuntimeError) as ctx:
-                with conn_mod.get_connection():
-                    pass
-            self.assertIn("SQLite fallback disabled", str(ctx.exception))
+        prev_unreachable = conn_mod._pg_unreachable
+        prev_check = conn_mod._last_pg_check
+        try:
+            with patch.object(conn_mod, "IS_POSTGRES", True), \
+                 patch.object(conn_mod, "ALLOW_SQLITE_FALLBACK", False), \
+                 patch.object(conn_mod, "get_pg_pool", return_value=None), \
+                 patch("psycopg.connect", side_effect=Exception("Connection refused")):
+                # First failure marks PG unreachable and must raise.
+                with self.assertRaises(RuntimeError) as ctx:
+                    with conn_mod.get_connection():
+                        pass
+                self.assertIn("SQLite fallback disabled", str(ctx.exception))
+
+                # A subsequent call must also fail closed instead of silently
+                # returning a SQLite connection.
+                with self.assertRaises(RuntimeError) as ctx2:
+                    with conn_mod.get_connection():
+                        pass
+                self.assertIn("SQLite fallback disabled", str(ctx2.exception))
+        finally:
+            conn_mod._pg_unreachable = prev_unreachable
+            conn_mod._last_pg_check = prev_check
 
     def test_suggested_master_phone(self):
         from services.masters_sync import get_suggested_master_phone, DEFAULT_MASTER_PHONE
         # Default fallback
-        self.assertEqual(get_suggested_master_phone(), "+79173225155")
+        self.assertEqual(get_suggested_master_phone(), TEST_MASTER_PHONE)
 
         # After saving a session in masters_session
         with get_connection() as conn:
             conn.execute(
                 "INSERT INTO masters_session (master_phone, cookie_phpsessid, is_active) VALUES (%s, %s, %s)",
-                ("+79173225155", "test_phpsessid", 1),
+                (TEST_MASTER_PHONE, "test_phpsessid", 1),
             )
             conn.commit()
 
-        self.assertEqual(get_suggested_master_phone(), "+79173225155")
+        self.assertEqual(get_suggested_master_phone(), TEST_MASTER_PHONE)
 
     async def test_admin_masters_flow(self):
         from handlers.referrals import (
@@ -1185,11 +1228,11 @@ class TestBookingBot(unittest.IsolatedAsyncioTestCase):
         await admin_masters_status(cb)
         cb.message.edit_text.assert_called_once()
         text_arg = cb.message.edit_text.call_args[0][0]
-        self.assertIn("+79173225155", text_arg)
+        self.assertIn(TEST_MASTER_PHONE, text_arg)
         kb_arg = cb.message.edit_text.call_args[1]["reply_markup"]
         btn_texts = [btn.text for row in kb_arg.inline_keyboard for btn in row]
         self.assertTrue(any("Ввести другой номер" in t for t in btn_texts))
-        self.assertTrue(any("+79173225155" in t for t in btn_texts))
+        self.assertTrue(any(TEST_MASTER_PHONE in t for t in btn_texts))
 
         # 2. Click "Ввести другой номер"
         cb_enter = MagicMock()
@@ -1204,17 +1247,17 @@ class TestBookingBot(unittest.IsolatedAsyncioTestCase):
         # 3. Type valid phone in chat
         msg = MagicMock()
         msg.from_user.id = admin_id
-        msg.text = "+7 917 322 51 55"
+        msg.text = "+7 999 000 00 00"
         msg.answer = AsyncMock()
 
         with patch("handlers.referrals.request_master_login") as mock_req:
             mock_req.return_value = (
                 True,
                 "OK",
-                {"phone": "+79173225155", "phone_formatted": "(917) 322-51-55", "csrf": "c1", "cookies": {}},
+                {"phone": TEST_MASTER_PHONE, "phone_formatted": TEST_MASTER_PHONE_FORMATTED, "csrf": "c1", "cookies": {}},
             )
             await handle_admin_text_inputs(msg)
-            mock_req.assert_called_once_with("+7 917 322 51 55")
+            mock_req.assert_called_once_with("+7 999 000 00 00")
 
         self.assertFalse(pending_master_logins[admin_id].get("awaiting_phone"))
         self.assertEqual(msg.answer.call_count, 2)
