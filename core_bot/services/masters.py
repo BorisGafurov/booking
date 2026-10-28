@@ -61,6 +61,22 @@ _last_services_fetch_time = 0.0
 _cached_masters_services: list[dict[str, Any]] | None = None
 
 
+def map_service_name_to_keys(services: str | None) -> list[str]:
+    """
+    Maps a human-readable service name (e.g. from the admin panel) to Masters
+    service keys usable with initiate_booking().
+    Examples: "Стрижка (МУЖСКАЯ)" -> ["hair"], "Стрижка + Борода" -> ["hair", "beard"].
+    Returns an empty list if no known service is recognized.
+    """
+    text = (services or "").lower()
+    keys: list[str] = []
+    if "стрижк" in text:
+        keys.append("hair")
+    if "бород" in text:
+        keys.append("beard")
+    return keys
+
+
 def get_service_options_for_creation() -> list[dict[str, Any]]:
     """
     Returns actual services from Masters for appointment creation.

@@ -4,8 +4,11 @@ from core_bot.services.appointments import (
     cancel_appointment,
     complete_appointment,
     confirm_appointment_by_client,
+    confirm_manual_appointment_masters_sms,
     create_manual_appointment,
     create_or_update_appointment,
+    pending_manual_bookings,
+    set_appointment_masters_id,
     get_appointment,
     get_appointments_counts,
     get_current_saratov_time,
@@ -32,6 +35,7 @@ from core_bot.services.masters import (
     get_schedule,
     get_service_options_for_creation,
     initiate_booking,
+    map_service_name_to_keys,
 )
 from core_bot.services.masters_sync import (
     cancel_masters_appointment,
@@ -100,6 +104,9 @@ __all__ = [
     "get_appointments_counts",
     "get_master_appointments",
     "create_manual_appointment",
+    "confirm_manual_appointment_masters_sms",
+    "pending_manual_bookings",
+    "set_appointment_masters_id",
     "get_master_day_schedule",
     "get_day_time_slots_status",
     "set_master_day_schedule",
@@ -117,6 +124,7 @@ __all__ = [
     "get_schedule",
     "initiate_booking",
     "confirm_sms_code",
+    "map_service_name_to_keys",
     # Masters Sync
     "sync_masters_appointments",
     "confirm_masters_appointment",

@@ -8,8 +8,11 @@ def get_main_menu(is_admin: bool = False) -> ReplyKeyboardMarkup:
             KeyboardButton(text="📍 Как добраться"),
         ],
         [
-            KeyboardButton(text="🧴 Советы и товары"),
+            KeyboardButton(text="📋 Мои записи"),
             KeyboardButton(text="🎁 Пригласить друга"),
+        ],
+        [
+            KeyboardButton(text="🧴 Советы и товары"),
         ],
     ]
 

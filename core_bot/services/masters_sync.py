@@ -629,14 +629,17 @@ def create_masters_appointment(
 
 def sync_schedule_from_masters_link() -> tuple[bool, int, str]:
     """
-    Fetches the live public schedule from mst.link/boris_gafurov/price,
-    detects booked appointment slots (gaps between available slots),
-    and synchronizes them into the appointments table.
+    Validates guessed placeholder appointments (masters_id like 'mst_YYYY-MM-DD_HHMM')
+    against the live public schedule from mst.link and removes stale ones.
+
+    It intentionally does NOT create new appointments from "gaps" between available
+    slots: gap analysis cannot know the real client, service or exact start time and
+    previously produced wrong times (e.g. 14:00 instead of 15:00) and phantom busy
+    slots. Real appointments arrive here only from bot bookings or from the
+    authenticated web sync in sync_masters_appointments().
     """
     try:
         from core_bot.services.masters import get_schedule
-        # Use 'beard' (60 min) because it exposes exact 60-min slot boundaries
-        # without artificially blocking 60-min preceding slots as 75-min hair does.
         days = get_schedule(["beard"])
     except Exception as e:
         logger.error("Failed to get schedule from Masters: %s", e)
@@ -645,151 +648,16 @@ def sync_schedule_from_masters_link() -> tuple[bool, int, str]:
     if not days:
         return False, 0, "Не удалось получить расписание из Masters (mst.link)"
 
-    synced_count = 0
+    removed_count = 0
     now = datetime.datetime.now(SARATOV_TZ)
     today_key = now.strftime("%Y-%m-%d")
-
-    all_standard_slots = [
-        "08:00", "08:30", "09:00", "09:30",
-        "10:00", "10:30", "11:00", "11:30", "12:00", "12:30", "13:00", "13:30",
-        "14:00", "14:30", "15:00", "15:30", "16:00", "16:30", "17:00", "17:30",
-        "18:00", "18:30", "19:00", "19:30", "20:00", "20:30", "21:00", "21:30"
-    ]
-
-    def _add_minutes_to_time(t_str: str, minutes: int) -> str:
-        try:
-            dt = datetime.datetime.strptime(t_str, "%H:%M") + datetime.timedelta(minutes=minutes)
-            return dt.strftime("%H:%M")
-        except Exception:
-            return t_str
 
     for day_key, day_data in days.items():
         if day_key < today_key:
             continue
 
-        avail_slots = [s["time"] for s in day_data.get("slots", [])]
-        avail_set = set(avail_slots)
+        avail_set = set(s["time"] for s in day_data.get("slots", []))
 
-        # Detect busy slots (grouped contiguous 30-min intervals)
-        cur: list[str] = []
-        appts: list[list[str]] = []
-        for s in all_standard_slots:
-            if s not in avail_set:
-                cur.append(s)
-            else:
-                if cur:
-                    appts.append(cur)
-                    cur = []
-        if cur:
-            appts.append(cur)
-
-        # For each busy group, derive exact appointment start time and duration
-        derived_times: list[str] = []
-        for group in appts:
-            first_missing = group[0]
-            last_missing = group[-1]
-
-            idx_first = all_standard_slots.index(first_missing)
-            prev_slot = all_standard_slots[idx_first - 1] if idx_first > 0 else None
-
-            idx_last = all_standard_slots.index(last_missing)
-            next_slot = all_standard_slots[idx_last + 1] if idx_last < len(all_standard_slots) - 1 else None
-
-            if prev_slot:
-                # Preceded by an available 60-min slot: master is busy starting exactly after it
-                start_time = _add_minutes_to_time(prev_slot, 60)
-                if next_slot:
-                    try:
-                        d_start = datetime.datetime.strptime(start_time, "%H:%M")
-                        d_next = datetime.datetime.strptime(next_slot, "%H:%M")
-                        duration_min = int((d_next - d_start).total_seconds() / 60)
-                    except Exception:
-                        duration_min = 90
-                else:
-                    duration_min = 90
-            else:
-                # Gap at start of day (no previous available slot)
-                if next_slot == "10:30" or (first_missing == "10:00" and len(group) == 1):
-                    # Master has early appointment finishing at 10:30 (e.g. 08:30 - 10:30, Haircut + Beard)
-                    start_time = "08:30"
-                    duration_min = 120
-                else:
-                    start_time = "10:00"
-                    if next_slot:
-                        try:
-                            d_start = datetime.datetime.strptime(start_time, "%H:%M")
-                            d_next = datetime.datetime.strptime(next_slot, "%H:%M")
-                            duration_min = int((d_next - d_start).total_seconds() / 60)
-                        except Exception:
-                            duration_min = 90
-                    else:
-                        duration_min = 90
-
-            derived_times.append(start_time)
-            dt_str = f"{day_key} {start_time}:00"
-            try:
-                dt = datetime.datetime.fromisoformat(dt_str).replace(tzinfo=SARATOV_TZ)
-            except Exception:
-                continue
-
-            masters_id = f"mst_{day_key}_{start_time.replace(':', '')}"
-
-            # Check if appointment already exists around this time (+/- 45 min)
-            with get_connection() as conn:
-                dt_from = dt - datetime.timedelta(minutes=45)
-                dt_to = dt + datetime.timedelta(minutes=45)
-                p_from = dt_from if conn.is_pg else dt_from.strftime("%Y-%m-%d %H:%M:%S")
-                p_to = dt_to if conn.is_pg else dt_to.strftime("%Y-%m-%d %H:%M:%S")
-
-                existing = conn.execute(
-                    """
-                    SELECT id, client_name, phone, status, platform, masters_id
-                    FROM appointments
-                    WHERE (masters_id = %s OR (appointment_time >= %s AND appointment_time <= %s))
-                      AND (status IS NULL OR status != 'cancelled')
-                    LIMIT 1
-                    """,
-                    (masters_id, p_from, p_to),
-                ).fetchone()
-
-                if not existing:
-                    # Determine service name and price based on duration
-                    if duration_min <= 60:
-                        svc_name = "Оформление бороды"
-                        price = 700
-                    elif duration_min >= 110:
-                        svc_name = "Стрижка + Борода"
-                        price = 3000
-                    else:
-                        svc_name = "Стрижка (МУЖСКАЯ)"
-                        price = 2300
-
-                    create_or_update_appointment(
-                        phone="",
-                        appointment_time=dt,
-                        services=svc_name,
-                        total_price=price,
-                        client_name="Клиент (Masters)",
-                        platform="masters",
-                        masters_id=masters_id,
-                    )
-                    # Mark confirmed
-                    val_true = True if conn.is_pg else 1
-                    conn.execute(
-                        "UPDATE appointments SET client_confirmed = %s WHERE masters_id = %s",
-                        (val_true, masters_id),
-                    )
-                    conn.commit()
-                    synced_count += 1
-                elif not existing["masters_id"]:
-                    # Update masters_id if was booked via bot
-                    conn.execute(
-                        "UPDATE appointments SET masters_id = %s WHERE id = %s",
-                        (masters_id, existing["id"]),
-                    )
-                    conn.commit()
-
-        # Check for cancelled masters appointments (slot became available on mst.link or old shifted slot)
         with get_connection() as conn:
             d_start = f"{day_key} 00:00:00"
             d_end = f"{day_key} 23:59:59"
@@ -801,6 +669,7 @@ def sync_schedule_from_masters_link() -> tuple[bool, int, str]:
                 SELECT id, masters_id, appointment_time, client_name, phone
                 FROM appointments
                 WHERE platform = 'masters'
+                  AND (masters_id LIKE 'mst_%' OR masters_id IS NULL)
                   AND (status IS NULL OR status != 'cancelled')
                   AND appointment_time >= %s AND appointment_time <= %s
                 """,
@@ -809,27 +678,35 @@ def sync_schedule_from_masters_link() -> tuple[bool, int, str]:
 
             for ma in m_appts:
                 ma_id = ma["masters_id"]
-                if ma_id and ma_id.startswith("mst_"):
-                    appt_dt = ma["appointment_time"]
-                    if isinstance(appt_dt, str):
-                        appt_t = appt_dt[11:16]
-                    else:
-                        appt_t = appt_dt.strftime("%H:%M")
+                appt_dt = ma["appointment_time"]
+                if isinstance(appt_dt, str):
+                    appt_t = appt_dt[11:16]
+                else:
+                    appt_t = appt_dt.strftime("%H:%M")
 
-                    # If slot is now free on mst.link, or old placeholder 10:00 was replaced by 08:30:
-                    is_obsolete = (appt_t in avail_set) or (appt_t == "10:00" and "08:30" in derived_times)
-                    if is_obsolete:
-                        is_unmodified_placeholder = (
-                            ma["client_name"] in ("Клиент", "Клиент (Masters)", None)
-                            and not ma["phone"]
-                        )
-                        if is_unmodified_placeholder:
-                            conn.execute("DELETE FROM appointments WHERE id = %s", (ma["id"],))
-                        else:
-                            conn.execute("UPDATE appointments SET status = 'cancelled' WHERE id = %s", (ma["id"],))
-                        conn.commit()
+                # A guessed placeholder becomes stale when its slot is free again on
+                # mst.link (or when it was guessed for the middle of a gap).
+                is_stale_placeholder = (
+                    ma_id and ma_id.startswith("mst_") and appt_t in avail_set
+                )
+                if not is_stale_placeholder:
+                    continue
 
-    return True, synced_count, f"Синхронизировано записей: {synced_count}"
+                is_unmodified_placeholder = (
+                    ma["client_name"] in ("Клиент", "Клиент (Masters)", None)
+                    and not ma["phone"]
+                )
+                if is_unmodified_placeholder:
+                    conn.execute("DELETE FROM appointments WHERE id = %s", (ma["id"],))
+                else:
+                    conn.execute(
+                        "UPDATE appointments SET status = 'cancelled' WHERE id = %s",
+                        (ma["id"],),
+                    )
+                conn.commit()
+                removed_count += 1
+
+    return True, removed_count, f"Очищено устаревших заглушек: {removed_count}"
 
 
 def sync_masters_appointments() -> tuple[bool, int, str]:

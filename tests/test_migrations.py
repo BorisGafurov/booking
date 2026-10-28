@@ -122,5 +122,39 @@ def rollback(conn):
         self.assertIn("005_client_notes", applied_set)
 
 
+    def test_migration_006_removes_guessed_placeholders(self):
+        """Migration 006 deletes guessed Masters placeholders but keeps real appointments."""
+        run_migrations(self.conn)
+
+        self.conn.execute(
+            """
+            INSERT INTO appointments
+                (platform, platform_user_id, client_name, phone, services,
+                 total_price, appointment_time, status, masters_id)
+            VALUES
+                ('masters', 0, 'Клиент (Masters)', '', 'Стрижка (МУЖСКАЯ)', 0,
+                 '2026-10-27 14:00:00', 'confirmed', 'mst_2026-10-27_1400'),
+                ('masters', 0, 'Клиент (Masters)', '', 'Стрижка (МУЖСКАЯ)', 0,
+                 '2026-10-27 10:00:00', 'confirmed', 'mst_2026-10-27_1000'),
+                ('telegram', 123456, 'Реальный Клиент', '+79998887766', 'Стрижка', 2300,
+                 '2026-10-30 15:00:00', 'confirmed', 'mst_real_record_1')
+            """
+        )
+        self.conn.commit()
+
+        import importlib
+
+        mod = importlib.import_module(
+            "core_bot.database.migrations.versions.006_remove_guessed_placeholders"
+        )
+        mod.apply(self.conn)
+
+        rows = self.conn.execute(
+            "SELECT masters_id FROM appointments ORDER BY id"
+        ).fetchall()
+        remaining = [r["masters_id"] for r in rows]
+        self.assertEqual(remaining, ["mst_real_record_1"])
+
+
 if __name__ == "__main__":
     unittest.main()

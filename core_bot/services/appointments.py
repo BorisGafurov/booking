@@ -333,14 +333,34 @@ def get_appointment(appointment_id: int) -> dict | None:
 
 
 def get_user_upcoming_appointments(platform: str, platform_user_id: int) -> list[dict]:
+    now = get_current_saratov_time()
+    col = {"telegram": "telegram_id", "vk": "vk_id", "max": "max_user_id"}.get(platform)
     with get_connection() as conn:
+        params: list[Any] = []
+        if conn.is_pg:
+            params.append(now)
+        else:
+            params.append(now.strftime("%Y-%m-%d %H:%M:%S"))
+        params.extend([platform, platform_user_id])
+
+        ownership = "platform = %s AND platform_user_id = %s"
+        if col:
+            ownership += (
+                " OR (user_id IS NOT NULL AND user_id = ("
+                f"SELECT id FROM users WHERE {col} = %s LIMIT 1"
+                "))"
+            )
+            params.append(platform_user_id)
+
         rows = conn.execute(
-            """
+            f"""
             SELECT * FROM appointments
-            WHERE platform = %s AND platform_user_id = %s AND status = 'confirmed'
+            WHERE status = 'confirmed'
+              AND appointment_time >= %s
+              AND ({ownership})
             ORDER BY appointment_time ASC
             """,
-            (platform, platform_user_id),
+            tuple(params),
         ).fetchall()
         return [dict(r) for r in rows]
 
@@ -665,6 +685,48 @@ def get_master_appointments(
         return [dict(r) for r in rows], total
 
 
+def set_appointment_masters_id(appointment_id: int, masters_id: str) -> bool:
+    """Stores the Masters CRM record id for a locally created appointment."""
+    try:
+        with get_connection() as conn:
+            conn.execute(
+                "UPDATE appointments SET masters_id = %s, updated_at = CURRENT_TIMESTAMP WHERE id = %s",
+                (str(masters_id)[:64], appointment_id),
+            )
+            conn.commit()
+        return True
+    except Exception as e:
+        logger.warning("Failed to set masters_id for appointment %s: %s", appointment_id, e)
+        return False
+
+
+# Admin-created appointments awaiting the client's SMS code to finish the
+# booking in Masters (the client is new to Masters): appt_id -> session_data.
+pending_manual_bookings: dict[int, dict] = {}
+
+
+def confirm_manual_appointment_masters_sms(appointment_id: int, sms_code: str) -> tuple[bool, str]:
+    """
+    Completes a pending manual booking in Masters CRM using the 4-digit SMS code
+    the client received. Saves the resulting Masters record id.
+    """
+    session_data = pending_manual_bookings.get(appointment_id)
+    if not session_data:
+        return False, "Нет записи, ожидающей подтверждения по СМС."
+
+    from core_bot.services.masters import confirm_sms_code
+
+    ok, msg = confirm_sms_code(session_data, sms_code)
+    if not ok:
+        return False, msg
+
+    masters_id = session_data.get("appointment_id")
+    if masters_id:
+        set_appointment_masters_id(appointment_id, str(masters_id))
+    pending_manual_bookings.pop(appointment_id, None)
+    return True, "✅ Запись добавлена в Masters CRM."
+
+
 def create_manual_appointment(
     phone: str,
     appointment_time: datetime.datetime,
@@ -672,10 +734,20 @@ def create_manual_appointment(
     total_price: int,
     client_name: str | None = None,
     platform: str = "telegram",
+    sync_to_masters: bool = True,
 ) -> tuple[bool, str, int | None]:
     """
     Creates an appointment directly by master, with support for any custom time/price.
-    Syncs to Masters CRM if session active.
+
+    Syncs the record into Masters CRM via the same public booking flow
+    (mst.link) that clients use — this is the only mechanism proven to create
+    real records in Masters. For clients already known to Masters the booking
+    completes instantly; for new clients Masters sends an SMS code to the
+    client's phone and the appointment is kept in pending_manual_bookings
+    until confirm_manual_appointment_masters_sms() is called.
+
+    Returns (success, message, appointment_id). The message always reflects
+    the actual Masters sync state.
     """
     if appointment_time.tzinfo is None:
         appointment_time = appointment_time.replace(tzinfo=SARATOV_TZ)
@@ -691,20 +763,61 @@ def create_manual_appointment(
         platform=platform,
     )
 
-    # Sync to Masters CRM
+    if not sync_to_masters:
+        return True, "Запись успешно создана!", appt_id
+
+    # 1) Primary: the public mst.link booking flow (works without CRM session).
+    try:
+        from core_bot.services.masters import initiate_booking, map_service_name_to_keys
+
+        keys = map_service_name_to_keys(services)
+        if keys:
+            ts = int(appointment_time.timestamp())
+            ok_b, msg_b, session_data = initiate_booking(
+                phone, keys, ts, client_name=client_name or ""
+            )
+            if ok_b and session_data:
+                if not session_data.get("needs_sms"):
+                    masters_id = session_data.get("appointment_id")
+                    if masters_id:
+                        set_appointment_masters_id(appt_id, str(masters_id))
+                    return True, "✅ Запись успешно создана и синхронизирована с Masters CRM!", appt_id
+
+                # New client in Masters: an SMS code was sent to the client.
+                pending_manual_bookings[appt_id] = session_data
+                return (
+                    True,
+                    "🎉 Запись создана в боте.\n\n"
+                    "🔑 Клиент новый в Masters — сервис отправил ему код подтверждения по СМС. "
+                    "Перешлите боту этот 4-значный код, чтобы запись появилась и в Masters CRM.",
+                    appt_id,
+                )
+            logger.info("Public Masters booking failed for manual appt %s: %s", appt_id, msg_b)
+    except Exception as e:
+        logger.warning("Public Masters booking error for manual appt %s: %s", appt_id, e)
+
+    # 2) Fallback: authenticated CRM session endpoints (best effort).
     try:
         from core_bot.services.masters_sync import create_masters_appointment
-        create_masters_appointment(
+        ok_c, _msg_c, masters_id = create_masters_appointment(
             client_name=client_name or "Клиент",
             phone=phone,
             services=services,
             appointment_time=appointment_time,
             price=total_price,
         )
+        if ok_c and masters_id:
+            set_appointment_masters_id(appt_id, str(masters_id))
+            return True, "✅ Запись успешно создана и синхронизирована с Masters CRM!", appt_id
     except Exception as e:
-        logger.debug("Masters create sync notice: %s", e)
+        logger.debug("Masters CRM session create failed for appt %s: %s", appt_id, e)
 
-    return True, "Запись успешно создана!", appt_id
+    return (
+        True,
+        "⚠️ Запись создана в боте, но добавить её в Masters CRM не удалось. "
+        "Проверьте, что слот/услуга доступны для онлайн-записи, либо добавьте запись в Masters вручную.",
+        appt_id,
+    )
 
 
 def get_master_day_schedule(day_key: str) -> dict:

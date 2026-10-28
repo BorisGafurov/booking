@@ -10,6 +10,7 @@ from config import ADMIN_IDS, BOT_TOKEN
 from database import init_db
 from handlers.advice import router as advice_router
 from handlers.booking import router as booking_router
+from handlers.my_appointments import router as my_appointments_router
 from handlers.navigation import router as navigation_router
 from handlers.referrals import router as referrals_router
 from handlers.start import router as start_router
@@ -47,6 +48,7 @@ async def main():
     dp.include_router(start_router)
     dp.include_router(referrals_router)
     dp.include_router(booking_router)
+    dp.include_router(my_appointments_router)
     dp.include_router(navigation_router)
     dp.include_router(advice_router)
     dp.include_router(fallback_router)
