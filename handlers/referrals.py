@@ -11,6 +11,7 @@ from aiogram.filters import Command
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 from config import ADMIN_IDS, REFERRAL_REWARD_TEXT
+from handlers.ui import edit_or_send as _edit_or_send
 from services.appointments import (
     SARATOV_TZ,
     adjust_master_day_hours,
@@ -371,7 +372,7 @@ async def admin_menu(callback: CallbackQuery):
 
     try:
         if callback.message:
-            await callback.message.edit_text(
+            await _edit_or_send(callback.message, 
                 "⚙️ <b>Панель мастера и администратора:</b>",
                 reply_markup=admin_menu_keyboard(),
             )
@@ -409,7 +410,7 @@ async def admin_appts_list(callback: CallbackQuery):
 
     try:
         if callback.message:
-            await callback.message.edit_text(
+            await _edit_or_send(callback.message, 
                 text,
                 reply_markup=admin_appts_keyboard(appts, current_filter, offset, total, counts),
             )
@@ -471,7 +472,7 @@ async def admin_appt_detail(callback: CallbackQuery):
 
     try:
         if callback.message:
-            await callback.message.edit_text(
+            await _edit_or_send(callback.message, 
                 card_text,
                 reply_markup=admin_appt_card_keyboard(appt, current_filter, offset),
             )
@@ -589,7 +590,7 @@ async def admin_resched_start(callback: CallbackQuery):
     ])
 
     if callback.message:
-        await callback.message.edit_text(
+        await _edit_or_send(callback.message, 
             f"🗓 <b>Перенос записи #{appt_id}</b>\n\nВыберите новую дату:",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
         )
@@ -628,7 +629,7 @@ async def admin_resched_day_chosen(callback: CallbackQuery):
     ])
 
     if callback.message:
-        await callback.message.edit_text(
+        await _edit_or_send(callback.message, 
             f"🗓 <b>Перенос записи #{appt_id} на {day_key}</b>\n\nВыберите время или введите любое своё:",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
         )
@@ -695,7 +696,7 @@ async def admin_resched_custom_start(callback: CallbackQuery):
     }
 
     if callback.message:
-        await callback.message.edit_text(
+        await _edit_or_send(callback.message, 
             f"✏️ <b>Введите желаемое время на {day_key}</b>\n\n"
             "Напишите время в ответном сообщении (например <code>08:30</code> или <code>21:15</code>):",
             reply_markup=InlineKeyboardMarkup(
@@ -730,7 +731,7 @@ async def admin_create_start(callback: CallbackQuery):
     rows.append([InlineKeyboardButton(text="⬅️ Отмена", callback_data="admin:menu")])
 
     if callback.message:
-        await callback.message.edit_text(
+        await _edit_or_send(callback.message, 
             "➕ <b>Создание новой записи мастером</b>\n\n"
             "<b>Шаг 1 из 4:</b> Выберите услугу из Masters или введите другое название:",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
@@ -752,7 +753,7 @@ async def admin_create_service_chosen(callback: CallbackQuery):
     if svc_code == "custom":
         draft["step"] = "awaiting_custom_service"
         if callback.message:
-            await callback.message.edit_text(
+            await _edit_or_send(callback.message, 
                 "✏️ <b>Введите название услуги</b> в чат (например: <code>Моделирование бороды VIP</code>):",
                 reply_markup=InlineKeyboardMarkup(
                     inline_keyboard=[[InlineKeyboardButton(text="⬅️ Отмена", callback_data="admin:create:start")]]
@@ -808,7 +809,7 @@ async def show_create_day_picker(callback: CallbackQuery):
     rows.append([InlineKeyboardButton(text="⬅️ Назад к услугам", callback_data="admin:create:start")])
     rows.append([InlineKeyboardButton(text="❌ Отмена", callback_data="admin:menu")])
     if callback.message:
-        await callback.message.edit_text(
+        await _edit_or_send(callback.message, 
             "➕ <b>Шаг 2 из 4:</b> Выберите дату записи:",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
             parse_mode="HTML",
@@ -884,7 +885,7 @@ async def admin_create_day_chosen(callback: CallbackQuery):
     rows.append([InlineKeyboardButton(text="❌ Отмена", callback_data="admin:menu")])
 
     if callback.message:
-        await callback.message.edit_text(
+        await _edit_or_send(callback.message, 
             text,
             reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
             parse_mode="HTML",
@@ -918,7 +919,7 @@ async def admin_create_busy_clicked(callback: CallbackQuery):
         ]
     )
     if callback.message:
-        await callback.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+        await _edit_or_send(callback.message, text, reply_markup=kb, parse_mode="HTML")
     await callback.answer()
 
 
@@ -933,7 +934,7 @@ async def admin_create_time_chosen(callback: CallbackQuery):
     if time_val == "custom":
         draft["step"] = "awaiting_custom_time"
         if callback.message:
-            await callback.message.edit_text(
+            await _edit_or_send(callback.message, 
                 f"✏️ <b>Введите любое время записи</b> на {draft.get('day_key')}\n\n"
                 "Напишите в ответном сообщении (например <code>08:30</code> или <code>22:15</code>):",
                 reply_markup=InlineKeyboardMarkup(
@@ -951,7 +952,7 @@ async def admin_create_time_chosen(callback: CallbackQuery):
     day_key = draft.get("day_key", "")
 
     if callback.message:
-        await callback.message.edit_text(
+        await _edit_or_send(callback.message, 
             f"➕ <b>Шаг 4 из 4: Данные клиента и цена</b>\n\n"
             f"✂️ Услуга: <b>{curr_svc}</b>\n"
             f"⏰ Время: <b>{day_key} {time_val}</b>\n"
@@ -982,7 +983,7 @@ async def admin_sched_list(callback: CallbackQuery):
         "Выберите день, чтобы сделать его выходным/рабочим или изменить часы работы (прибавить/убавить начало и конец дня):"
     )
     if callback.message:
-        await callback.message.edit_text(
+        await _edit_or_send(callback.message, 
             text,
             reply_markup=admin_schedule_keyboard(slice_days, offset, len(all_days)),
         )
@@ -1007,7 +1008,7 @@ async def admin_sched_day_detail(callback: CallbackQuery):
     )
 
     if callback.message:
-        await callback.message.edit_text(
+        await _edit_or_send(callback.message, 
             card_text,
             reply_markup=admin_sched_day_keyboard(sched),
         )
@@ -1065,7 +1066,7 @@ async def admin_pending(callback: CallbackQuery):
     count_info = f" ({total} всего)" if total > 0 else ""
     try:
         if callback.message:
-            await callback.message.edit_text(
+            await _edit_or_send(callback.message, 
                 f"⏳ <b>Ожидают подтверждения визита{count_info}:</b>\n"
                 "<i>(нажми на нужного клиента, чтобы подтвердить его визит и начислить бонус другу)</i>",
                 reply_markup=pending_referrals_keyboard(referrals_list, offset, total),
@@ -1089,7 +1090,7 @@ async def admin_rewards(callback: CallbackQuery):
     count_info = f" ({total} всего)" if total > 0 else ""
     try:
         if callback.message:
-            await callback.message.edit_text(
+            await _edit_or_send(callback.message, 
                 f"💰 <b>Активные бонусы клиентов{count_info}:</b>\n"
                 "<i>(нажми на бонус, чтобы списать его при оплате клиентом)</i>",
                 reply_markup=active_rewards_keyboard(rewards_list, offset, total),
@@ -1134,7 +1135,7 @@ async def confirm_visit(callback: CallbackQuery):
     safe_text = html.escape(text)
     try:
         if callback.message:
-            await callback.message.edit_text(
+            await _edit_or_send(callback.message, 
                 f"ℹ️ {safe_text}\n\n⏳ <b>Ожидают подтверждения:</b>",
                 reply_markup=pending_referrals_keyboard(referrals_list, offset, total),
             )
@@ -1176,7 +1177,7 @@ async def use_reward(callback: CallbackQuery):
     safe_text = html.escape(text)
     try:
         if callback.message:
-            await callback.message.edit_text(
+            await _edit_or_send(callback.message, 
                 f"ℹ️ {safe_text}\n\n💰 <b>Активные бонусы клиентов:</b>",
                 reply_markup=active_rewards_keyboard(rewards_list, offset, total),
             )
@@ -1233,7 +1234,7 @@ async def admin_masters_status(callback: CallbackQuery):
 
     try:
         if callback.message:
-            await callback.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+            await _edit_or_send(callback.message, text, reply_markup=kb, parse_mode="HTML")
     except TelegramBadRequest:
         pass
     await callback.answer()
@@ -1259,7 +1260,7 @@ async def admin_masters_enter_phone(callback: CallbackQuery):
     )
     try:
         if callback.message:
-            await callback.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+            await _edit_or_send(callback.message, text, reply_markup=kb, parse_mode="HTML")
     except TelegramBadRequest:
         pass
     await callback.answer()
@@ -1279,7 +1280,7 @@ async def admin_masters_request_code(callback: CallbackQuery):
         pending_master_logins[user_id] = {"awaiting_phone": True}
         try:
             if callback.message:
-                await callback.message.edit_text(
+                await _edit_or_send(callback.message, 
                     "📱 <b>Введите номер телефона мастера</b>\n\n"
                     "Напишите номер, зарегистрированный в сервисе Masters (например, <code>+79991234567</code>):",
                     reply_markup=InlineKeyboardMarkup(
@@ -1299,7 +1300,7 @@ async def admin_masters_request_code(callback: CallbackQuery):
         pending_master_logins[user_id] = {"awaiting_phone": True}
         try:
             if callback.message:
-                await callback.message.edit_text(
+                await _edit_or_send(callback.message, 
                     f"❌ <b>{msg}</b>\n\n"
                     f"Проверьте номер или напишите другой номер телефона мастера в ответном сообщении:\n"
                     f"<i>(например, <code>+79991234567</code>)</i>",
@@ -1318,7 +1319,7 @@ async def admin_masters_request_code(callback: CallbackQuery):
     pending_master_logins[user_id] = session_data
     try:
         if callback.message:
-            await callback.message.edit_text(
+            await _edit_or_send(callback.message, 
                 f"📩 <b>Код подтверждения отправлен</b>\n\n"
                 f"На номер <code>{session_data['phone_formatted']}</code> отправлено СМС от Masters.\n\n"
                 "👉 <b>Напишите 4 цифры из СМС в ответном сообщении:</b>",
@@ -1378,7 +1379,7 @@ async def admin_broadcast_start(callback: CallbackQuery):
         "После отправки бот покажет предпросмотр и попросит подтвердить рассылку перед отправкой."
     )
     if callback.message:
-        await callback.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+        await _edit_or_send(callback.message, text, reply_markup=kb, parse_mode="HTML")
     await callback.answer()
 
 
@@ -1409,7 +1410,7 @@ async def admin_broadcast_send(callback: CallbackQuery):
     total = len(recipients)
 
     if callback.message:
-        await callback.message.edit_text(f"⏳ <b>Отправка рассылки...</b>\n0 из {total}", parse_mode="HTML")
+        await _edit_or_send(callback.message, f"⏳ <b>Отправка рассылки...</b>\n0 из {total}", parse_mode="HTML")
     await callback.answer()
 
     client_kb = InlineKeyboardMarkup(
@@ -1447,7 +1448,7 @@ async def admin_broadcast_send(callback: CallbackQuery):
         ]
     )
     if callback.message:
-        await callback.message.edit_text(report, reply_markup=back_kb, parse_mode="HTML")
+        await _edit_or_send(callback.message, report, reply_markup=back_kb, parse_mode="HTML")
 
 
 @router.callback_query(F.data.startswith("admin:clients:"))
@@ -1474,7 +1475,7 @@ async def admin_clients_list(callback: CallbackQuery):
             inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад к базе", callback_data="admin:clients:0")]]
         )
         if callback.message:
-            await callback.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+            await _edit_or_send(callback.message, text, reply_markup=kb, parse_mode="HTML")
         await callback.answer()
         return
 
@@ -1488,7 +1489,7 @@ async def admin_clients_list(callback: CallbackQuery):
             inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад к базе", callback_data="admin:clients:0")]]
         )
         if callback.message:
-            await callback.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+            await _edit_or_send(callback.message, text, reply_markup=kb, parse_mode="HTML")
         await callback.answer()
         return
 
@@ -1525,7 +1526,7 @@ async def admin_clients_list(callback: CallbackQuery):
     ])
 
     if callback.message:
-        await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=rows), parse_mode="HTML")
+        await _edit_or_send(callback.message, text, reply_markup=InlineKeyboardMarkup(inline_keyboard=rows), parse_mode="HTML")
     await callback.answer()
 
 
@@ -1566,7 +1567,7 @@ async def admin_edit_client_start(callback: CallbackQuery):
         inline_keyboard=[[InlineKeyboardButton(text="⬅️ Отмена", callback_data=f"admin:appt:{appt_id}:{current_filter}:{offset}")]]
     )
     if callback.message:
-        await callback.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+        await _edit_or_send(callback.message, text, reply_markup=kb, parse_mode="HTML")
     await callback.answer()
 
 
@@ -1607,7 +1608,7 @@ async def admin_edit_price_start(callback: CallbackQuery):
     ]
 
     if callback.message:
-        await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=rows), parse_mode="HTML")
+        await _edit_or_send(callback.message, text, reply_markup=InlineKeyboardMarkup(inline_keyboard=rows), parse_mode="HTML")
     await callback.answer()
 
 
@@ -1663,7 +1664,7 @@ async def admin_set_custom_price_start(callback: CallbackQuery):
         inline_keyboard=[[InlineKeyboardButton(text="⬅️ Отмена", callback_data=f"admin:edit_price:{appt_id}:{current_filter}:{offset}")]]
     )
     if callback.message:
-        await callback.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+        await _edit_or_send(callback.message, text, reply_markup=kb, parse_mode="HTML")
     await callback.answer()
 
 

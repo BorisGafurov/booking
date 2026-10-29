@@ -726,6 +726,41 @@ class TestBookingBot(unittest.IsolatedAsyncioTestCase):
             conn.commit()
         self.assertTrue(row2_exists)
 
+    def test_admin_screen_fallback_on_old_message(self):
+        from aiogram.exceptions import TelegramBadRequest
+
+        from handlers.referrals import _edit_or_send
+
+        # 1) Editing a message older than 48h fails -> the screen is sent as a new message
+        msg = MagicMock()
+        msg.edit_text = AsyncMock(
+            side_effect=TelegramBadRequest(
+                method=MagicMock(), message="Bad Request: message can't be edited"
+            )
+        )
+        msg.answer = AsyncMock()
+        asyncio.run(_edit_or_send(msg, "📋 Экран"))
+        msg.answer.assert_awaited_once()
+
+        # 2) "message is not modified" -> no duplicate message is sent
+        msg2 = MagicMock()
+        msg2.edit_text = AsyncMock(
+            side_effect=TelegramBadRequest(
+                method=MagicMock(), message="Bad Request: message is not modified"
+            )
+        )
+        msg2.answer = AsyncMock()
+        asyncio.run(_edit_or_send(msg2, "⚙️ Меню"))
+        msg2.answer.assert_not_awaited()
+
+        # 3) Successful edit -> no new message
+        msg3 = MagicMock()
+        msg3.edit_text = AsyncMock()
+        msg3.answer = AsyncMock()
+        asyncio.run(_edit_or_send(msg3, "📋 Экран"))
+        msg3.edit_text.assert_awaited_once()
+        msg3.answer.assert_not_awaited()
+
     def test_master_reschedule_appointment(self):
         from services.appointments import create_manual_appointment, get_appointment, reschedule_appointment
 

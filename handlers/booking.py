@@ -8,6 +8,7 @@ from aiogram import F, Router
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from handlers.ui import edit_or_send as _edit_or_send
 
 from config import ADMIN_IDS, BOOKING_URL
 from services.appointments import (
@@ -110,7 +111,7 @@ async def toggle_service(callback: CallbackQuery):
 
     try:
         if callback.message:
-            await callback.message.edit_text(
+            await _edit_or_send(callback.message, 
                 _format_services_text(current),
                 reply_markup=get_services_keyboard(current),
                 parse_mode="HTML",
@@ -130,7 +131,7 @@ async def back_to_services(callback: CallbackQuery):
 
     try:
         if callback.message:
-            await callback.message.edit_text(
+            await _edit_or_send(callback.message, 
                 _format_services_text(current),
                 reply_markup=get_services_keyboard(current),
                 parse_mode="HTML",
@@ -151,7 +152,7 @@ async def choose_day(callback: CallbackQuery):
 
     if not schedule:
         if callback.message:
-            await callback.message.edit_text(
+            await _edit_or_send(callback.message, 
                 "⚠️ Не удалось загрузить расписание в реальном времени.\n\n"
                 "Вы можете выбрать удобное время напрямую на сайте Masters:",
                 reply_markup=get_booking_keyboard(),
@@ -162,7 +163,7 @@ async def choose_day(callback: CallbackQuery):
     calc = calculate_services(current_services)
     try:
         if callback.message:
-            await callback.message.edit_text(
+            await _edit_or_send(callback.message, 
                 f"📅 <b>Выберите удобный день записи:</b>\n\n"
                 f"Услуги: <b>{', '.join(calc['names'])}</b>\n"
                 f"Длительность: <b>{calc['duration_text']}</b>\n"
@@ -192,7 +193,7 @@ async def choose_time_slot(callback: CallbackQuery):
     title = day_data["title"] if day_data else day_key
     try:
         if callback.message:
-            await callback.message.edit_text(
+            await _edit_or_send(callback.message, 
                 f"🕒 <b>Свободные окна на {title}:</b>\n\n"
                 "Выберите удобное время начала стрижки:",
                 reply_markup=get_slots_keyboard(slots),
@@ -256,15 +257,12 @@ async def _finalize_successful_booking(
     )
 
     if isinstance(target_msg_or_cb, CallbackQuery):
-        try:
-            if target_msg_or_cb.message:
-                await target_msg_or_cb.message.edit_text(
-                    text,
-                    reply_markup=cancel_markup,
-                    parse_mode="HTML",
-                )
-        except TelegramBadRequest:
-            pass
+        await _edit_or_send(
+            target_msg_or_cb.message,
+            text,
+            reply_markup=cancel_markup,
+            parse_mode="HTML",
+        )
         await target_msg_or_cb.answer()
     else:
         await target_msg_or_cb.answer(
@@ -316,7 +314,7 @@ async def initiate_slot_booking(callback: CallbackQuery):
 
     try:
         if callback.message:
-            await callback.message.edit_text("⏳ Бронирую слот в Masters...")
+            await _edit_or_send(callback.message, "⏳ Бронирую слот в Masters...")
     except TelegramBadRequest:
         pass
 
@@ -329,7 +327,7 @@ async def initiate_slot_booking(callback: CallbackQuery):
     if not success or not session_data:
         try:
             if callback.message:
-                await callback.message.edit_text(
+                await _edit_or_send(callback.message, 
                     f"⚠️ {msg}\n\nВы можете завершить бронирование напрямую через сайт:",
                     reply_markup=get_booking_keyboard(),
                 )
@@ -347,7 +345,7 @@ async def initiate_slot_booking(callback: CallbackQuery):
 
     try:
         if callback.message:
-            await callback.message.edit_text(
+            await _edit_or_send(callback.message, 
                 f"📩 <b>Подтверждение записи</b>\n\n"
                 f"Вы выбрали: <b>{dt.strftime('%d.%m.%Y в %H:%M')}</b>\n"
                 f"На ваш номер <code>{phone}</code> отправлено СМС-сообщение с кодом от Masters.\n\n"
@@ -370,7 +368,7 @@ async def cancel_booking(callback: CallbackQuery):
 
     try:
         if callback.message:
-            await callback.message.edit_text("Запись отменена.")
+            await _edit_or_send(callback.message, "Запись отменена.")
     except TelegramBadRequest:
         pass
     await callback.answer("Запись отменена.")
@@ -514,7 +512,7 @@ async def handle_confirm_appointment(callback: CallbackQuery):
 
     try:
         if callback.message:
-            await callback.message.edit_text(
+            await _edit_or_send(callback.message, 
                 "✅ <b>Запись подтверждена!</b>\n\n"
                 f"Спасибо за подтверждение! Ждём вас <b>{dt_str}</b> ✂️\n"
                 "📍 <b>Адрес:</b> Саратов, ул. имени Е.И. Пугачёва, 110",
@@ -588,7 +586,7 @@ async def handle_cancel_appointment(callback: CallbackQuery):
 
     try:
         if callback.message:
-            await callback.message.edit_text(
+            await _edit_or_send(callback.message, 
                 "❌ <b>Запись успешно отменена</b>\n\n"
                 "Будем рады видеть вас в другой раз! Чтобы выбрать новую дату, нажмите «✂️ Записаться».\n\n"
                 "💡 Остальные ваши записи — в разделе «📋 Мои записи».",

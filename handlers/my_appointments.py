@@ -13,6 +13,7 @@ from aiogram.types import (
     InlineKeyboardMarkup,
     Message,
 )
+from handlers.ui import edit_or_send as _edit_or_send
 
 from config import SALON_ADDRESS
 from services.appointments import (
@@ -86,12 +87,7 @@ async def _show_my_appointments(target: Message | CallbackQuery, user_id: int):
         kb = _my_appts_keyboard(appts)
 
     if isinstance(target, CallbackQuery):
-        if target.message:
-            try:
-                await target.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
-            except TelegramBadRequest:
-                if target.message:
-                    await target.message.answer(text, reply_markup=kb, parse_mode="HTML")
+        await _edit_or_send(target.message, text, reply_markup=kb, parse_mode="HTML")
         await target.answer()
     else:
         await target.answer(text, reply_markup=kb, parse_mode="HTML")
@@ -117,7 +113,7 @@ async def start_reschedule(callback: CallbackQuery):
     schedule = await asyncio.to_thread(get_schedule, current_services)
     if not schedule:
         if callback.message:
-            await callback.message.edit_text(
+            await _edit_or_send(callback.message, 
                 "⚠️ Не удалось загрузить расписание. Попробуйте позже или отмените запись и запишитесь заново."
             )
         await callback.answer()
@@ -136,7 +132,7 @@ async def start_reschedule(callback: CallbackQuery):
 
     if callback.message:
         try:
-            await callback.message.edit_text(
+            await _edit_or_send(callback.message, 
                 "🗓 <b>Перенос записи</b>\n\nВыберите новый день:",
                 reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
                 parse_mode="HTML",
@@ -172,7 +168,7 @@ async def reschedule_day(callback: CallbackQuery):
 
     if callback.message:
         try:
-            await callback.message.edit_text(
+            await _edit_or_send(callback.message, 
                 f"🕒 <b>Свободные окна на {title}:</b>\n\nВыберите новое время:",
                 reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
                 parse_mode="HTML",
@@ -210,7 +206,7 @@ async def reschedule_slot(callback: CallbackQuery):
 
     if not ok:
         if callback.message:
-            await callback.message.edit_text(f"⚠️ {html.escape(msg)}")
+            await _edit_or_send(callback.message, f"⚠️ {html.escape(msg)}")
         await callback.answer()
         return
 
@@ -221,7 +217,7 @@ async def reschedule_slot(callback: CallbackQuery):
     )
     if callback.message:
         try:
-            await callback.message.edit_text(
+            await _edit_or_send(callback.message, 
                 text,
                 reply_markup=_my_appts_keyboard([appt]),
                 parse_mode="HTML",

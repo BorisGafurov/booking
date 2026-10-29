@@ -3,6 +3,7 @@ from aiogram import F, Router
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command
 from aiogram.types import CallbackQuery, Message
+from handlers.ui import edit_or_send as _edit_or_send
 
 from keyboards.advice import (
     get_article_detail_keyboard,
@@ -37,7 +38,7 @@ async def advice_menu(message: Message):
 async def callback_rec_hub(callback: CallbackQuery):
     try:
         if callback.message:
-            await callback.message.edit_text(
+            await _edit_or_send(callback.message, 
                 HUB_TEXT,
                 reply_markup=get_recommendations_hub_keyboard(),
             )
@@ -50,7 +51,7 @@ async def callback_rec_hub(callback: CallbackQuery):
 async def callback_rec_articles(callback: CallbackQuery):
     try:
         if callback.message:
-            await callback.message.edit_text(
+            await _edit_or_send(callback.message, 
                 "📖 <b>Инструкции по уходу и укладке:</b>\n\n"
                 "Выбери тему, чтобы прочитать руководство мастера 👇",
                 reply_markup=get_articles_keyboard(),
@@ -64,7 +65,7 @@ async def callback_rec_articles(callback: CallbackQuery):
 async def callback_rec_products(callback: CallbackQuery):
     try:
         if callback.message:
-            await callback.message.edit_text(
+            await _edit_or_send(callback.message, 
                 "🛍 <b>Проверенные средства на Ozon:</b>\n\n"
                 "Здесь собраны проверенные стайлинги и уход, которые мастер лично использует в работе. "
                 "Выбери категорию, чтобы посмотреть рекомендации и ссылки 👇",
@@ -88,7 +89,7 @@ async def callback_article_detail(callback: CallbackQuery):
 
     try:
         if callback.message:
-            await callback.message.edit_text(
+            await _edit_or_send(callback.message, 
                 text,
                 reply_markup=get_article_detail_keyboard(slug),
                 disable_web_page_preview=True,
@@ -112,7 +113,7 @@ async def callback_product_detail(callback: CallbackQuery):
 
     try:
         if callback.message:
-            await callback.message.edit_text(
+            await _edit_or_send(callback.message, 
                 text,
                 reply_markup=get_product_detail_keyboard(product["links"]),
                 disable_web_page_preview=True,
