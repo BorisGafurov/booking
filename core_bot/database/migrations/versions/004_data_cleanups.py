@@ -20,7 +20,7 @@ def apply(conn) -> None:
             UPDATE appointments
             SET phone = '', platform_user_id = 0
             WHERE phone IN ({placeholders})
-              AND (client_name LIKE '%Клиент%' OR platform = 'masters')
+              AND client_name LIKE '%Клиент%'
             """,
             tuple(phones),
         )

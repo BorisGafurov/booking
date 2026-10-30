@@ -42,6 +42,10 @@ def parse_to_saratov(val: Any) -> datetime.datetime:
     return get_current_saratov_time()
 
 
+class SlotUnavailableError(Exception):
+    """Raised when a requested time is outside the schedule or already taken."""
+
+
 def create_or_update_appointment(
     phone: str,
     appointment_time: datetime.datetime,
@@ -50,17 +54,39 @@ def create_or_update_appointment(
     client_name: str | None = None,
     platform: str = "telegram",
     platform_user_id: int = 0,
-    masters_id: str | None = None,
+    duration_min: int | None = None,
 ) -> int:
+    """
+    Creates a booking in the shared «Срез» database.
+
+    The same date is serialized with a PostgreSQL advisory lock so two clients
+    (or a client and the website) cannot take an overlapping slot at the same
+    time. Existing appointments that overlap the requested interval are
+    rejected with :class:`SlotUnavailableError`.
+    """
+    from core_bot.services.booking import (
+        find_overlapping_appointment,
+        service_duration_minutes,
+    )
+
     norm_phone = normalize_phone(phone) if phone else ""
-    if is_master_phone(norm_phone) and (platform == "masters" or not client_name or "Клиент" in client_name):
-        norm_phone = ""
     if appointment_time.tzinfo is None:
         appointment_time = appointment_time.replace(tzinfo=SARATOV_TZ)
     else:
         appointment_time = appointment_time.astimezone(SARATOV_TZ)
 
+    duration = int(duration_min or service_duration_minutes(services))
+
     with get_connection() as conn:
+        # Serialize all writers for this date across bots and the website.
+        if conn.is_pg:
+            conn.execute(
+                "SELECT pg_advisory_xact_lock(hashtext(%s))",
+                (f"appointments:{appointment_time.date().isoformat()}",),
+            )
+
+        dt_value = appointment_time if conn.is_pg else appointment_time.strftime("%Y-%m-%d %H:%M:%S")
+
         user_row = None
         if norm_phone:
             user_row = conn.execute(
@@ -99,83 +125,89 @@ def create_or_update_appointment(
                     platform = "max"
                     platform_user_id = user_row["max_user_id"]
 
-        # Check existing by masters_id if provided
-        if masters_id:
-            existing_row = conn.execute(
-                "SELECT id, client_name, phone, services, total_price, platform, platform_user_id, user_id, status FROM appointments WHERE masters_id = %s", (masters_id,)
-            ).fetchone()
-            if existing_row:
-                existing = dict(existing_row)
-                eff_name = client_name or ""
-                if eff_name in ("Клиент (Masters)", "Клиент", "") and existing["client_name"] and existing["client_name"] not in ("Клиент (Masters)", "Клиент"):
-                    eff_name = existing["client_name"]
-                eff_phone = norm_phone
-                if not eff_phone and existing["phone"] and not is_master_phone(existing["phone"]):
-                    eff_phone = existing["phone"]
-                elif is_master_phone(eff_phone):
-                    eff_phone = existing["phone"] if (existing["phone"] and not is_master_phone(existing["phone"])) else ""
+        # Idempotency: the same client pressing the slot twice updates the
+        # existing record instead of creating a duplicate.
+        if norm_phone and platform_user_id:
+            identity_cond = "(phone = %s OR (platform = %s AND platform_user_id = %s))"
+            identity_params = (norm_phone, platform, platform_user_id)
+        elif norm_phone:
+            identity_cond = "phone = %s"
+            identity_params = (norm_phone,)
+        elif platform_user_id:
+            identity_cond = "(platform = %s AND platform_user_id = %s)"
+            identity_params = (platform, platform_user_id)
+        else:
+            identity_cond = "1 = 0"
+            identity_params = ()
 
-                eff_price = total_price
-                eff_services = services
-                if existing["total_price"] is not None and existing["total_price"] > 0:
-                    if platform == "masters" or not total_price:
-                        eff_price = existing["total_price"]
-                        eff_services = existing["services"] or services
+        existing_row = conn.execute(
+            f"""
+            SELECT id, status, client_name FROM appointments
+            WHERE appointment_time = %s
+              AND (status IS NULL OR status != 'cancelled')
+              AND {identity_cond}
+            ORDER BY id ASC
+            LIMIT 1
+            """,
+            (dt_value, *identity_params),
+        ).fetchone()
 
-                eff_platform = platform
-                eff_p_user_id = platform_user_id
-                if platform == "masters":
-                    if existing.get("platform") and existing["platform"] != "masters":
-                        eff_platform = existing["platform"]
-                    if existing.get("platform_user_id") and existing["platform_user_id"] != 0:
-                        eff_p_user_id = existing["platform_user_id"]
-
-                eff_user_db_id = user_db_id if user_db_id is not None else existing.get("user_id")
-
-                eff_status = existing.get("status")
-                # Preserve terminal status if already completed or cancelled
-                if eff_status not in ("completed", "cancelled"):
-                    eff_status = "confirmed"
-
-                conn.execute(
-                    """
-                    UPDATE appointments
-                    SET user_id = %s,
-                        platform = %s,
-                        platform_user_id = %s,
-                        client_name = %s,
-                        phone = %s,
-                        services = %s,
-                        total_price = %s,
-                        appointment_time = %s,
-                        status = %s,
-                        updated_at = CURRENT_TIMESTAMP
-                    WHERE id = %s
-                    """,
-                    (
-                        eff_user_db_id,
-                        eff_platform,
-                        eff_p_user_id,
-                        eff_name,
-                        eff_phone,
-                        eff_services,
-                        eff_price,
-                        appointment_time if conn.is_pg else appointment_time.strftime("%Y-%m-%d %H:%M:%S"),
-                        eff_status,
-                        existing["id"],
-                    ),
-                )
+        if existing_row:
+            # A completed visit is history; never reopen it on a repeated click.
+            if existing_row["status"] == "completed":
                 conn.commit()
-                return existing["id"]
+                return existing_row["id"]
 
-        # Insert new appointment
+            effective_name = client_name or ""
+            if not effective_name or effective_name in ("Клиент", "Гость", "Гость сайта"):
+                effective_name = existing_row["client_name"] or effective_name
+
+            conn.execute(
+                """
+                UPDATE appointments
+                SET user_id = %s,
+                    platform = %s,
+                    platform_user_id = %s,
+                    client_name = %s,
+                    phone = %s,
+                    services = %s,
+                    total_price = %s,
+                    duration_min = %s,
+                    appointment_time = %s,
+                    status = 'confirmed',
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = %s
+                """,
+                (
+                    user_db_id,
+                    platform,
+                    platform_user_id,
+                    effective_name,
+                    norm_phone,
+                    services,
+                    total_price,
+                    duration,
+                    dt_value,
+                    existing_row["id"],
+                ),
+            )
+            conn.commit()
+            return existing_row["id"]
+
+        overlap = find_overlapping_appointment(conn, appointment_time, duration)
+        if overlap:
+            conn.raw_conn.rollback()
+            raise SlotUnavailableError(
+                "Это время уже занято. Пожалуйста, выберите другой слот."
+            )
+
         if conn.is_pg:
             res = conn.execute(
                 """
                 INSERT INTO appointments (
                     user_id, platform, platform_user_id, client_name, phone,
-                    services, total_price, appointment_time, status, masters_id
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'confirmed', %s)
+                    services, total_price, appointment_time, duration_min, status
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 'confirmed')
                 RETURNING id
                 """,
                 (
@@ -186,36 +218,36 @@ def create_or_update_appointment(
                     norm_phone,
                     services,
                     total_price,
-                    appointment_time,
-                    masters_id,
+                    dt_value,
+                    duration,
                 ),
             ).fetchone()
             conn.commit()
             return res["id"]
-        else:
-            conn.execute(
-                """
-                INSERT INTO appointments (
-                    user_id, platform, platform_user_id, client_name, phone,
-                    services, total_price, appointment_time, status, masters_id
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'confirmed', %s)
-                """,
-                (
-                    user_db_id,
-                    platform,
-                    platform_user_id,
-                    client_name or "",
-                    norm_phone,
-                    services,
-                    total_price,
-                    appointment_time.strftime("%Y-%m-%d %H:%M:%S"),
-                    masters_id,
-                ),
-            )
-            cursor = conn.raw_conn.execute("SELECT last_insert_rowid()")
-            row_id = cursor.fetchone()[0]
-            conn.commit()
-            return row_id
+
+        conn.execute(
+            """
+            INSERT INTO appointments (
+                user_id, platform, platform_user_id, client_name, phone,
+                services, total_price, appointment_time, duration_min, status
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 'confirmed')
+            """,
+            (
+                user_db_id,
+                platform,
+                platform_user_id,
+                client_name or "",
+                norm_phone,
+                services,
+                total_price,
+                dt_value,
+                duration,
+            ),
+        )
+        cursor = conn.raw_conn.execute("SELECT last_insert_rowid()")
+        row_id = cursor.fetchone()[0]
+        conn.commit()
+        return row_id
 
 
 def _check_appointment_access(
@@ -238,14 +270,6 @@ def _check_appointment_access(
         if appt.get("platform") == platform and appt.get("platform_user_id") == platform_user_id:
             return True
 
-        # Masters-imported appointments are created without a client platform id,
-        # so allow the linked user to manage only those rows. Never apply this
-        # fallback to bot-created appointments: it would bypass the platform+id
-        # check after an account was linked to a phone.
-        if appt.get("platform") == "masters":
-            user = get_user_by_platform_id(platform_user_id, platform)
-            if user and appt.get("user_id") and user.get("id") == appt["user_id"]:
-                return True
     except Exception as e:
         logger.error("Error in _check_appointment_access: %s", e)
         return False
@@ -278,13 +302,6 @@ def cancel_appointment(
         res = dict(appt)
         res["status"] = "cancelled"
 
-    try:
-        from core_bot.services.masters_sync import cancel_masters_appointment
-        sync_ok, sync_msg = cancel_masters_appointment(res)
-        logger.info("Masters cancel sync for appt %s: %s (%s)", appointment_id, sync_ok, sync_msg)
-    except Exception as e:
-        logger.error("Error executing Masters cancel sync for appt %s: %s", appointment_id, e)
-
     return True, "Запись успешно отменена", res
 
 
@@ -313,13 +330,6 @@ def confirm_appointment_by_client(
         conn.commit()
         res = dict(appt)
         res["client_confirmed"] = True
-
-    try:
-        from core_bot.services.masters_sync import confirm_masters_appointment
-        sync_ok, sync_msg = confirm_masters_appointment(res)
-        logger.info("Masters confirm sync for appt %s: %s (%s)", appointment_id, sync_ok, sync_msg)
-    except Exception as e:
-        logger.error("Error executing Masters confirm sync for appt %s: %s", appointment_id, e)
 
     return True, "Запись успешно подтверждена", res
 
@@ -369,7 +379,7 @@ def complete_appointment(appointment_id: int) -> tuple[bool, str, dict | None, d
     """
     Marks appointment as completed (клиент пострижен / визит состоялся).
     If the client was invited by a referral, marks the referral visited and awards bonus.
-    Synchronizes status with Masters CRM.
+    Synchronizes status across all platforms in the unified database.
     Returns (success, message, appointment_dict, referral_notify_data).
     """
     with get_connection() as conn:
@@ -420,14 +430,6 @@ def complete_appointment(appointment_id: int) -> tuple[bool, str, dict | None, d
     except Exception as ref_err:
         logger.error("Error checking referral for completed appt %s: %s", appointment_id, ref_err)
 
-    # Sync to Masters CRM
-    try:
-        from core_bot.services.masters_sync import complete_masters_appointment
-        sync_ok, sync_msg = complete_masters_appointment(appt)
-        logger.info("Masters complete sync for appt %s: %s (%s)", appointment_id, sync_ok, sync_msg)
-    except Exception as e:
-        logger.error("Error executing Masters complete sync for appt %s: %s", appointment_id, e)
-
     msg = "Визит успешно отмечен! Запись выполнена."
     if referral_notify_data:
         msg += f" Другу начислен бонус за рекомендацию: {referral_notify_data.get('amount', 300)} ₽!"
@@ -442,9 +444,19 @@ def reschedule_appointment(
     platform_user_id: int | None = None,
 ) -> tuple[bool, str, dict | None]:
     """
-    Reschedules appointment to a new date and time and resets reminder flags.
-    Synchronizes with Masters CRM.
+    Moves an appointment to a new date/time in the shared «Срез» schedule.
+
+    The new interval must fit the working hours and must not overlap another
+    booking (taken into account service duration). The current appointment is
+    excluded from the overlap check.
     """
+    from core_bot.services.booking import (
+        _time_to_minutes,
+        find_overlapping_appointment,
+        get_day_schedule,
+        service_duration_minutes,
+    )
+
     if new_datetime.tzinfo is None:
         new_datetime = new_datetime.replace(tzinfo=SARATOV_TZ)
     else:
@@ -457,6 +469,36 @@ def reschedule_appointment(
         appt = dict(row)
         if not _check_appointment_access(appt, platform, platform_user_id):
             return False, "У вас нет прав для изменения этой записи.", None
+
+        duration = int(appt.get("duration_min") or service_duration_minutes(appt.get("services")))
+        day_key = new_datetime.date().isoformat()
+        sched = get_day_schedule(day_key)
+        if not sched["is_working"]:
+            return False, "В этот день мастер не работает.", None
+
+        day_start = datetime.datetime.combine(
+            new_datetime.date(), datetime.time.min, tzinfo=SARATOV_TZ
+        ) + datetime.timedelta(minutes=_time_to_minutes(sched["start_time"]))
+        day_end = datetime.datetime.combine(
+            new_datetime.date(), datetime.time.min, tzinfo=SARATOV_TZ
+        ) + datetime.timedelta(minutes=_time_to_minutes(sched["end_time"]))
+        slot_end = new_datetime + datetime.timedelta(minutes=duration)
+        if new_datetime < day_start or slot_end > day_end:
+            return False, "Это время вне рабочих часов мастера.", None
+        if new_datetime <= datetime.datetime.now(SARATOV_TZ):
+            return False, "Это время уже прошло.", None
+
+        if conn.is_pg:
+            conn.execute(
+                "SELECT pg_advisory_xact_lock(hashtext(%s))",
+                (f"appointments:{day_key}",),
+            )
+
+        overlap = find_overlapping_appointment(
+            conn, new_datetime, duration, exclude_appointment_id=appointment_id
+        )
+        if overlap:
+            return False, "Это время уже занято. Пожалуйста, выберите другой слот.", None
 
         val_false = False if conn.is_pg else 0
         dt_val = new_datetime if conn.is_pg else new_datetime.strftime("%Y-%m-%d %H:%M:%S")
@@ -475,17 +517,8 @@ def reschedule_appointment(
             (dt_val, val_false, val_false, val_false, appointment_id),
         )
         conn.commit()
-        appt = dict(row)
         appt["appointment_time"] = new_datetime
         appt["status"] = "confirmed"
-
-    # Sync to Masters CRM
-    try:
-        from core_bot.services.masters_sync import reschedule_masters_appointment
-        sync_ok, sync_msg = reschedule_masters_appointment(appt, new_datetime)
-        logger.info("Masters reschedule sync for appt %s: %s (%s)", appointment_id, sync_ok, sync_msg)
-    except Exception as e:
-        logger.error("Error executing Masters reschedule sync for appt %s: %s", appointment_id, e)
 
     return True, "Запись успешно перенесена!", appt
 
@@ -578,32 +611,6 @@ def get_appointments_counts() -> dict[str, int]:
         ).fetchone()
         counts["all"] = row["c"] if row else 0
 
-        if counts["all"] == 0:
-            try:
-                from core_bot.services.masters_sync import sync_masters_appointments
-                sync_masters_appointments()
-                r_tm = conn.execute(
-                    """
-                    SELECT COUNT(*) AS c FROM appointments
-                    WHERE (status IS NULL OR status != 'cancelled')
-                      AND appointment_time >= %s AND appointment_time < %s
-                    """,
-                    (tm_start, tm_end),
-                ).fetchone()
-                counts["tomorrow"] = r_tm["c"] if r_tm else 0
-
-                r_all = conn.execute(
-                    """
-                    SELECT COUNT(*) AS c FROM appointments
-                    WHERE (status IS NULL OR status != 'cancelled')
-                      AND appointment_time >= %s
-                    """,
-                    (t_start,),
-                ).fetchone()
-                counts["all"] = r_all["c"] if r_all else 0
-            except Exception as e:
-                logger.debug("Auto-sync inside get_appointments_counts: %s", e)
-
     return counts
 
 
@@ -665,15 +672,6 @@ def get_master_appointments(
         row = conn.execute(count_sql, tuple(exec_params)).fetchone()
         total = row["total"] if row else 0
 
-        if total == 0 and date_filter in ("tomorrow", "all"):
-            try:
-                from core_bot.services.masters_sync import sync_masters_appointments
-                sync_masters_appointments()
-                row = conn.execute(count_sql, tuple(exec_params)).fetchone()
-                total = row["total"] if row else 0
-            except Exception as e:
-                logger.debug("Auto-sync inside get_master_appointments: %s", e)
-
         list_sql = f"""
             SELECT * FROM appointments
             WHERE {where_sql}
@@ -685,48 +683,6 @@ def get_master_appointments(
         return [dict(r) for r in rows], total
 
 
-def set_appointment_masters_id(appointment_id: int, masters_id: str) -> bool:
-    """Stores the Masters CRM record id for a locally created appointment."""
-    try:
-        with get_connection() as conn:
-            conn.execute(
-                "UPDATE appointments SET masters_id = %s, updated_at = CURRENT_TIMESTAMP WHERE id = %s",
-                (str(masters_id)[:64], appointment_id),
-            )
-            conn.commit()
-        return True
-    except Exception as e:
-        logger.warning("Failed to set masters_id for appointment %s: %s", appointment_id, e)
-        return False
-
-
-# Admin-created appointments awaiting the client's SMS code to finish the
-# booking in Masters (the client is new to Masters): appt_id -> session_data.
-pending_manual_bookings: dict[int, dict] = {}
-
-
-def confirm_manual_appointment_masters_sms(appointment_id: int, sms_code: str) -> tuple[bool, str]:
-    """
-    Completes a pending manual booking in Masters CRM using the 4-digit SMS code
-    the client received. Saves the resulting Masters record id.
-    """
-    session_data = pending_manual_bookings.get(appointment_id)
-    if not session_data:
-        return False, "Нет записи, ожидающей подтверждения по СМС."
-
-    from core_bot.services.masters import confirm_sms_code
-
-    ok, msg = confirm_sms_code(session_data, sms_code)
-    if not ok:
-        return False, msg
-
-    masters_id = session_data.get("appointment_id")
-    if masters_id:
-        set_appointment_masters_id(appointment_id, str(masters_id))
-    pending_manual_bookings.pop(appointment_id, None)
-    return True, "✅ Запись добавлена в Masters CRM."
-
-
 def create_manual_appointment(
     phone: str,
     appointment_time: datetime.datetime,
@@ -734,288 +690,44 @@ def create_manual_appointment(
     total_price: int,
     client_name: str | None = None,
     platform: str = "telegram",
-    sync_to_masters: bool = True,
+    duration_min: int | None = None,
 ) -> tuple[bool, str, int | None]:
     """
-    Creates an appointment directly by master, with support for any custom time/price.
-
-    Syncs the record into Masters CRM via the same public booking flow
-    (mst.link) that clients use — this is the only mechanism proven to create
-    real records in Masters. For clients already known to Masters the booking
-    completes instantly; for new clients Masters sends an SMS code to the
-    client's phone and the appointment is kept in pending_manual_bookings
-    until confirm_manual_appointment_masters_sms() is called.
-
-    Returns (success, message, appointment_id). The message always reflects
-    the actual Masters sync state.
+    Creates an appointment directly by the master, with custom time/price.
+    Saves immediately to the shared «Срез» database and rejects overlaps.
     """
     if appointment_time.tzinfo is None:
         appointment_time = appointment_time.replace(tzinfo=SARATOV_TZ)
     else:
         appointment_time = appointment_time.astimezone(SARATOV_TZ)
 
-    appt_id = create_or_update_appointment(
-        phone=phone,
-        appointment_time=appointment_time,
-        services=services,
-        total_price=total_price,
-        client_name=client_name or "Клиент",
-        platform=platform,
-    )
-
-    if not sync_to_masters:
-        return True, "Запись успешно создана!", appt_id
-
-    # 1) Primary: the public mst.link booking flow (works without CRM session).
     try:
-        from core_bot.services.masters import initiate_booking, map_service_name_to_keys
-
-        keys = map_service_name_to_keys(services)
-        if keys:
-            ts = int(appointment_time.timestamp())
-            ok_b, msg_b, session_data = initiate_booking(
-                phone, keys, ts, client_name=client_name or ""
-            )
-            if ok_b and session_data:
-                if not session_data.get("needs_sms"):
-                    masters_id = session_data.get("appointment_id")
-                    if masters_id:
-                        set_appointment_masters_id(appt_id, str(masters_id))
-                    return True, "✅ Запись успешно создана и синхронизирована с Masters CRM!", appt_id
-
-                # New client in Masters: an SMS code was sent to the client.
-                pending_manual_bookings[appt_id] = session_data
-                return (
-                    True,
-                    "🎉 Запись создана в боте.\n\n"
-                    "🔑 Клиент новый в Masters — сервис отправил ему код подтверждения по СМС. "
-                    "Перешлите боту этот 4-значный код, чтобы запись появилась и в Masters CRM.",
-                    appt_id,
-                )
-            logger.info("Public Masters booking failed for manual appt %s: %s", appt_id, msg_b)
-    except Exception as e:
-        logger.warning("Public Masters booking error for manual appt %s: %s", appt_id, e)
-
-    # 2) Fallback: authenticated CRM session endpoints (best effort).
-    try:
-        from core_bot.services.masters_sync import create_masters_appointment
-        ok_c, _msg_c, masters_id = create_masters_appointment(
-            client_name=client_name or "Клиент",
+        appt_id = create_or_update_appointment(
             phone=phone,
-            services=services,
             appointment_time=appointment_time,
-            price=total_price,
+            services=services,
+            total_price=total_price,
+            client_name=client_name or "Клиент",
+            platform=platform,
+            duration_min=duration_min,
         )
-        if ok_c and masters_id:
-            set_appointment_masters_id(appt_id, str(masters_id))
-            return True, "✅ Запись успешно создана и синхронизирована с Masters CRM!", appt_id
-    except Exception as e:
-        logger.debug("Masters CRM session create failed for appt %s: %s", appt_id, e)
-
-    return (
-        True,
-        "⚠️ Запись создана в боте, но добавить её в Masters CRM не удалось. "
-        "Проверьте, что слот/услуга доступны для онлайн-записи, либо добавьте запись в Masters вручную.",
-        appt_id,
-    )
+    except SlotUnavailableError as exc:
+        return False, str(exc), None
+    return True, "✅ Запись успешно создана в единой базе «Срез»!", appt_id
 
 
 def get_master_day_schedule(day_key: str) -> dict:
-    """
-    Returns schedule for day_key (YYYY-MM-DD).
-    1. Checks DB master_schedule table for master overrides.
-    2. Checks Masters CRM live schedule (via services.masters.get_schedule).
-    3. Falls back to Boris Gafurov's standard schedule:
-       Tuesdays (1) and Saturdays (5) are working days (10:00 - 19:00).
-       All other days (Mon, Wed, Thu, Fri, Sun) are non-working days / days off.
-    """
-    # 1. Custom DB override
-    with get_connection() as conn:
-        row = conn.execute("SELECT * FROM master_schedule WHERE day_key = %s", (day_key,)).fetchone()
-        if row:
-            r = dict(row)
-            return {
-                "day_key": day_key,
-                "is_working": bool(r["is_working"]),
-                "start_time": r["start_time"],
-                "end_time": r["end_time"],
-                "note": r.get("note"),
-            }
+    """Returns the effective schedule for one date from the shared service."""
+    from core_bot.services.booking import get_day_schedule
 
-    # 2. Check Masters CRM schedule
-    try:
-        from core_bot.services.masters import get_schedule
-        masters_map = get_schedule(["hair"])
-        if masters_map and day_key in masters_map:
-            slots = masters_map[day_key].get("slots", [])
-            start_time = "10:00"
-            end_time = "19:00"
-            if slots:
-                first_s = slots[0].get("time", "10:00")
-                start_time = min("10:00", first_s)
-                last_s = slots[-1].get("time", "17:30")
-                try:
-                    lh, lm = [int(p) for p in last_s.split(":")[:2]]
-                    end_dt = datetime.datetime(2000, 1, 1, lh, lm) + datetime.timedelta(minutes=90)
-                    end_time = end_dt.strftime("%H:%M")
-                except Exception:
-                    end_time = "19:00"
-            return {
-                "day_key": day_key,
-                "is_working": True,
-                "start_time": start_time,
-                "end_time": end_time,
-                "note": None,
-            }
-        elif masters_map:
-            # Masters schedule was successfully fetched and this day has no slots -> day off in Masters
-            return {
-                "day_key": day_key,
-                "is_working": False,
-                "start_time": "10:00",
-                "end_time": "19:00",
-                "note": "Выходной в Masters",
-            }
-    except Exception as e:
-        logger.debug("Masters schedule check skipped for %s: %s", day_key, e)
-
-    # 3. Standard fallback: Tuesdays (1) and Saturdays (5) are working (10:00 - 19:00)
-    try:
-        d = datetime.date.fromisoformat(day_key)
-        is_working_day = d.weekday() in (1, 5)
-    except Exception:
-        is_working_day = False
-
-    return {
-        "day_key": day_key,
-        "is_working": is_working_day,
-        "start_time": "10:00",
-        "end_time": "19:00",
-        "note": None if is_working_day else "Выходной день",
-    }
+    return get_day_schedule(day_key)
 
 
 def get_day_time_slots_status(day_key: str) -> dict[str, Any]:
-    """
-    Returns time slots breakdown for day_key:
-    - free_slots: list of free time strings (e.g. ['13:30', '16:30', '17:00'])
-    - busy_appts: list of unique booked appointments from DB on that day
-    - all_slots: list of slot dicts: [{'time': '10:00', 'is_busy': bool, 'badge': '🟢'|'🔴', ...}]
-    - sched: schedule dictionary
-    """
-    sched = get_master_day_schedule(day_key)
+    """Admin day view backed by the same availability rules as client booking."""
+    from core_bot.services.booking import get_day_time_slots_status as _status
 
-    with get_connection() as conn:
-        dt_start = f"{day_key} 00:00:00"
-        dt_end = f"{day_key} 23:59:59"
-        p_start = dt_start if conn.is_pg else dt_start
-        p_end = dt_end if conn.is_pg else dt_end
-        rows = conn.execute(
-            """
-            SELECT id, appointment_time, client_name, phone, services, total_price, status
-            FROM appointments
-            WHERE appointment_time >= %s AND appointment_time <= %s
-              AND (status IS NULL OR status != 'cancelled')
-            ORDER BY appointment_time ASC
-            """,
-            (p_start, p_end),
-        ).fetchall()
-        db_appts = [dict(r) for r in rows]
-
-    busy_slots_map: dict[str, dict] = {}
-    busy_appts: list[dict] = []
-
-    for a in db_appts:
-        appt_dt = parse_to_saratov(a["appointment_time"])
-        start_hm = appt_dt.strftime("%H:%M")
-        svc_lower = (a.get("services") or "").lower()
-        if "бород" in svc_lower and "стрижк" not in svc_lower:
-            duration_min = 60
-        elif "стрижк" in svc_lower and "бород" in svc_lower:
-            duration_min = 135
-        else:
-            duration_min = 75
-
-        busy_appts.append({
-            "id": a["id"],
-            "time": start_hm,
-            "client_name": a.get("client_name") or "Клиент",
-            "services": a.get("services") or "Стрижка",
-            "phone": a.get("phone") or "",
-            "price": a.get("total_price") or 0,
-        })
-
-        cur_dt = appt_dt
-        end_dt = appt_dt + datetime.timedelta(minutes=duration_min)
-        while cur_dt < end_dt:
-            busy_slots_map[cur_dt.strftime("%H:%M")] = a
-            cur_dt += datetime.timedelta(minutes=30)
-
-    masters_free_slots: set[str] | None = None
-    try:
-        from core_bot.services.masters import get_schedule
-        masters_map = get_schedule(["hair"])
-        if masters_map and day_key in masters_map:
-            masters_free_slots = set(s["time"].strip() for s in masters_map[day_key].get("slots", []))
-    except Exception as e:
-        logger.debug("Masters schedule check failed for %s: %s", day_key, e)
-
-    standard_slots = [
-        "08:30", "09:00", "09:30",
-        "10:00", "10:30", "11:00", "11:30", "12:00", "12:30", "13:00", "13:30",
-        "14:00", "14:30", "15:00", "15:30", "16:00", "16:30", "17:00", "17:30",
-        "18:00", "18:30", "19:00", "19:30", "20:00", "20:30", "21:00"
-    ]
-
-    free_slots: list[str] = []
-    if masters_free_slots is not None:
-        for s in masters_free_slots:
-            if s not in busy_slots_map:
-                free_slots.append(s)
-        free_slots = sorted(free_slots)
-    else:
-        for s in standard_slots:
-            if s not in busy_slots_map:
-                free_slots.append(s)
-
-    all_slots: list[dict] = []
-    for s in standard_slots:
-        if s in busy_slots_map:
-            appt_info = busy_slots_map[s]
-            all_slots.append({
-                "time": s,
-                "is_busy": True,
-                "badge": "🔴",
-                "client_name": appt_info.get("client_name"),
-                "services": appt_info.get("services"),
-                "appt_id": appt_info.get("id"),
-            })
-        elif s in free_slots:
-            all_slots.append({
-                "time": s,
-                "is_busy": False,
-                "badge": "🟢",
-                "client_name": None,
-                "services": None,
-                "appt_id": None,
-            })
-        elif masters_free_slots is not None and s not in masters_free_slots:
-            all_slots.append({
-                "time": s,
-                "is_busy": True,
-                "badge": "🔴",
-                "client_name": "Занято в Masters",
-                "services": None,
-                "appt_id": None,
-            })
-
-    return {
-        "day_key": day_key,
-        "sched": sched,
-        "free_slots": free_slots,
-        "busy_appts": busy_appts,
-        "all_slots": all_slots,
-    }
+    return _status(day_key)
 
 
 def set_master_day_schedule(

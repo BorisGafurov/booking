@@ -1,37 +1,36 @@
-VERSION = "007_masters_client_fields"
-NAME = "Add Masters CRM client fields to users"
+VERSION = "007_client_extra_fields"
+NAME = "Add extended client profile fields"
 
-# Columns mirrored from the Masters CRM client export ("Клиенты" sheet):
-# Дата рождения, Регистрация в Masters, Записей всего, Отмененных записей,
-# Оказано услуг, Группы, Instagram, Facebook, VK, Email, Комментарий.
+# Дополнительные поля карточки клиента: день рождения, источник регистрации,
+# группа, статистика визитов, соцсети и контактные данные.
 PG_COLUMNS = [
     "birthday VARCHAR(64)",
-    "masters_registered VARCHAR(32)",
-    "masters_group VARCHAR(128)",
-    "masters_appointments_total INTEGER DEFAULT 0",
-    "masters_cancelled_total INTEGER DEFAULT 0",
-    "masters_revenue INTEGER DEFAULT 0",
+    "source_registered VARCHAR(32)",
+    "client_group VARCHAR(128)",
+    "visits_total INTEGER DEFAULT 0",
+    "cancelled_total INTEGER DEFAULT 0",
+    "revenue_total INTEGER DEFAULT 0",
     "social_instagram VARCHAR(255)",
     "social_facebook VARCHAR(255)",
     "social_vk VARCHAR(255)",
     "email VARCHAR(255)",
     "comment TEXT",
-    "masters_imported_at TIMESTAMP WITH TIME ZONE",
+    "imported_at TIMESTAMP WITH TIME ZONE",
 ]
 
 SQLITE_COLUMNS = [
     "birthday TEXT",
-    "masters_registered TEXT",
-    "masters_group TEXT",
-    "masters_appointments_total INTEGER DEFAULT 0",
-    "masters_cancelled_total INTEGER DEFAULT 0",
-    "masters_revenue INTEGER DEFAULT 0",
+    "source_registered TEXT",
+    "client_group TEXT",
+    "visits_total INTEGER DEFAULT 0",
+    "cancelled_total INTEGER DEFAULT 0",
+    "revenue_total INTEGER DEFAULT 0",
     "social_instagram TEXT",
     "social_facebook TEXT",
     "social_vk TEXT",
     "email TEXT",
     "comment TEXT",
-    "masters_imported_at TIMESTAMP",
+    "imported_at TIMESTAMP",
 ]
 
 

@@ -1,69 +1,66 @@
-# Архитектура и Документация API Внутренних Сервисов (`core_bot`)
+# Архитектура и документация внутренних сервисов (`core_bot`)
 
-Данный документ описывает архитектуру мультиплатформенной экосистемы ботов онлайн-записи (Telegram, VK, MAX), систему миграций базы данных, внутренние сервисы и контракты API.
+Документ описывает мультиплатформенную экосистему онлайн-записи (Telegram, VK, MAX), единую базу данных с сайтом «Срез», систему миграций и контракты внутренних сервисов.
 
 ---
 
 ## 1. Общая архитектура экосистемы
 
-Система построена по модульному принципу: вся бизнес-логика, работа с базой данных, интеграция с Masters CRM и реферальная программа вынесены в единый переиспользуемый пакет **`core_bot`**.
-Платформенные боты (`bot_booking`, `bot_VK_booking`, `bot_Max_booking`) выступают тонкими клиентами (адаптерами), отвечающими исключительно за UI, клавиатуры и обработку входящих событий платформ.
+Вся бизнес-логика, работа с базой данных, расписание, каталог услуг и реферальная программа вынесены в переиспользуемый пакет **`core_bot`**. Платформенные боты (`bot_booking`, `bot_VK_booking`, `bot_Max_booking`) — тонкие адаптеры: UI, клавиатуры и обработка событий платформы. Сайт `srezforma.ru` работает с той же базой и теми же правилами записи.
 
 ```mermaid
 flowchart TD
-    subgraph Clients["Платформенные боты (Адаптеры)"]
+    subgraph Clients["Клиенты"]
         TG["Telegram Bot (aiogram 3.14+)<br/>bot_booking"]
         VK["VK Bot (vkbottle 4.11+)<br/>bot_VK_booking"]
         MAX["MAX Bot (maxapi 1.2+)<br/>bot_Max_booking"]
+        SITE["Сайт и мини-приложение<br/>srezforma.ru"]
     end
 
     subgraph Core["Единый пакет core_bot"]
         direction TB
         DB_LAYER["core_bot.database<br/>Connection Pool & Migrations"]
-        SERVICES["core_bot.services<br/>Appointments, Referrals, Masters CRM, Sync"]
+        BOOKING["core_bot.services.booking<br/>Каталог, расписание, слоты"]
+        APPTS["core_bot.services.appointments<br/>Записи, статусы, напоминания"]
+        REFS["core_bot.services.referrals<br/>Профили, роли, бонусы"]
     end
 
     subgraph Storage["Слой хранения данных"]
-        PG[("PostgreSQL (Bothost Prod)<br/>node1.pghost.ru:16252")]
-        SQLITE[("SQLite (Fallback & Local Tests)<br/>bot.db")]
+        PG[("PostgreSQL (Bothost Prod)<br/>общая база ботов и сайта")]
+        SQLITE[("SQLite (локальная разработка и тесты)")]
     end
 
-    subgraph External["Внешние системы"]
-        MASTERS["Masters CRM<br/>prod.mastersapp.ru"]
-    end
-
-    TG --> SERVICES
-    VK --> SERVICES
-    MAX --> SERVICES
-    TG --> DB_LAYER
-    VK --> DB_LAYER
-    MAX --> DB_LAYER
-
-    DB_LAYER --> PG
-    DB_LAYER -.->|Offline Fallback| SQLITE
-    SERVICES --> MASTERS
+    TG --> Core
+    VK --> Core
+    MAX --> Core
+    SITE --> PG
+    Core --> PG
+    DB_LAYER -.->|Разрешённый fallback| SQLITE
 ```
 
+### Единый источник истины
+
+- **Расписание** хранится в таблице `master_schedule` (переопределения по конкретным датам) и дополняется стандартной сеткой: вторник и суббота, `10:00–19:00`, слоты `10:00, 11:15, 12:30, 14:00, 15:15, 16:30, 17:45`.
+- **Каталог услуг** задан в `core_bot/services/booking.py` и используется ботами и сайтом: `hair` — 2 300 ₽ / 75 мин, `beard` — 700 ₽ / 60 мин, `combo` — 3 000 ₽ / 135 мин.
+- **Занятость** проверяется по интервалам с учётом длительности услуги: запись блокирует всё время процедуры, а не только время начала.
+- Любая запись, отмена или перенос через бота либо сайт сразу видны всем платформам.
+
 ### Синхронизация между репозиториями
-Для исключения дублирования и расхождения кода используется утилита:
+
 ```bash
 python3 scripts/sync_core.py
 ```
-Она автоматически обновляет пакет `core_bot`, фасады в `services/` и миграции во всех трёх репозиториях (`bot_booking`, `bot_VK_booking`, `bot_Max_booking`).
+
+Утилита обновляет `core_bot`, фасады в `services/` и миграции во всех трёх репозиториях (`bot_booking`, `bot_VK_booking`, `bot_Max_booking`). Общими являются `appointments`, `booking`, `referrals`, `client_import` и `recommendations`.
 
 ---
 
 ## 2. Система миграций базы данных (`core_bot.database.migrations`)
 
 ### Принцип работы
-Вместо тяжёлых внешних ORM (Alembic/SQLAlchemy) используется нативный легковесный dual-engine runner с нулевыми сторонними зависимостями, гарантирующий 100% совместимость с Bothost и локальным SQLite.
 
-### Отказоустойчивость подключения к базе
-- При настроенном `DATABASE_URL` и `ALLOW_SQLITE_FALLBACK=false` недоступность PostgreSQL является фатальной: `get_connection()` выбрасывает `RuntimeError`, а не переключается молча на локальный SQLite.
-- Повторные вызовы после сбоя также завершаются ошибкой (fail-closed), чтобы боты не начинали писать в отдельную локальную базу и не создавать split-brain.
-- SQLite используется только при явно разрешённом fallback или при отсутствии `DATABASE_URL` (локальная разработка и тесты).
+Вместо тяжёлых ORM используется нативный dual-engine runner с поддержкой PostgreSQL и SQLite. Таблица учёта версий:
 
-Таблица учета примененных версий:
 ```sql
 CREATE TABLE IF NOT EXISTS schema_migrations (
     version VARCHAR(64) PRIMARY KEY,
@@ -72,159 +69,201 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 );
 ```
 
+### Отказоустойчивость подключения
+
+- При настроенном `DATABASE_URL` и `ALLOW_SQLITE_FALLBACK=false` недоступность PostgreSQL фатальна: `get_connection()` выбрасывает `RuntimeError` и не переключается молча на локальный SQLite.
+- Повторные вызовы после сбоя также завершаются ошибкой (fail-closed), чтобы боты не создавали отдельную локальную базу и split-brain.
+- SQLite используется только при явно разрешённом fallback или при отсутствии `DATABASE_URL` (локальная разработка и тесты).
+
 ### Версии миграций (`core_bot/database/migrations/versions/`)
-1. **`001_initial_schema.py`** — создание базовых таблиц `users`, `referrals`, `rewards`, `appointments` и индексов.
-2. **`002_masters_session.py`** — создание таблицы `masters_session` для сессий авторизации Masters CRM.
-3. **`003_user_roles_and_schedule.py`** — создание таблиц `user_roles` (RBAC) и `master_schedule` (расписание рабочего дня мастера).
-4. **`004_data_cleanups.py`** — очистка служебных номеров телефонов мастера из клиентских записей. Номера берутся из `MASTER_PHONES`/`MASTER_PHONE`; если переменные не заданы, миграция ничего не меняет.
+
+1. **`001_initial_schema.py`** — базовые таблицы `users`, `referrals`, `rewards`, `appointments` и индексы.
+2. **`003_user_roles_and_schedule.py`** — таблицы `user_roles` (RBAC) и `master_schedule` (переопределения рабочего графика).
+3. **`004_data_cleanups.py`** — очистка служебных номеров мастера из клиентских записей. Номера берутся из `MASTER_PHONES`/`MASTER_PHONE`; если переменные не заданы, миграция ничего не меняет.
+4. **`006_remove_guessed_placeholders.py`** — историческая заглушка, намеренно ничего не делает и сохраняет цепочку миграций.
+5. **`007_client_extra_fields.py`** — дополнительные поля карточки клиента: день рождения, источник регистрации, группа, статистика визитов, соцсети, email, комментарий.
+6. **`008_site_sync_cleanup.py`** — приводит схему к единой модели сайта и ботов:
+   - переименовывает legacy-поля клиента в нейтральные (`source_registered`, `client_group`, `visits_total`, `cancelled_total`, `revenue_total`, `imported_at`), сохраняя данные;
+   - добавляет и заполняет `appointments.duration_min` и `appointments.notes`;
+   - удаляет устаревшую таблицу сессий и колонку внешнего идентификатора;
+   - переводит исторические записи внешней CRM в `platform = 'manual'`;
+   - идемпотентна для PostgreSQL и SQLite.
 
 ### Добавление новой миграции
-Создайте файл `core_bot/database/migrations/versions/005_ваше_название.py`:
+
+Создайте файл `core_bot/database/migrations/versions/009_ваше_название.py`:
+
 ```python
-VERSION = "005_ваше_название"
+VERSION = "009_ваше_название"
 NAME = "Краткое описание изменений"
 
 def apply(conn):
-    if conn.is_pg:
-        conn.execute("ALTER TABLE appointments ADD COLUMN notes TEXT;")
-    else:
-        conn.execute("ALTER TABLE appointments ADD COLUMN notes TEXT;")
+    conn.execute("ALTER TABLE appointments ADD COLUMN example TEXT")
 
 def rollback(conn):
     pass
 ```
 
-### CLI команды
-- Просмотр статуса миграций:
-  ```bash
-  python3 -m core_bot.database.migrations.runner --status
-  ```
-- Применение ожидающих миграций:
-  ```bash
-  python3 -m core_bot.database.migrations.runner
-  ```
+### CLI
+
+```bash
+python3 -m core_bot.database.migrations.runner --status
+python3 -m core_bot.database.migrations.runner
+```
 
 ---
 
 ## 3. Спецификация API сервисов
 
-### 3.1. `core_bot.services.appointments`
-Управляет жизненным циклом записей клиентов, расписанием мастера и рассылкой напоминаний.
+### 3.1. `core_bot.services.booking`
+
+Единые правила каталога, расписания и доступности слотов. Используется ботами, сайтом и локальным dev-сервером.
+
+#### Каталог услуг
+
+- `SERVICES` — словарь услуг с ценой и длительностью.
+- `calculate_services(selected_keys) -> dict` — нормализует набор услуг, суммирует стоимость и время, возвращает `names`, `total_price`, `duration_minutes`, `duration_text`.
+- `service_duration_minutes(services: str | None) -> int` — определяет длительность по тексту услуги из записи.
+- `map_service_name_to_keys(services: str | None) -> list[str]` — сопоставляет свободное название услуги с ключами каталога.
+- `get_service_options_for_creation() -> list[dict]` — варианты услуг для админского создания записи.
+
+#### Расписание и доступность
+
+- `get_day_schedule(day_key: str) -> dict` — эффективный график дня: `is_working`, `start_time`, `end_time`; учитывает `master_schedule`, иначе стандартный вторник/суббота.
+- `get_days_schedule(selected_keys=None, days_count=14) -> list[dict]` — календарь на N дней со всеми слотами и флагом `available`. Используется сайтом.
+- `get_schedule(selected_keys=None) -> dict` — рабочие дни, в которых есть хотя бы одно свободное окно (вид для клавиатуры бота).
+- `is_slot_available(day_key, time, selected_keys=None, exclude_appointment_id=None) -> bool` — проверка слота с учётом рабочих часов, прошедшего времени и наложений.
+- `find_overlapping_appointment(conn, start, duration_min, exclude_appointment_id=None) -> dict | None` — поиск пересекающейся записи.
+- `get_day_time_slots_status(day_key: str) -> dict` — сетка слотов для админского экрана с пометкой занятости.
+
+---
+
+### 3.2. `core_bot.services.appointments`
+
+Жизненный цикл записей, расписание, ручные записи и напоминания.
 
 #### Таймзона и время
-- Все временные метки строго приводятся к **Саратовскому времени (`Europe/Saratov`, UTC+4)**.
-- `get_current_saratov_time() -> datetime.datetime`: текущее время в Саратове.
-- `parse_to_saratov(val: Any) -> datetime.datetime`: корректно парсит aware и naive ISO-строки (включая UTC `Z` и MSK `+03:00` от Masters CRM), конвертируя через `.astimezone(SARATOV_TZ)`.
+
+- Все временные метки приводятся к **Саратову (`Europe/Saratov`, UTC+4)**.
+- `get_current_saratov_time() -> datetime.datetime` — текущее время в Саратове.
+- `parse_to_saratov(val) -> datetime.datetime` — парсит aware/naive ISO-строки и приводит к саратовскому времени.
 
 #### Основные методы
+
 - `create_or_update_appointment(...) -> int`:
-  Создает или обновляет запись. При фоновой синхронизации из Masters CRM сохраняет существующие `platform`, `platform_user_id` и `user_id`. Если телефон пустой, автоматически привязывает запись к клиенту по его `platform_user_id`.
-- `cancel_appointment(appointment_id: int) -> tuple[bool, str, dict | None]`:
-  Отменяет запись в БД и выполняет синхронизацию отмены с Masters CRM.
-- `confirm_appointment_by_client(appointment_id: int) -> tuple[bool, str, dict | None]`:
-  Подтверждает запись со стороны клиента (`client_confirmed = True`) и передает статус в Masters CRM.
-- `complete_appointment(appointment_id: int) -> tuple[bool, str, dict | None, dict | None]`:
-  Переводит запись в статус `completed`. Автоматически начисляет реферальный бонус (300 ₽) пригласившему другу, если это первый выполненный визит.
-- `reschedule_appointment(appointment_id: int, new_time: datetime, ...) -> tuple[bool, str, dict | None]`:
-  Переносит запись на новую дату/время с гарантированным сохранением таймзоны UTC+4.
+  Создаёт или обновляет запись. При повторной отправке того же клиента на тот же слот возвращает существующую запись (идемпотентность). Завершённые визиты не переоткрываются. При пересечении интервалов выбрасывает `SlotUnavailableError`.
+- `cancel_appointment(appointment_id, platform=None, platform_user_id=None) -> tuple[bool, str, dict | None]`:
+  Отменяет запись и освобождает слот для всех платформ.
+- `confirm_appointment_by_client(appointment_id) -> tuple[bool, str, dict | None]`:
+  Подтверждает запись клиентом (`client_confirmed = true`).
+- `complete_appointment(appointment_id) -> tuple[bool, str, dict | None, dict | None]`:
+  Переводит запись в `completed`. При первом завершённом визите начисляет реферальный бонус пригласившему.
+- `reschedule_appointment(appointment_id, new_datetime, ...) -> tuple[bool, str, dict | None]`:
+  Переносит запись с проверкой рабочих часов и пересечений; текущая запись исключается из проверки.
+- `create_manual_appointment(...) -> tuple[bool, str, int | None]`:
+  Создаёт запись мастера/администратора с проверкой занятости и длительности.
 
-#### Контроль доступа к записям
-- Клиентские операции (отмена, подтверждение, перенос) проверяют точное совпадение `platform` и `platform_user_id` записи.
-- Связь по `user_id` допускается только для записей, импортированных из Masters CRM (`platform == "masters"`), у которых нет клиентского platform id. Для записей, созданных ботом, такая связь не применяется — это исключает IDOR после привязки телефона.
-- Мастер и администраторы проходят проверку через `is_master_user()`.
+#### Контроль доступа
 
-#### Расписание мастера и слоты
-- `get_master_day_schedule(day_key: str) -> dict`: возвращает статус дня (`is_working`, `start_time`, `end_time`, `note`).
-- `set_master_day_schedule(day_key: str, is_working: bool, start_time: str, end_time: str, note: str)`: обновляет график мастера.
-- `get_day_time_slots_status(day_key: str) -> dict`: формирует сетку слотов с 08:00 до 21:30 с шагом 30 минут, помечая занятые и свободные часы с учетом наложений процедур.
+- Клиентские операции (отмена, подтверждение, перенос) проверяют `platform` и `platform_user_id`.
+- Связь по `user_id` используется только как fallback для записей без платформенного идентификатора; это исключает IDOR после привязки телефона.
+- Мастер и администраторы проходят проверку через `is_master_user()` / `is_admin_user()`.
+
+#### Расписание мастера
+
+- `get_master_day_schedule(day_key) -> dict`
+- `set_master_day_schedule(day_key, is_working, start_time, end_time, note)`
+- `adjust_master_day_hours(day_key, start_time, end_time)` — быстрое изменение часов.
+- `get_upcoming_days_schedule(days_ahead=14) -> list[dict]` — сводка ближайших дней для админки.
 
 #### Фоновые напоминания (`reminder_worker`)
-- `get_due_evening_reminders(platform: str | None) -> list[dict]`: выборка записей на следующий день для вечернего напоминания (в 19:00).
-- `get_due_confirmation_followup_reminders(platform: str | None) -> list[dict]`: выборка неподтвержденных записей для утреннего запроса подтверждения (в 08:30).
-- `get_due_2h_reminders(platform: str | None) -> list[dict]`: выборка записей за 2 часа до начала визита. Мастер (`MASTER_USER_IDS` / телефон мастера) гарантированно исключается из рассылки.
-- `get_due_retention_reminders(platform: str | None) -> list[dict]`: выборка для удержания клиентов **только по фактически состоявшимся визитам** (`status = 'completed'`). Просроченные неподтверждённые записи и no-show не попадают в рассылку.
-- `mark_reminder_sent(appointment_id: int, reminder_type: str)`: атомарная отметка об отправке напоминания.
+
+- `get_due_evening_reminders(platform=None)` — записи на следующий день (вечернее напоминание).
+- `get_due_confirmation_followup_reminders(platform=None)` — неподтверждённые записи для утреннего запроса.
+- `get_due_2h_reminders(platform=None)` — напоминание за 2 часа; мастер исключается.
+- `get_due_retention_reminders(platform=None)` — удержание только по завершённым визитам (`status = 'completed'`).
+- `mark_reminder_sent(appointment_id, reminder_type)` — атомарная отметка отправки.
 
 ---
 
-### 3.2. `core_bot.services.referrals`
-Единый кроссплатформенный сервис идентификации пользователей, привязки телефона и начисления бонусов.
+### 3.3. `core_bot.services.referrals`
 
-#### Профили и привязка телефона
-- `save_user(telegram_id, vk_id, max_user_id, username, first_name, last_name, phone, domain) -> tuple[int, bool]`:
-  Сохраняет или обновляет профиль клиента в таблице `users`.
-- `link_user_phone(user_identifier: int, phone: str, platform: str) -> tuple[bool, str]`:
-  Привязывает телефон к текущему профилю. Номер телефона не является доказательством личности, поэтому **автоматическое слияние профилей по телефону запрещено**.
-  Если номер уже занят другим профилем, возвращается предупреждение, оба профиля остаются неизменными, а запись можно оформить на указанный номер. Объединение профилей выполняется только вручную мастером после подтверждения владения номером.
-- `is_master_phone(phone) -> bool`: проверяет номер по `MASTER_PHONES`/`MASTER_PHONE` (без хардкода персональных данных в коде).
+Кроссплатформенные профили, привязка телефона, роли и бонусы.
+
+#### Профили
+
+- `save_user(telegram_id, vk_id, max_user_id, username, first_name, last_name, phone, domain)` — создаёт или обновляет клиента.
+- `link_user_phone(user_identifier, phone, platform)` — привязывает номер к текущему профилю. Автоматическое слияние профилей по телефону запрещено: при конфликте возвращается предупреждение, оба профиля остаются неизменными.
+- `is_master_phone(phone)` — проверка номера по `MASTER_PHONES`/`MASTER_PHONE`.
 
 #### Реферальная программа
-- `register_referral(new_user_id, referrer_id, platform="telegram", ...) -> tuple[bool, str, dict | None]`:
-  Регистрирует реферальную связь. Поддерживает как позиционные параметры, так и именованные (`new_user_vk_id`, `referrer_telegram_id` и т.д.).
-- `mark_referral_visited(referral_id: int) -> tuple[bool, str, dict | None]`:
-  Подтверждает визит и начисляет бонус пригласившему (300 ₽).
-- `mark_reward_used(reward_id: int) -> tuple[bool, str, dict | None]`:
-  Списывает бонус в счет оплаты визита.
-- `get_referral_stats(user_id, platform) -> dict`:
-  Возвращает статистику приглашений (`started`, `confirmed`, `active_rewards_sum`, `used_rewards_sum`).
+
+- `register_referral(new_user_id, referrer_id, platform="telegram", ...)` — регистрирует связь.
+- `mark_referral_visited(referral_id)` — подтверждает визит и начисляет бонус пригласившему.
+- `mark_reward_used(reward_id)` — списывает бонус.
+- `get_referral_stats(user_id, platform)` — статистика приглашений и бонусов.
 
 #### Роли и безопасность (RBAC)
-- `get_user_role(platform_user_id, platform) -> str | None`: возвращает `"admin"`, `"master"` или `None`.
-- `is_admin_user(...) -> bool` и `is_master_user(...) -> bool`: проверка прав.
-- `assign_user_role(platform_or_user_id, user_id_or_platform, role="master", permissions="all") -> bool`: назначение роли.
-- `revoke_user_role(...) -> bool`: отзыв роли.
 
----
-
-### 3.3. `core_bot.services.masters` и `core_bot.services.masters_sync`
-Интеграция с Masters CRM (`prod.mastersapp.ru` и `mst.link`).
-
-- `SERVICES`: единый словарь услуг, их длительности и стоимости.
-- `calculate_services(selected_keys) -> dict`: суммирует время и стоимость выбранного набора процедур.
-- `get_schedule(selected_keys) -> dict`: обращается к API Masters CRM для получения свободных слотов.
-- `initiate_booking(phone, selected_keys, timestamp, client_name="") -> tuple[bool, str, dict | None]`:
-  Инициирует процесс бронирования слота в Masters:
-  - Защита от самозаписи: блокирует попытки записи на телефон самого мастера (`+79173225155`).
-  - **Существующие клиенты CRM (`move_to_url`)**: Masters автоматически распознает зарегистрированных клиентов и перенаправляет на шаг комментария без отправки СМС. Бот автоматически отправляет форму с сохранением имени клиента из CRM, возвращая `session_data["needs_sms"] = False` и `appointment_id`. Клиент записывается мгновенно в 1 клик!
-  - **Новые клиенты (`verify_url`)**: Masters отправляет 4-значный СМС-код. Бот возвращает `session_data["needs_sms"] = True` и запрашивает код у пользователя.
-- `confirm_sms_code(session_data, code) -> tuple[bool, str]`:
-  Подтверждает 4-значный код СМС на странице `/verify`. При редиректе на форму комментария (`/comment`) автоматически финализирует её, извлекая `appointment_id` со страницы подтверждения (`/finish`).
-- `sync_masters_appointments() -> tuple[int, int]`:
-  Периодический воркер (каждые 15 минут), выгружающий новые и измененные записи из Masters CRM в базу данных ботов с сохранением связей платформ.
-- `confirm_masters_appointment`, `cancel_masters_appointment`, `complete_masters_appointment`, `reschedule_masters_appointment`:
-  Двусторонняя передача статусов из ботов в Masters CRM через HTTP-запросы.
+- `get_user_role(platform_user_id, platform)`
+- `is_admin_user(...)`, `is_master_user(...)`
+- `assign_user_role(...)`, `revoke_user_role(...)`
 
 ---
 
 ### 3.4. `core_bot.services.client_import`
-Массовый импорт базы клиентов.
 
-- `import_clients_from_file(file_path: Path) -> tuple[int, int, list[str]]`:
-  Универсальный парсер файлов `.xlsx` (Excel), `.csv` и `.json`. Выполняет валидацию номеров телефонов, дедупликацию и сохранение в таблицу `users`.
+Массовый импорт клиентов из `.csv`, `.xlsx` и текста.
+
+- `import_clients_from_file(filename, file_bytes) -> tuple[int, int, str]` — определяет формат, валидирует телефоны, дедуплицирует и сохраняет клиентов.
+- `import_clients_from_text(raw_text) -> tuple[int, int, str]` — импорт из строк «Имя + телефон».
+- `import_clients_from_rows(rows) -> tuple[int, int, str]` — общая обработка таблиц.
+- `get_clients_stats()`, `get_clients_page(...)` — статистика и постраничный список клиентов для админки.
+- `update_appointment_client_details(appointment_id, name, phone)` — обновление контактов в записи.
+
+---
+
+### 3.5. Сайт «Срез» (`hair_site`)
+
+Сайт использует те же правила, что и боты, через общий PostgreSQL.
+
+| Endpoint | Назначение |
+| --- | --- |
+| `GET /api/slots?services=hair,beard` | 14 дней с расписанием и доступностью слотов; учитывает `master_schedule`, длительность услуг и занятые интервалы. |
+| `POST /api/appointments` | Создание записи с проверкой рабочих часов и пересечений под advisory-lock; возвращает `409`, если слот занят. |
+| `GET /api/crm/appointments` | Список записей для CRM с `duration_min` и `notes`. |
+| `POST /api/crm/appointments` | Ручная запись мастера с теми же проверками. |
+
+Уведомления мастеру отправляются через Telegram Bot API при наличии `TELEGRAM_BOT_TOKEN` и `MASTER_CHAT_IDS`. Секреты и строка подключения берутся только из переменных окружения.
 
 ---
 
 ## 4. Тестирование и гарантии качества
 
-Все тесты изолированы, используют временные базы данных и независимы от внешней сети:
+Все тесты изолированы, используют временные базы данных и не требуют сети:
+
 ```bash
-# Запуск полного набора тестов в Telegram-боте (35 тестов)
+# Telegram
 bot_booking/.venv/bin/python3 -m unittest discover tests
 
-# Запуск полного набора тестов в VK-боте (34 теста)
+# VK
 bot_VK_booking/.venv/bin/python3 -m unittest discover tests
 
-# Запуск полного набора тестов в MAX-боте (35 тестов)
+# MAX
 bot_Max_booking/.venv/bin/python3 -m unittest discover tests
 ```
 
 Покрытие включает:
-- Проверку точности конвертации часовых поясов (UTC+4);
-- Сохранение платформы и идентификатора клиента при синхронизации Masters CRM;
-- Изоляцию профилей при конфликте телефона: автоматического слияния нет, чужие записи и бонусы не переносятся;
-- Защиту от IDOR: клиент не может управлять чужой записью, `user_id`-fallback работает только для импортированных из Masters записей;
-- Fail-closed поведение при недоступности PostgreSQL с запрещённым SQLite fallback;
-- Исключение мастера из клиентских напоминаний;
-- Retention-рассылку только по завершённым визитам;
-- Идемпотентность и динамическое применение миграций БД;
-- Обработку сценариев бронирования: без СМС (`move_to_url`), с подтверждением по СМС и обработку ошибок занятости слотов.
+
+- конвертацию часовых поясов (UTC+4);
+- единый каталог услуг, длительности и стоимости;
+- расписание из `master_schedule` и стандартную сетку вторник/суббота;
+- запрет пересекающихся записей с учётом длительности услуги;
+- идемпотентность повторной записи и сохранение завершённых визитов;
+- изоляцию профилей при конфликте телефона (без автоматического слияния);
+- защиту от IDOR: клиент не управляет чужой записью;
+- fail-closed поведение при недоступном PostgreSQL;
+- исключение мастера из клиентских напоминаний;
+- retention-рассылку только по завершённым визитам;
+- идемпотентность и динамическое применение миграций;
+- сценарии бронирования без SMS и обработку занятых слотов.

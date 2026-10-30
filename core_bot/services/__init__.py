@@ -1,14 +1,12 @@
 from core_bot.services.appointments import (
     SARATOV_TZ,
+    SlotUnavailableError,
     adjust_master_day_hours,
     cancel_appointment,
     complete_appointment,
     confirm_appointment_by_client,
-    confirm_manual_appointment_masters_sms,
     create_manual_appointment,
     create_or_update_appointment,
-    pending_manual_bookings,
-    set_appointment_masters_id,
     get_appointment,
     get_appointments_counts,
     get_current_saratov_time,
@@ -27,24 +25,14 @@ from core_bot.services.appointments import (
     set_master_day_schedule,
     update_appointment_price_and_service,
 )
-from core_bot.services.client_import import import_clients_from_file
-from core_bot.services.masters import (
+from core_bot.services.booking import (
     SERVICES,
     calculate_services,
-    confirm_sms_code,
     get_schedule,
     get_service_options_for_creation,
-    initiate_booking,
     map_service_name_to_keys,
 )
-from core_bot.services.masters_sync import (
-    cancel_masters_appointment,
-    complete_masters_appointment,
-    confirm_masters_appointment,
-    create_masters_appointment,
-    reschedule_masters_appointment,
-    sync_masters_appointments,
-)
+from core_bot.services.client_import import import_clients_from_file
 from core_bot.services.recommendations import (
     format_vk_text,
     get_article,
@@ -89,6 +77,7 @@ get_appointment_by_id = get_appointment
 __all__ = [
     # Appointments
     "SARATOV_TZ",
+    "SlotUnavailableError",
     "get_current_saratov_time",
     "parse_to_saratov",
     "create_or_update_appointment",
@@ -104,9 +93,6 @@ __all__ = [
     "get_appointments_counts",
     "get_master_appointments",
     "create_manual_appointment",
-    "confirm_manual_appointment_masters_sms",
-    "pending_manual_bookings",
-    "set_appointment_masters_id",
     "get_master_day_schedule",
     "get_day_time_slots_status",
     "set_master_day_schedule",
@@ -117,21 +103,12 @@ __all__ = [
     "get_due_2h_reminders",
     "get_due_retention_reminders",
     "mark_reminder_sent",
-    # Masters CRM
+    # Services & schedule
     "SERVICES",
     "get_service_options_for_creation",
     "calculate_services",
     "get_schedule",
-    "initiate_booking",
-    "confirm_sms_code",
     "map_service_name_to_keys",
-    # Masters Sync
-    "sync_masters_appointments",
-    "confirm_masters_appointment",
-    "cancel_masters_appointment",
-    "complete_masters_appointment",
-    "reschedule_masters_appointment",
-    "create_masters_appointment",
     # Client Import
     "import_clients_from_file",
     # Recommendations

@@ -14,7 +14,6 @@ from services.appointments import (
     get_due_retention_reminders,
     mark_reminder_sent,
 )
-from services.masters_sync import sync_masters_appointments
 
 logger = logging.getLogger(__name__)
 
@@ -298,18 +297,6 @@ async def run_reminder_worker(bot: Bot, platform: str = "telegram"):
                     logger.info("Отправлено retention напоминание клиенту #%s (appt #%s)", target_user_id, appt["id"])
                 except Exception as send_err:
                     logger.warning("Ошибка отправки retention напоминания #%s: %s", appt["id"], send_err)
-
-            # 5. Periodic Masters sync every ~10 minutes (10 ticks * 60s)
-            sync_counter += 1
-            if sync_counter >= 10:
-                sync_counter = 0
-                if platform == "telegram":
-                    try:
-                        ok, count, msg = sync_masters_appointments()
-                        if ok and count > 0:
-                            logger.info("Фоновая синхронизация Masters: %s", msg)
-                    except Exception as sync_err:
-                        logger.warning("Ошибка фоновой синхронизации Masters: %s", sync_err)
 
         except Exception as e:
             logger.error("Ошибка в цикле reminder worker: %s", e)

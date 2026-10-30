@@ -55,6 +55,16 @@ from services.referrals import (
 )
 
 
+def next_working_datetime(start_in_days: int = 1) -> datetime.datetime:
+    """Returns 14:00 Saratov time on the next Tuesday/Saturday."""
+    now = datetime.datetime.now()
+    for offset in range(start_in_days, start_in_days + 30):
+        candidate = now + datetime.timedelta(days=offset)
+        if candidate.weekday() in (1, 5):
+            return candidate.replace(hour=14, minute=0, second=0, microsecond=0)
+    return now + datetime.timedelta(days=start_in_days)
+
+
 class TestBookingBot(unittest.IsolatedAsyncioTestCase):
     @classmethod
     def setUpClass(cls):
@@ -69,7 +79,9 @@ class TestBookingBot(unittest.IsolatedAsyncioTestCase):
             conn.execute("DELETE FROM rewards")
             conn.execute("DELETE FROM referrals")
             conn.execute("DELETE FROM users")
-            conn.execute("DELETE FROM masters_session")
+            conn.execute("DELETE FROM appointments")
+            conn.execute("DELETE FROM master_schedule")
+            conn.execute("DELETE FROM user_roles")
 
     def test_database_and_referral_cycle(self):
         # 1. Save referrer
@@ -373,36 +385,36 @@ class TestBookingBot(unittest.IsolatedAsyncioTestCase):
         upcoming_past = get_user_upcoming_appointments(platform="telegram", platform_user_id=123456)
         self.assertNotIn(past_id, [a["id"] for a in upcoming_past])
 
-    def test_masters_session_and_phone_formatting(self):
-        from services.masters_sync import (
-            format_master_phone,
-            get_active_masters_session,
-            disconnect_masters_session,
+    def test_booking_catalog_and_schedule(self):
+        from services.booking import (
+            calculate_services,
+            get_day_schedule,
+            get_days_schedule,
+            map_service_name_to_keys,
+            service_duration_minutes,
         )
-        from database import get_connection
 
-        self.assertEqual(format_master_phone("+79991234567"), "(999) 123-45-67")
-        self.assertEqual(format_master_phone("89991234567"), "(999) 123-45-67")
+        calc = calculate_services(["hair", "beard"])
+        self.assertEqual(calc["total_price"], 3000)
+        self.assertEqual(calc["duration_minutes"], 135)
+        self.assertEqual(calc["duration_text"], "2 ч 15 мин")
 
-        with get_connection() as conn:
-            conn.execute("DELETE FROM masters_session")
-            conn.commit()
+        self.assertEqual(service_duration_minutes("Стрижка + Борода"), 135)
+        self.assertEqual(service_duration_minutes("Оформление бороды"), 60)
+        self.assertEqual(service_duration_minutes("Мужская стрижка"), 75)
 
-        self.assertIsNone(get_active_masters_session())
+        self.assertEqual(map_service_name_to_keys("Стрижка (МУЖСКАЯ)"), ["hair"])
+        self.assertEqual(map_service_name_to_keys("Оформление бороды"), ["beard"])
+        self.assertEqual(map_service_name_to_keys("Стрижка + Борода"), ["combo"])
+        self.assertEqual(map_service_name_to_keys("Неизвестная услуга"), ["hair"])
 
-        with get_connection() as conn:
-            conn.execute(
-                "INSERT INTO masters_session (cookie_phpsessid, master_phone, is_active) VALUES (%s, %s, %s)",
-                ("test_session_token", "+79991234567", True if conn.is_pg else 1),
-            )
-            conn.commit()
+        days = get_days_schedule(["hair"], days_count=14)
+        self.assertEqual(len(days), 14)
+        self.assertTrue(all("slots" in day for day in days))
 
-        session = get_active_masters_session()
-        self.assertIsNotNone(session)
-        self.assertEqual(session["master_phone"], "+79991234567")
-
-        disconnect_masters_session()
-        self.assertIsNone(get_active_masters_session())
+        # Tuesday is a working day by default, Sunday is a day off.
+        self.assertTrue(get_day_schedule("2026-11-17")["is_working"])
+        self.assertFalse(get_day_schedule("2026-11-15")["is_working"])
 
     def test_broadcast_recipients(self):
         from services.referrals import get_broadcast_recipients, save_user
@@ -470,61 +482,57 @@ class TestBookingBot(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(ok_conf_again)
         self.assertIn("отменена", msg_conf)
 
-    def test_masters_confirm_and_cancel_sync(self):
-        from unittest.mock import MagicMock, patch
-        from services.masters_sync import (
-            confirm_masters_appointment,
-            cancel_masters_appointment,
-            disconnect_masters_session,
+    def test_overlapping_booking_is_rejected(self):
+        from services.appointments import (
+            SlotUnavailableError,
+            create_or_update_appointment,
+            get_appointment,
         )
-        from database import get_connection
 
-        # Ensure no active session
-        disconnect_masters_session()
+        base = (datetime.datetime.now() + datetime.timedelta(days=30)).replace(
+            hour=12, minute=0, second=0, microsecond=0
+        )
+        first_id = create_or_update_appointment(
+            phone="+79995550001",
+            appointment_time=base,
+            services="Стрижка + Борода",
+            total_price=3000,
+            client_name="Первый Клиент",
+            duration_min=135,
+        )
+        self.assertIsNotNone(get_appointment(first_id))
 
-        test_appt = {
-            "id": 999111,
-            "masters_id": "test_m_123",
-            "phone": "+79991234567",
-            "appointment_time": datetime.datetime.now(),
-        }
-
-        # Without active session -> returns False with warning
-        ok_c, msg_c = confirm_masters_appointment(test_appt)
-        self.assertFalse(ok_c)
-        self.assertIn("не подключена", msg_c)
-
-        ok_d, msg_d = cancel_masters_appointment(test_appt)
-        self.assertFalse(ok_d)
-        self.assertIn("не подключена", msg_d)
-
-        # Now insert active session
-        with get_connection() as conn:
-            conn.execute(
-                "INSERT INTO masters_session (cookie_phpsessid, cookie_csrf, master_phone, is_active) VALUES (%s, %s, %s, %s)",
-                ("dummy_sess", "dummy_csrf", "+79991234567", True if conn.is_pg else 1),
+        with self.assertRaises(SlotUnavailableError):
+            create_or_update_appointment(
+                phone="+79995550002",
+                appointment_time=base + datetime.timedelta(minutes=75),
+                services="Мужская стрижка",
+                total_price=2300,
+                client_name="Второй Клиент",
+                duration_min=75,
             )
-            conn.commit()
 
-        # Mock urllib opener to return successful response
-        mock_resp = MagicMock()
-        mock_resp.status = 200
-        mock_opener = MagicMock()
-        mock_opener.open.return_value.__enter__.return_value = mock_resp
+        # A slot after the combo ends is free again.
+        second_id = create_or_update_appointment(
+            phone="+79995550002",
+            appointment_time=base + datetime.timedelta(minutes=135),
+            services="Мужская стрижка",
+            total_price=2300,
+            client_name="Второй Клиент",
+            duration_min=75,
+        )
+        self.assertIsNotNone(get_appointment(second_id))
 
-        with patch("services.masters_sync._get_masters_opener", return_value=(mock_opener, "dummy_csrf")):
-            # Test confirm with active session
-            ok_conf, msg_conf = confirm_masters_appointment(test_appt)
-            self.assertTrue(ok_conf)
-            self.assertIn("успешно подтверждена", msg_conf)
-
-            # Test cancel with active session
-            ok_canc, msg_canc = cancel_masters_appointment(test_appt)
-            self.assertTrue(ok_canc)
-            self.assertIn("успешно отменена", msg_canc)
-
-        # Cleanup session
-        disconnect_masters_session()
+        # Repeating the same client + slot is idempotent.
+        repeated_id = create_or_update_appointment(
+            phone="+79995550002",
+            appointment_time=base + datetime.timedelta(minutes=135),
+            services="Мужская стрижка",
+            total_price=2300,
+            client_name="Второй Клиент",
+            duration_min=75,
+        )
+        self.assertEqual(second_id, repeated_id)
 
     def test_master_complete_appointment_auto_rewards_referral(self):
         from services.appointments import complete_appointment, create_manual_appointment, get_appointment
@@ -546,7 +554,6 @@ class TestBookingBot(unittest.IsolatedAsyncioTestCase):
             total_price=1000,
             client_name="Friend Guy",
             platform="telegram",
-            sync_to_masters=False,
         )
         self.assertTrue(ok_cr)
         self.assertIsNotNone(appt_id)
@@ -573,158 +580,77 @@ class TestBookingBot(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(rewards[0]["user_db_id"], ref_id)
         self.assertEqual(rewards[0]["amount"], 300)
 
-    def test_manual_appointment_masters_sync_flow(self):
-        from services.appointments import (
-            confirm_manual_appointment_masters_sms,
-            create_manual_appointment,
-            get_appointment,
-            pending_manual_bookings,
-        )
-        from services.masters import map_service_name_to_keys
+    def test_manual_appointment_flow(self):
+        from services.appointments import create_manual_appointment, get_appointment
+        from services.booking import map_service_name_to_keys
 
-        # Service name mapping for Masters public booking flow
         self.assertEqual(map_service_name_to_keys("Стрижка (МУЖСКАЯ)"), ["hair"])
         self.assertEqual(map_service_name_to_keys("Оформление бороды"), ["beard"])
-        self.assertEqual(map_service_name_to_keys("Стрижка + Борода"), ["hair", "beard"])
+        self.assertEqual(map_service_name_to_keys("Стрижка + Борода"), ["combo"])
         self.assertEqual(map_service_name_to_keys("Моделирование бороды VIP"), ["beard"])
-        self.assertEqual(map_service_name_to_keys("Что-то неизвестное"), [])
+        self.assertEqual(map_service_name_to_keys("Что-то неизвестное"), ["hair"])
 
-        # Creation without Masters sync must not touch the network and must succeed
-        appt_time = datetime.datetime.now() + datetime.timedelta(days=2)
+        appt_time = (datetime.datetime.now() + datetime.timedelta(days=2)).replace(
+            hour=14, minute=0, second=0, microsecond=0
+        )
         ok, msg, appt_id = create_manual_appointment(
             phone="+79175554433",
             appointment_time=appt_time,
             services="Стрижка (МУЖСКАЯ)",
             total_price=2300,
-            client_name="Тест Синхронизации",
-            sync_to_masters=False,
+            client_name="Тест Записи",
+            duration_min=75,
         )
-        self.assertTrue(ok)
+        self.assertTrue(ok, msg)
         self.assertIsNotNone(appt_id)
-        self.assertNotIn(appt_id, pending_manual_bookings)
         self.assertIsNotNone(get_appointment(appt_id))
 
-        # Confirming SMS for a booking that is not pending must fail gracefully
-        ok_sms, msg_sms = confirm_manual_appointment_masters_sms(appt_id, "1234")
-        self.assertFalse(ok_sms)
-        self.assertIn("ожидающей", msg_sms)
-
-    def test_masters_clients_import(self):
-        import io
-        import zipfile
-
-        from services.client_import import (
-            import_masters_clients,
-            parse_masters_clients_xlsx,
+        # The same interval cannot be taken by a second manual booking.
+        ok_dup, msg_dup, dup_id = create_manual_appointment(
+            phone="+79175554434",
+            appointment_time=appt_time,
+            services="Оформление бороды",
+            total_price=700,
+            client_name="Другой Клиент",
+            duration_min=60,
         )
+        self.assertFalse(ok_dup)
+        self.assertIsNone(dup_id)
+        self.assertIn("занято", msg_dup.lower())
 
-        def col_letter(idx: int) -> str:
-            s = ""
-            idx += 1
-            while idx:
-                idx, r = divmod(idx - 1, 26)
-                s = chr(65 + r) + s
-            return s
+    def test_generic_clients_import(self):
+        from services.client_import import import_clients_from_file
 
-        grid = [
-            ["№", "Фамилия", "Имя", "Телефон", "Группы", "Email"],
-            ["1", "Тестов", "Пётр", "79990001122", "“Спящие” клиенты", "test@example.com"],
-            ["2", "", "Ольга", "79990003344", "", ""],
-        ]
+        csv_data = (
+            "Имя;Телефон\n"
+            "Пётр Тестов;79990001122\n"
+            "Ольга;79990003344\n"
+        ).encode("utf-8")
 
-        rows_xml = []
-        for r, row in enumerate(grid, start=1):
-            cells = []
-            for c, val in enumerate(row):
-                ref = f"{col_letter(c)}{r}"
-                val_esc = (
-                    val.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-                )
-                cells.append(f'<c r="{ref}" t="inlineStr"><is><t>{val_esc}</t></is></c>')
-            rows_xml.append(f'<row r="{r}">{"".join(cells)}</row>')
-
-        buf = io.BytesIO()
-        with zipfile.ZipFile(buf, "w") as zf:
-            zf.writestr(
-                "[Content_Types].xml",
-                '<?xml version="1.0" encoding="UTF-8"?>'
-                '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
-                '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
-                '<Default Extension="xml" ContentType="application/xml"/>'
-                '<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>'
-                '<Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>'
-                "</Types>",
-            )
-            zf.writestr(
-                "_rels/.rels",
-                '<?xml version="1.0" encoding="UTF-8"?>'
-                '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
-                '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>'
-                "</Relationships>",
-            )
-            zf.writestr(
-                "xl/workbook.xml",
-                '<?xml version="1.0" encoding="UTF-8"?>'
-                '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
-                'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
-                '<sheets><sheet name="Клиенты" sheetId="1" r:id="rId1"/></sheets>'
-                "</workbook>",
-            )
-            zf.writestr(
-                "xl/_rels/workbook.xml.rels",
-                '<?xml version="1.0" encoding="UTF-8"?>'
-                '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
-                '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>'
-                "</Relationships>",
-            )
-            zf.writestr(
-                "xl/worksheets/sheet1.xml",
-                '<?xml version="1.0" encoding="UTF-8"?>'
-                '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
-                f'<sheetData>{"".join(rows_xml)}</sheetData></worksheet>',
-            )
-
-        clients = parse_masters_clients_xlsx(buf.getvalue())
-        self.assertEqual(len(clients), 2)
-        self.assertEqual(clients[0]["first_name"], "Пётр")
-        self.assertEqual(clients[0]["last_name"], "Тестов")
-        self.assertEqual(clients[0]["phone"], "79990001122")
-        self.assertEqual(clients[0]["masters_group"], "“Спящие” клиенты")
-        self.assertEqual(clients[0]["email"], "test@example.com")
-        self.assertEqual(clients[1]["first_name"], "Ольга")
-
-        # Pre-create a user with junk numeric name (as left by a bad CSV import)
-        with get_connection() as conn:
-            conn.execute("DELETE FROM users WHERE phone = %s", ("+79990001122",))
-            conn.execute(
-                "INSERT INTO users (phone, first_name, last_name) VALUES (%s, %s, %s)",
-                ("+79990001122", "77", "Тестов"),
-            )
-            conn.commit()
-
-        added, updated, msg = import_masters_clients(clients)
-        self.assertEqual(added, 1)
-        self.assertEqual(updated, 1)
+        added, updated, msg = import_clients_from_file("clients.csv", csv_data)
+        self.assertEqual(added, 2)
+        self.assertEqual(updated, 0)
+        self.assertIn("Обработано клиентов: 2", msg)
 
         with get_connection() as conn:
             row = conn.execute(
-                "SELECT first_name, last_name, masters_group, email FROM users WHERE phone = %s",
+                "SELECT first_name, last_name FROM users WHERE phone = %s",
                 ("+79990001122",),
             ).fetchone()
-        # Junk numeric first_name must be replaced with the Masters value
-        self.assertEqual(row["first_name"], "Пётр")
-        self.assertEqual(row["masters_group"], "“Спящие” клиенты")
-        self.assertEqual(row["email"], "test@example.com")
+            self.assertEqual(row["first_name"], "Пётр")
+            self.assertEqual(row["last_name"], "Тестов")
 
-        row2_exists = False
-        with get_connection() as conn:
-            row2_exists = conn.execute(
-                "SELECT id FROM users WHERE phone = %s", ("+79990003344",)
-            ).fetchone() is not None
-            # cleanup
-            conn.execute("DELETE FROM users WHERE phone IN (%s, %s)", ("+79990001122", "+79990003344"))
+            row2 = conn.execute(
+                "SELECT first_name FROM users WHERE phone = %s",
+                ("+79990003344",),
+            ).fetchone()
+            self.assertEqual(row2["first_name"], "Ольга")
+
+            conn.execute(
+                "DELETE FROM users WHERE phone IN (%s, %s)",
+                ("+79990001122", "+79990003344"),
+            )
             conn.commit()
-        self.assertTrue(row2_exists)
 
     def test_admin_screen_fallback_on_old_message(self):
         from aiogram.exceptions import TelegramBadRequest
@@ -771,10 +697,9 @@ class TestBookingBot(unittest.IsolatedAsyncioTestCase):
             services="Стрижка бороды",
             total_price=600,
             client_name="Test Resched",
-            sync_to_masters=False,
         )
 
-        new_time = datetime.datetime.now() + datetime.timedelta(days=3, hours=2)
+        new_time = next_working_datetime(3)
         resched_ok, resched_msg, updated = reschedule_appointment(appt_id, new_time)
         self.assertTrue(resched_ok)
 
@@ -791,10 +716,10 @@ class TestBookingBot(unittest.IsolatedAsyncioTestCase):
             set_master_day_schedule,
         )
 
-        tuesday_day = "2026-11-17"  # Tuesday (working in Masters)
+        tuesday_day = "2026-11-17"  # Tuesday (working day)
         sunday_day = "2026-11-15"   # Sunday (day off)
 
-        # 1. Default schedule from Masters: Tuesday is working, Sunday is day off
+        # 1. Default schedule: Tuesday is working, Sunday is day off
         tue_sched = get_master_day_schedule(tuesday_day)
         self.assertTrue(tue_sched["is_working"])
         self.assertEqual(tue_sched["start_time"], "10:00")
@@ -836,22 +761,28 @@ class TestBookingBot(unittest.IsolatedAsyncioTestCase):
         revoke_user_role("telegram", user_id)
         self.assertFalse(is_master_user(user_id, platform="telegram"))
 
-    def test_client_import_and_masters_services(self):
+    def test_client_import_and_services(self):
         from services.client_import import (
             get_clients_page,
             get_clients_stats,
             import_clients_from_text,
             update_appointment_client_details,
         )
-        from services.masters import get_service_options_for_creation
-        from services.appointments import create_or_update_appointment, get_appointment
+        from services.booking import get_service_options_for_creation
+        from services.appointments import (
+            create_or_update_appointment,
+            get_appointment,
+            update_appointment_price_and_service,
+        )
 
-        # 1. Services
+        # 1. Service catalog
         opts = get_service_options_for_creation()
         names = [o["name"] for o in opts]
         prices = [o["price"] for o in opts]
-        self.assertIn("Стрижка (МУЖСКАЯ)", names)
+        self.assertIn("Мужская стрижка", names)
+        self.assertIn("Стрижка + Борода", names)
         self.assertIn(2300, prices)
+        self.assertIn(3000, prices)
         self.assertNotIn(1000, prices)
 
         # 2. Text import
@@ -868,71 +799,51 @@ class TestBookingBot(unittest.IsolatedAsyncioTestCase):
         clients, total = get_clients_page(search="Дмитрий")
         self.assertTrue(any("Дмитрий" in (c["first_name"] or "") for c in clients))
 
-        # 3. Create appointment with generic name then update client details
-        now = datetime.datetime.now(datetime.timezone.utc)
+        # 3. Create appointment with a generic name, then fill in client details
+        appt_time = (datetime.datetime.now() + datetime.timedelta(days=4)).replace(
+            hour=12, minute=0, second=0, microsecond=0
+        )
         appt_id = create_or_update_appointment(
-            masters_id="mst_test_import_99",
-            appointment_time=now + datetime.timedelta(days=1),
-            services="Стрижка (МУЖСКАЯ)",
+            appointment_time=appt_time,
+            services="Мужская стрижка",
             total_price=2300,
-            client_name="Клиент (Masters)",
+            client_name="Клиент",
             phone="+79270001122",
             platform="telegram",
         )
         ok, umsg = update_appointment_client_details(appt_id, "Дмитрий Смирнов", "+79270001122")
-        self.assertTrue(ok)
+        self.assertTrue(ok, umsg)
         appt = get_appointment(appt_id)
         self.assertEqual(appt["client_name"], "Дмитрий Смирнов")
 
-        # 4. Re-sync from masters with placeholder must NOT overwrite custom client name
+        # 4. A repeated generic submission must not overwrite the real name.
         create_or_update_appointment(
-            masters_id="mst_test_import_99",
-            appointment_time=now + datetime.timedelta(days=1),
-            services="Стрижка (МУЖСКАЯ)",
+            appointment_time=appt_time,
+            services="Мужская стрижка",
             total_price=2300,
-            client_name="Клиент (Masters)",
-            phone=TEST_MASTER_PHONE,
+            client_name="Клиент",
+            phone="+79270001122",
             platform="telegram",
         )
         appt_after = get_appointment(appt_id)
         self.assertEqual(appt_after["client_name"], "Дмитрий Смирнов")
         self.assertEqual(appt_after["phone"], "+79270001122")
 
-        # 5. Price update and preservation
-        from services.appointments import update_appointment_price_and_service
-        ok_p, p_msg, p_appt = update_appointment_price_and_service(appt_id, 700, "Оформление бороды")
-        self.assertTrue(ok_p)
+        # 5. Price and service update
+        ok_p, p_msg, p_appt = update_appointment_price_and_service(
+            appt_id, 700, "Оформление бороды"
+        )
+        self.assertTrue(ok_p, p_msg)
         self.assertEqual(p_appt["total_price"], 700)
         self.assertEqual(p_appt["services"], "Оформление бороды")
 
-        # Background masters sync must NOT overwrite this custom price back to 2300
-        create_or_update_appointment(
-            masters_id="mst_test_import_99",
-            appointment_time=now + datetime.timedelta(days=1),
-            services="Стрижка (МУЖСКАЯ)",
-            total_price=2300,
-            client_name="Клиент (Masters)",
-            phone=TEST_MASTER_PHONE,
-            platform="masters",
-        )
-        appt_final = get_appointment(appt_id)
-        self.assertEqual(appt_final["total_price"], 700)
-        self.assertEqual(appt_final["services"], "Оформление бороды")
-
-    def test_link_user_phone_auto_creation_and_master_phone_prevention(self):
+    def test_link_user_phone_auto_creation(self):
         from services.referrals import link_user_phone, get_user_phone
-        from services.masters import initiate_booking
 
-        # 1. Non-existent user sends phone -> should auto-create unified user and succeed
+        # Non-existent user sends phone -> auto-create unified user and succeed
         success, msg = link_user_phone(999888, "+7 (999) 111-22-33", platform="telegram")
         self.assertTrue(success)
         self.assertEqual(get_user_phone(999888, platform="telegram"), "+79991112233")
-
-        # 2. Master's own phone prevention
-        ok, error_msg, session_data = initiate_booking(TEST_MASTER_PHONE, {"hair"}, int(datetime.datetime.now().timestamp()))
-        self.assertFalse(ok)
-        self.assertIn("номер самого мастера", error_msg)
-        self.assertIsNone(session_data)
 
     def test_timezone_conversion_precision(self):
         from services.appointments import SARATOV_TZ, parse_to_saratov, create_or_update_appointment, get_appointment
@@ -966,44 +877,43 @@ class TestBookingBot(unittest.IsolatedAsyncioTestCase):
             total_price=2300,
             client_name="Тест Часового Пояса",
             platform="telegram",
-            masters_id="mst_tz_test_1",
         )
         saved = get_appointment(appt_id)
         saved_dt = parse_to_saratov(saved["appointment_time"])
         self.assertEqual(saved_dt.hour, 15)
 
-    def test_masters_sync_platform_and_user_preservation(self):
+    def test_create_or_update_platform_preservation(self):
         from services.appointments import create_or_update_appointment, get_appointment
 
-        # 1. Book appointment via Telegram with user_id=123456
-        appt_time = datetime.datetime(2026, 11, 5, 14, 0, 0)
+        appt_time = (datetime.datetime.now() + datetime.timedelta(days=6)).replace(
+            hour=14, minute=0, second=0, microsecond=0
+        )
         appt_id = create_or_update_appointment(
             phone="+79271112233",
             appointment_time=appt_time,
-            services="Стрижка",
+            services="Мужская стрижка",
             total_price=2300,
             client_name="Иван Клиент",
             platform="telegram",
             platform_user_id=123456,
-            masters_id="mst_sync_preserve_99",
         )
         first_state = get_appointment(appt_id)
         self.assertEqual(first_state["platform"], "telegram")
         self.assertEqual(first_state["platform_user_id"], 123456)
 
-        # 2. Background Masters sync runs with platform='masters' and platform_user_id=0
-        create_or_update_appointment(
-            phone="",
+        # Repeated submission for the same client and slot updates the same row
+        # and keeps the platform identity for reminders.
+        repeated_id = create_or_update_appointment(
+            phone="+79271112233",
             appointment_time=appt_time,
-            services="Стрижка",
+            services="Мужская стрижка",
             total_price=2300,
-            client_name="Клиент (Masters)",
-            platform="masters",
-            platform_user_id=0,
-            masters_id="mst_sync_preserve_99",
+            client_name="Иван Клиент",
+            platform="telegram",
+            platform_user_id=123456,
         )
+        self.assertEqual(appt_id, repeated_id)
         second_state = get_appointment(appt_id)
-        # Platform and user_id must remain preserved for Telegram reminders!
         self.assertEqual(second_state["platform"], "telegram")
         self.assertEqual(second_state["platform_user_id"], 123456)
         self.assertEqual(second_state["client_name"], "Иван Клиент")
@@ -1024,7 +934,7 @@ class TestBookingBot(unittest.IsolatedAsyncioTestCase):
             platform="telegram",
             platform_user_id=777001,
         )
-        # Create user B (has phone from Masters or VK)
+        # Create user B (has a phone from VK)
         user_b_id, _ = save_user(telegram_id=888002, phone="+79997778899", first_name="UserB")
 
         # User A enters a phone that belongs to User B. Accounts must NOT be merged
@@ -1062,134 +972,46 @@ class TestBookingBot(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(_resolve_platform_user_id(appt_vk_master, "vk"))
 
 
-    def test_initiate_booking_existing_client_move_to_url(self):
-        from unittest.mock import patch, MagicMock
-        from services.masters import initiate_booking
+    def test_direct_booking_flow(self):
+        from services.appointments import (
+            SlotUnavailableError,
+            create_or_update_appointment,
+            get_appointment,
+        )
+        from services.booking import get_schedule
 
-        class DummyResponse:
-            def __init__(self, data: bytes, url: str):
-                self._data = data
-                self._url = url
+        # Schedule from the shared DB
+        sched = get_schedule(["hair"])
+        self.assertIsInstance(sched, dict)
 
-            def read(self):
-                return self._data
+        # Direct booking without any SMS step
+        base = (datetime.datetime.now() + datetime.timedelta(days=20)).replace(
+            hour=13, minute=0, second=0, microsecond=0
+        )
+        appt_id = create_or_update_appointment(
+            phone="+79991234567",
+            appointment_time=base,
+            services="Мужская стрижка",
+            total_price=2300,
+            client_name="Alexander",
+            platform="telegram",
+            platform_user_id=555,
+        )
+        appt = get_appointment(appt_id)
+        self.assertEqual(appt["phone"], "+79991234567")
+        self.assertFalse(bool(appt["client_confirmed"]))
 
-            def geturl(self):
-                return self._url
-
-        mock_opener = MagicMock()
-
-        def fake_open(req, timeout=10):
-            url = req.get_full_url() if hasattr(req, "get_full_url") else str(req)
-            if "/price" in url and "services=" not in url:
-                return DummyResponse(b'var ONLINE_CID = "test_cid";', url)
-            elif "/price" in url:
-                return DummyResponse(b"OK", url)
-            elif "/times" in url:
-                return DummyResponse(b'<form action="/boris_gafurov/phone?test_cid"></form>', url)
-            elif "/phone" in url:
-                return DummyResponse(b'{"move_to_url": "/boris_gafurov/comment?cid=test_cid"}', url)
-            elif "/comment" in url:
-                if hasattr(req, "data") and req.data:
-                    return DummyResponse(b"<html>Done</html>", "https://mst.link/boris_gafurov/finish?id=APPT-TEST-123")
-                else:
-                    return DummyResponse(b'<form id="online-info-form"><input name="_csrf" value="csrf123"/><input name="OnlineInfoForm[firstname]" value="Alexander"/></form>', url)
-            return DummyResponse(b"", url)
-
-        mock_opener.open.side_effect = fake_open
-
-        with patch("urllib.request.build_opener", return_value=mock_opener):
-            ok, msg, session_data = initiate_booking("+79991234567", {"hair"}, 1700000000, client_name="Alexander")
-            self.assertTrue(ok)
-            self.assertIsNotNone(session_data)
-            self.assertFalse(session_data.get("needs_sms"))
-            self.assertEqual(session_data.get("appointment_id"), "APPT-TEST-123")
-
-    def test_initiate_booking_new_client_sms_flow_and_confirmation(self):
-        from unittest.mock import patch, MagicMock
-        from services.masters import initiate_booking, confirm_sms_code
-
-        class DummyResponse:
-            def __init__(self, data: bytes, url: str):
-                self._data = data
-                self._url = url
-
-            def read(self):
-                return self._data
-
-            def geturl(self):
-                return self._url
-
-        mock_opener = MagicMock()
-
-        def fake_open(req, timeout=10):
-            url = req.get_full_url() if hasattr(req, "get_full_url") else str(req)
-            if "/price" in url and "services=" not in url:
-                return DummyResponse(b'var ONLINE_CID = "test_cid";', url)
-            elif "/price" in url:
-                return DummyResponse(b"OK", url)
-            elif "/times" in url:
-                return DummyResponse(b'<form action="/boris_gafurov/phone?test_cid"></form>', url)
-            elif "/phone" in url:
-                return DummyResponse(b'{"success": true, "verify_url": "/boris_gafurov/verify?v=123&cid=test_cid"}', url)
-            elif "/verify" in url:
-                if hasattr(req, "data") and req.data:
-                    return DummyResponse(b'<form id="online-info-form"><input name="_csrf" value="csrf456"/><input name="OnlineInfoForm[firstname]" value=""/></form>', "https://mst.link/boris_gafurov/comment?cid=test_cid")
-                else:
-                    return DummyResponse(b'<form id="js-form-online-code"><input name="_csrf" value="csrf456"/></form>', url)
-            elif "/comment" in url:
-                return DummyResponse(b"<html>Done</html>", "https://mst.link/boris_gafurov/finish?id=APPT-SMS-456")
-            return DummyResponse(b"", url)
-
-        mock_opener.open.side_effect = fake_open
-
-        with patch("urllib.request.build_opener", return_value=mock_opener):
-            ok, msg, session_data = initiate_booking("+79998887766", {"hair"}, 1700000000, client_name="NewClient")
-            self.assertTrue(ok)
-            self.assertIsNotNone(session_data)
-            self.assertTrue(session_data.get("needs_sms"))
-
-            # Now confirm code
-            confirm_ok, confirm_msg = confirm_sms_code(session_data, "1234")
-            self.assertTrue(confirm_ok)
-            self.assertEqual(session_data.get("appointment_id"), "APPT-SMS-456")
-
-    def test_initiate_booking_masters_error_handling(self):
-        from unittest.mock import patch, MagicMock
-        from services.masters import initiate_booking
-
-        class DummyResponse:
-            def __init__(self, data: bytes, url: str):
-                self._data = data
-                self._url = url
-
-            def read(self):
-                return self._data
-
-            def geturl(self):
-                return self._url
-
-        mock_opener = MagicMock()
-
-        def fake_open(req, timeout=10):
-            url = req.get_full_url() if hasattr(req, "get_full_url") else str(req)
-            if "/price" in url and "services=" not in url:
-                return DummyResponse(b'var ONLINE_CID = "test_cid";', url)
-            elif "/price" in url:
-                return DummyResponse(b"OK", url)
-            elif "/times" in url:
-                return DummyResponse(b'<form action="/boris_gafurov/phone?test_cid"></form>', url)
-            elif "/phone" in url:
-                return DummyResponse('{"error": "Выбранное время уже занято другим клиентом."}'.encode("utf-8"), url)
-            return DummyResponse(b"", url)
-
-        mock_opener.open.side_effect = fake_open
-
-        with patch("urllib.request.build_opener", return_value=mock_opener):
-            ok, msg, session_data = initiate_booking("+79990001122", {"hair"}, 1700000000)
-            self.assertFalse(ok)
-            self.assertEqual(msg, "Выбранное время уже занято другим клиентом.")
-            self.assertIsNone(session_data)
+        # A second client cannot take an overlapping interval.
+        with self.assertRaises(SlotUnavailableError):
+            create_or_update_appointment(
+                phone="+79991234568",
+                appointment_time=base + datetime.timedelta(minutes=30),
+                services="Мужская стрижка",
+                total_price=2300,
+                client_name="Second",
+                platform="telegram",
+                platform_user_id=556,
+            )
 
     def test_idor_protection(self):
         from services.appointments import (
@@ -1276,6 +1098,8 @@ class TestBookingBot(unittest.IsolatedAsyncioTestCase):
 
         mock_now = datetime.datetime(2026, 10, 27, 14, 0, tzinfo=SARATOV_TZ)
         time_18d_ago = mock_now - datetime.timedelta(days=18)
+        time_18d_ago_later = time_18d_ago + datetime.timedelta(hours=2)
+        time_18d_ago_latest = time_18d_ago + datetime.timedelta(hours=4)
         time_future = mock_now + datetime.timedelta(days=2)
 
         # 1. Completed 18 days ago -> should be included
@@ -1292,7 +1116,7 @@ class TestBookingBot(unittest.IsolatedAsyncioTestCase):
         # 2. Cancelled 18 days ago -> should NOT be included
         appt_cancelled_id = create_or_update_appointment(
             phone="+79991110002",
-            appointment_time=time_18d_ago,
+            appointment_time=time_18d_ago_later,
             services="Стрижка",
             total_price=2300,
             platform="telegram",
@@ -1313,7 +1137,7 @@ class TestBookingBot(unittest.IsolatedAsyncioTestCase):
         # 4. Past appointment that stayed 'confirmed' (no-show) -> should NOT be included
         appt_no_show_id = create_or_update_appointment(
             phone="+79991110004",
-            appointment_time=time_18d_ago,
+            appointment_time=time_18d_ago_latest,
             services="Стрижка",
             total_price=2300,
             platform="telegram",
@@ -1343,7 +1167,7 @@ class TestBookingBot(unittest.IsolatedAsyncioTestCase):
             complete_appointment,
             get_appointment,
         )
-        t = datetime.datetime.now(datetime.timezone.utc)
+        t = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=8)
         appt_id = create_or_update_appointment(
             phone="+79992223344",
             appointment_time=t,
@@ -1351,21 +1175,21 @@ class TestBookingBot(unittest.IsolatedAsyncioTestCase):
             total_price=2300,
             platform="telegram",
             platform_user_id=888,
-            masters_id="mst-terminal-test-1",
         )
         complete_appointment(appt_id)
         self.assertEqual(get_appointment(appt_id)["status"], "completed")
 
-        # Sync comes in again with same masters_id
-        create_or_update_appointment(
+        # A repeated submission for the same client and slot must not reopen
+        # the completed visit.
+        repeated_id = create_or_update_appointment(
             phone="+79992223344",
             appointment_time=t,
             services="Стрижка",
             total_price=2300,
-            platform="masters",
-            masters_id="mst-terminal-test-1",
+            platform="telegram",
+            platform_user_id=888,
         )
-        # Status MUST remain 'completed', not reset to 'confirmed'
+        self.assertEqual(appt_id, repeated_id)
         self.assertEqual(get_appointment(appt_id)["status"], "completed")
 
     def test_postgres_split_brain_protection(self):
@@ -1395,78 +1219,24 @@ class TestBookingBot(unittest.IsolatedAsyncioTestCase):
             conn_mod._pg_unreachable = prev_unreachable
             conn_mod._last_pg_check = prev_check
 
-    def test_suggested_master_phone(self):
-        from services.masters_sync import get_suggested_master_phone, DEFAULT_MASTER_PHONE
-        # Default fallback
-        self.assertEqual(get_suggested_master_phone(), TEST_MASTER_PHONE)
-
-        # After saving a session in masters_session
-        with get_connection() as conn:
-            conn.execute(
-                "INSERT INTO masters_session (master_phone, cookie_phpsessid, is_active) VALUES (%s, %s, %s)",
-                (TEST_MASTER_PHONE, "test_phpsessid", 1),
-            )
-            conn.commit()
-
-        self.assertEqual(get_suggested_master_phone(), TEST_MASTER_PHONE)
-
-    async def test_admin_masters_flow(self):
-        from handlers.referrals import (
-            admin_masters_status,
-            admin_masters_enter_phone,
-            admin_masters_request_code,
-            handle_admin_text_inputs,
-            pending_master_logins,
-        )
-        from unittest.mock import patch
+    async def test_admin_sync_screen(self):
+        from handlers.referrals import admin_sync_status
 
         admin_id = 802560333  # from ADMIN_IDS
-        pending_master_logins.clear()
 
-        # 1. Open admin:masters
         cb = MagicMock()
         cb.from_user.id = admin_id
-        cb.data = "admin:masters"
+        cb.data = "admin:sync"
         cb.message.edit_text = AsyncMock()
         cb.answer = AsyncMock()
 
-        await admin_masters_status(cb)
+        await admin_sync_status(cb)
         cb.message.edit_text.assert_called_once()
         text_arg = cb.message.edit_text.call_args[0][0]
-        self.assertIn(TEST_MASTER_PHONE, text_arg)
+        self.assertIn("Единая база «Срез»", text_arg)
         kb_arg = cb.message.edit_text.call_args[1]["reply_markup"]
         btn_texts = [btn.text for row in kb_arg.inline_keyboard for btn in row]
-        self.assertTrue(any("Ввести другой номер" in t for t in btn_texts))
-        self.assertTrue(any(TEST_MASTER_PHONE in t for t in btn_texts))
-
-        # 2. Click "Ввести другой номер"
-        cb_enter = MagicMock()
-        cb_enter.from_user.id = admin_id
-        cb_enter.data = "admin:masters_enter_phone"
-        cb_enter.message.edit_text = AsyncMock()
-        cb_enter.answer = AsyncMock()
-
-        await admin_masters_enter_phone(cb_enter)
-        self.assertTrue(pending_master_logins.get(admin_id, {}).get("awaiting_phone"))
-
-        # 3. Type valid phone in chat
-        msg = MagicMock()
-        msg.from_user.id = admin_id
-        msg.text = "+7 999 000 00 00"
-        msg.answer = AsyncMock()
-
-        with patch("handlers.referrals.request_master_login") as mock_req:
-            mock_req.return_value = (
-                True,
-                "OK",
-                {"phone": TEST_MASTER_PHONE, "phone_formatted": TEST_MASTER_PHONE_FORMATTED, "csrf": "c1", "cookies": {}},
-            )
-            await handle_admin_text_inputs(msg)
-            mock_req.assert_called_once_with("+7 999 000 00 00")
-
-        self.assertFalse(pending_master_logins[admin_id].get("awaiting_phone"))
-        self.assertEqual(msg.answer.call_count, 2)
-        self.assertIn("Код подтверждения отправлен", msg.answer.call_args_list[1][0][0])
+        self.assertTrue(any("CRM «Срез»" in t for t in btn_texts))
 
 
 if __name__ == "__main__":

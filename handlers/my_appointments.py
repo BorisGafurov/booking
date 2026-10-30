@@ -22,7 +22,7 @@ from services.appointments import (
     get_user_upcoming_appointments,
     reschedule_appointment,
 )
-from services.masters import get_schedule
+from services.booking import get_schedule
 
 logger = logging.getLogger(__name__)
 router = Router()

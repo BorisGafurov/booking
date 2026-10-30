@@ -55,7 +55,6 @@ def apply(conn) -> None:
                 reminder_morning_sent BOOLEAN NOT NULL DEFAULT FALSE,
                 reminder_2h_sent BOOLEAN NOT NULL DEFAULT FALSE,
                 retention_18d_sent BOOLEAN NOT NULL DEFAULT FALSE,
-                masters_id VARCHAR(64) UNIQUE,
                 created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
             );
@@ -151,7 +150,6 @@ def apply(conn) -> None:
                 reminder_morning_sent INTEGER NOT NULL DEFAULT 0,
                 reminder_2h_sent INTEGER NOT NULL DEFAULT 0,
                 retention_18d_sent INTEGER NOT NULL DEFAULT 0,
-                masters_id TEXT UNIQUE,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );

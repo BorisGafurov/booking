@@ -10,9 +10,10 @@ from aiogram.filters import Command
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from handlers.ui import edit_or_send as _edit_or_send
 
-from config import ADMIN_IDS, BOOKING_URL
+from config import ADMIN_IDS, BOOKING_URL, WEB_APP_URL
 from services.appointments import (
     SARATOV_TZ,
+    SlotUnavailableError,
     cancel_appointment,
     confirm_appointment_by_client,
     create_or_update_appointment,
@@ -23,16 +24,11 @@ from keyboards.booking import (
     get_request_phone_keyboard,
     get_services_keyboard,
     get_slots_keyboard,
-    get_sms_keyboard,
 )
 from keyboards.menu import get_main_menu
-from services.masters import (
-    SERVICES,
+from services.booking import (
     calculate_services,
-    confirm_sms_code,
     get_schedule,
-    initiate_booking,
-    user_pending_booking,
     user_selected_day,
     user_selected_services,
 )
@@ -88,6 +84,18 @@ async def booking_start(event: Message | CallbackQuery):
             reply_markup=kb,
             parse_mode="HTML",
         )
+
+
+@router.message(Command("site", "website", "app"))
+@router.message(F.text.in_({"🌐 Наш сайт / Запись", "🌐 Наш сайт", "Наш сайт", "Сайт"}))
+async def open_site_handler(message: Message):
+    url = WEB_APP_URL or BOOKING_URL
+    text = (
+        "🌐 <b>Онлайн-запись и сайт мастера Бориса Гафурова</b>\n\n"
+        "Вы можете записаться через наш сайт, выбрать удобное время или использовать удобный Мини-Апп:\n"
+        f"🔗 {url}"
+    )
+    await message.answer(text, reply_markup=get_booking_keyboard(), parse_mode="HTML")
 
 
 @router.callback_query(F.data.startswith("book:toggle:"))
@@ -152,9 +160,10 @@ async def choose_day(callback: CallbackQuery):
 
     if not schedule:
         if callback.message:
-            await _edit_or_send(callback.message, 
-                "⚠️ Не удалось загрузить расписание в реальном времени.\n\n"
-                "Вы можете выбрать удобное время напрямую на сайте Masters:",
+            await _edit_or_send(
+                callback.message, 
+                "⚠️ Не удалось загрузить расписание.\n\n"
+                "Вы можете выбрать удобное время на сайте «Срез»:",
                 reply_markup=get_booking_keyboard(),
             )
         await callback.answer()
@@ -163,7 +172,8 @@ async def choose_day(callback: CallbackQuery):
     calc = calculate_services(current_services)
     try:
         if callback.message:
-            await _edit_or_send(callback.message, 
+            await _edit_or_send(
+                callback.message, 
                 f"📅 <b>Выберите удобный день записи:</b>\n\n"
                 f"Услуги: <b>{', '.join(calc['names'])}</b>\n"
                 f"Длительность: <b>{calc['duration_text']}</b>\n"
@@ -193,7 +203,8 @@ async def choose_time_slot(callback: CallbackQuery):
     title = day_data["title"] if day_data else day_key
     try:
         if callback.message:
-            await _edit_or_send(callback.message, 
+            await _edit_or_send(
+                callback.message, 
                 f"🕒 <b>Свободные окна на {title}:</b>\n\n"
                 "Выберите удобное время начала стрижки:",
                 reply_markup=get_slots_keyboard(slots),
@@ -204,29 +215,54 @@ async def choose_time_slot(callback: CallbackQuery):
     await callback.answer()
 
 
-async def _finalize_successful_booking(
+async def _create_booking_and_notify(
     bot,
     user_id: int,
-    session_data: dict,
+    phone: str,
+    timestamp: int,
+    selected_services: list[str] | set[str],
     client_name: str,
     target_msg_or_cb,
-):
-    user_pending_booking.pop(user_id, None)
-    user_selected_slot.pop(user_id, None)
-    calc = session_data["calc"]
-    dt = datetime.datetime.fromtimestamp(session_data["timestamp"], tz=SARATOV_TZ)
-    phone = session_data["phone"]
+) -> int | None:
+    """Creates the booking in the shared schedule and shows the confirmation."""
+    calc = calculate_services(selected_services)
+    dt = datetime.datetime.fromtimestamp(timestamp, tz=SARATOV_TZ)
 
-    appt_id = create_or_update_appointment(
-        phone=phone,
-        appointment_time=dt,
-        services=", ".join(calc["names"]),
-        total_price=calc["total_price"],
-        client_name=client_name,
-        platform="telegram",
-        platform_user_id=user_id,
-        masters_id=session_data.get("appointment_id"),
-    )
+    try:
+        appt_id = await asyncio.to_thread(
+            create_or_update_appointment,
+            phone=phone,
+            appointment_time=dt,
+            services=", ".join(calc["names"]),
+            total_price=calc["total_price"],
+            client_name=client_name,
+            platform="telegram",
+            platform_user_id=user_id,
+            duration_min=calc["duration_minutes"],
+        )
+    except SlotUnavailableError:
+        text = (
+            "⚠️ <b>Это время уже занято.</b>\n\n"
+            "Пожалуйста, выберите другой слот или запишитесь через сайт «Срез»:"
+        )
+        if isinstance(target_msg_or_cb, CallbackQuery):
+            if target_msg_or_cb.message:
+                await _edit_or_send(
+                    target_msg_or_cb.message,
+                    text,
+                    reply_markup=get_booking_keyboard(),
+                    parse_mode="HTML",
+                )
+            await target_msg_or_cb.answer()
+        else:
+            await target_msg_or_cb.answer(
+                text,
+                reply_markup=get_booking_keyboard(),
+                parse_mode="HTML",
+            )
+        return None
+
+    user_selected_slot.pop(user_id, None)
 
     cancel_markup = InlineKeyboardMarkup(
         inline_keyboard=[
@@ -290,6 +326,8 @@ async def _finalize_successful_booking(
         except Exception as e:
             logger.error("Failed to notify admin %s: %s", admin_id, e)
 
+    return appt_id
+
 
 @router.callback_query(F.data.startswith("book:slot:"))
 async def initiate_slot_booking(callback: CallbackQuery):
@@ -312,50 +350,17 @@ async def initiate_slot_booking(callback: CallbackQuery):
         await callback.answer()
         return
 
-    try:
-        if callback.message:
-            await _edit_or_send(callback.message, "⏳ Бронирую слот в Masters...")
-    except TelegramBadRequest:
-        pass
-
     current_services = user_selected_services.get(user_id, {"hair"})
     client_name = callback.from_user.full_name or "Клиент"
-    success, msg, session_data = await asyncio.to_thread(
-        initiate_booking, phone, current_services, timestamp, client_name=client_name
+    await _create_booking_and_notify(
+        callback.bot,
+        user_id,
+        phone,
+        timestamp,
+        current_services,
+        client_name,
+        callback,
     )
-
-    if not success or not session_data:
-        try:
-            if callback.message:
-                await _edit_or_send(callback.message, 
-                    f"⚠️ {msg}\n\nВы можете завершить бронирование напрямую через сайт:",
-                    reply_markup=get_booking_keyboard(),
-                )
-        except TelegramBadRequest:
-            pass
-        await callback.answer()
-        return
-
-    if not session_data.get("needs_sms", True):
-        await _finalize_successful_booking(callback.bot, user_id, session_data, client_name, callback)
-        return
-
-    user_pending_booking[user_id] = session_data
-    dt = datetime.datetime.fromtimestamp(timestamp, tz=SARATOV_TZ)
-
-    try:
-        if callback.message:
-            await _edit_or_send(callback.message, 
-                f"📩 <b>Подтверждение записи</b>\n\n"
-                f"Вы выбрали: <b>{dt.strftime('%d.%m.%Y в %H:%M')}</b>\n"
-                f"На ваш номер <code>{phone}</code> отправлено СМС-сообщение с кодом от Masters.\n\n"
-                "👉 <b>Напишите 4 цифры из СМС в ответном сообщении:</b>",
-                reply_markup=get_sms_keyboard(),
-                parse_mode="HTML",
-            )
-    except TelegramBadRequest:
-        pass
-    await callback.answer()
 
 
 @router.callback_query(F.data == "book:cancel")
@@ -363,7 +368,6 @@ async def cancel_booking(callback: CallbackQuery):
     if not callback.from_user:
         return
     user_id = callback.from_user.id
-    user_pending_booking.pop(user_id, None)
     user_selected_slot.pop(user_id, None)
 
     try:
@@ -392,32 +396,18 @@ async def _process_phone_provided(message: Message, user_id: int, phone_raw: str
         dt = datetime.datetime.fromtimestamp(pending_ts, tz=SARATOV_TZ)
 
         await message.answer(
-            f"⏳ Номер <code>{eff_phone}</code> сохранён. Связываюсь с Masters для записи на <b>{dt.strftime('%d.%m.%Y в %H:%M')}</b>...",
+            f"⏳ Номер <code>{eff_phone}</code> сохранён. Оформляю запись на <b>{dt.strftime('%d.%m.%Y в %H:%M')}</b>...",
             parse_mode="HTML",
         )
         client_name = message.from_user.full_name if message.from_user else "Клиент"
-        success_init, msg_init, session_data = await asyncio.to_thread(
-            initiate_booking, eff_phone, current_services, pending_ts, client_name=client_name
-        )
-        if not success_init or not session_data:
-            await message.answer(
-                f"⚠️ {msg_init}\n\nВы можете завершить бронирование напрямую через сайт:",
-                reply_markup=get_booking_keyboard(),
-            )
-            return
-
-        if not session_data.get("needs_sms", True):
-            await _finalize_successful_booking(message.bot, user_id, session_data, client_name, message)
-            return
-
-        user_pending_booking[user_id] = session_data
-        await message.answer(
-            f"📩 <b>Подтверждение записи</b>\n\n"
-            f"Вы выбрали: <b>{dt.strftime('%d.%m.%Y в %H:%M')}</b>\n"
-            f"На ваш номер <code>{eff_phone}</code> отправлено СМС-сообщение с кодом от Masters.\n\n"
-            "👉 <b>Напишите 4 цифры из СМС в ответном сообщении:</b>",
-            reply_markup=get_sms_keyboard(),
-            parse_mode="HTML",
+        await _create_booking_and_notify(
+            message.bot,
+            user_id,
+            eff_phone,
+            pending_ts,
+            current_services,
+            client_name,
+            message,
         )
         return
 
@@ -445,42 +435,6 @@ async def back_to_menu(message: Message):
         return
     is_admin_user = message.from_user.id in ADMIN_IDS
     await message.answer("Главное меню:", reply_markup=get_main_menu(is_admin_user))
-
-
-@router.message(
-    lambda msg: bool(
-        msg.from_user
-        and msg.from_user.id in user_pending_booking
-        and msg.text
-        and msg.text.strip().isdigit()
-        and len(msg.text.strip()) == 4
-    )
-)
-async def handle_sms_code(message: Message):
-    if not message.from_user or not message.text:
-        return
-
-    user_id = message.from_user.id
-    session_data = user_pending_booking.get(user_id)
-
-    if not session_data:
-        return  # Regular message, not waiting for SMS code
-
-    code = message.text.strip()
-    success, msg = await asyncio.to_thread(confirm_sms_code, session_data, code)
-
-    if not success:
-        await message.answer(
-            f"❌ <b>{html.escape(msg)}</b>\n\n"
-            "Попробуйте ввести 4 цифры ещё раз или завершите запись на сайте:",
-            reply_markup=get_sms_keyboard(),
-            parse_mode="HTML",
-        )
-        return
-
-    # Successfully booked!
-    client_name = message.from_user.full_name or "Клиент"
-    await _finalize_successful_booking(message.bot, user_id, session_data, client_name, message)
 
 
 @router.callback_query(F.data.startswith("appt:confirm:"))

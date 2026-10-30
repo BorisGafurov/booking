@@ -28,37 +28,56 @@ class TestDatabaseMigrations(unittest.TestCase):
         self.conn.close()
         shutil.rmtree(self.test_dir, ignore_errors=True)
 
+    def _columns(self, table: str) -> set[str]:
+        rows = self.conn.raw_conn.execute(f"PRAGMA table_info({table})").fetchall()
+        return {row["name"] for row in rows}
+
+    def _tables(self) -> set[str]:
+        cursor = self.conn.raw_conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        return {row["name"] for row in cursor.fetchall()}
+
     def test_run_migrations_fresh_db(self):
         """Test applying all migrations to an empty database."""
         applied = run_migrations(self.conn)
         self.assertIn("001_initial_schema", applied)
-        self.assertIn("002_masters_session", applied)
         self.assertIn("003_user_roles_and_schedule", applied)
         self.assertIn("004_data_cleanups", applied)
+        self.assertIn("007_client_extra_fields", applied)
+        self.assertIn("008_site_sync_cleanup", applied)
 
-        # Verify tables exist
-        cursor = self.conn.raw_conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table'"
-        )
-        tables = {row["name"] for row in cursor.fetchall()}
         expected_tables = {
             "schema_migrations",
             "users",
             "referrals",
             "rewards",
             "appointments",
-            "masters_session",
             "user_roles",
             "master_schedule",
         }
-        for t in expected_tables:
-            self.assertIn(t, tables, f"Expected table {t} to exist after migrations")
+        self.assertTrue(expected_tables.issubset(self._tables()))
 
-        # Verify schema_migrations contains recorded versions
+        user_columns = self._columns("users")
+        for column in (
+            "source_registered",
+            "client_group",
+            "visits_total",
+            "cancelled_total",
+            "revenue_total",
+            "imported_at",
+        ):
+            self.assertIn(column, user_columns)
+        self.assertFalse(any(column.startswith("masters_") for column in user_columns))
+        self.assertNotIn("masters_session", self._tables())
+
+        appointment_columns = self._columns("appointments")
+        self.assertIn("duration_min", appointment_columns)
+        self.assertIn("notes", appointment_columns)
+        self.assertNotIn("masters_id", appointment_columns)
+
         applied_set = get_applied_migrations(self.conn)
         self.assertEqual(len(applied_set), len(applied))
-        for v in applied:
-            self.assertIn(v, applied_set)
+        for version in applied:
+            self.assertIn(version, applied_set)
 
     def test_migrations_idempotency(self):
         """Test that running migrations twice is safe and applies nothing on second run."""
@@ -71,38 +90,40 @@ class TestDatabaseMigrations(unittest.TestCase):
     def test_migration_status_reporting(self):
         """Test get_migration_status returns accurate status before and after run."""
         statuses_before = get_migration_status(self.conn)
-        for s in statuses_before:
-            self.assertFalse(s["applied"])
-            self.assertIsNone(s["applied_at"])
+        for status in statuses_before:
+            self.assertFalse(status["applied"])
+            self.assertIsNone(status["applied_at"])
 
         run_migrations(self.conn)
 
         statuses_after = get_migration_status(self.conn)
-        for s in statuses_after:
-            self.assertTrue(s["applied"])
-            self.assertIsNotNone(s["applied_at"])
+        for status in statuses_after:
+            self.assertTrue(status["applied"])
+            self.assertIsNotNone(status["applied_at"])
 
     def test_dynamic_incremental_migration_and_rollback(self):
-        """Test creating an incremental migration version, applying it, and rolling it back."""
-        # Baseline run
+        """Test creating an incremental migration version and applying it."""
         run_migrations(self.conn)
 
-        # Create a temp versions directory copying existing ones plus a new migration
         custom_versions = Path(self.test_dir) / "custom_versions"
         custom_versions.mkdir()
 
-        # Copy existing migrations
-        real_versions = Path(__file__).resolve().parent.parent / "core_bot" / "database" / "migrations" / "versions"
-        for f in real_versions.glob("*.py"):
-            shutil.copy(f, custom_versions / f.name)
+        real_versions = (
+            Path(__file__).resolve().parent.parent
+            / "core_bot"
+            / "database"
+            / "migrations"
+            / "versions"
+        )
+        for migration_file in real_versions.glob("*.py"):
+            shutil.copy(migration_file, custom_versions / migration_file.name)
 
-        # Write migration 005
         m005_content = '''
 VERSION = "005_client_notes"
-NAME = "Add notes column to appointments"
+NAME = "Add a custom note column to appointments"
 
 def apply(conn):
-    conn.execute("ALTER TABLE appointments ADD COLUMN notes TEXT")
+    conn.execute("ALTER TABLE appointments ADD COLUMN legacy_note TEXT")
 
 def rollback(conn):
     pass
@@ -111,49 +132,74 @@ def rollback(conn):
 
         new_applied = run_migrations(self.conn, versions_dir=custom_versions)
         self.assertEqual(new_applied, ["005_client_notes"])
+        self.assertIn("legacy_note", self._columns("appointments"))
+        self.assertIn("005_client_notes", get_applied_migrations(self.conn))
 
-        # Check column was added
-        cursor = self.conn.raw_conn.execute("PRAGMA table_info(appointments)")
-        cols = {row["name"] for row in cursor.fetchall()}
-        self.assertIn("notes", cols)
-
-        # Check applied set
-        applied_set = get_applied_migrations(self.conn)
-        self.assertIn("005_client_notes", applied_set)
-
-
-    def test_migration_006_removes_guessed_placeholders(self):
-        """Migration 006 deletes guessed Masters placeholders but keeps real appointments."""
+    def test_migration_008_migrates_legacy_columns(self):
+        """Migration 008 keeps legacy client data under neutral names."""
         run_migrations(self.conn)
 
+        self.conn.execute(
+            "ALTER TABLE users ADD COLUMN masters_registered TEXT"
+        )
+        self.conn.execute(
+            "ALTER TABLE users ADD COLUMN masters_group TEXT"
+        )
+        self.conn.execute(
+            "ALTER TABLE users ADD COLUMN masters_appointments_total INTEGER DEFAULT 0"
+        )
+        self.conn.execute(
+            "ALTER TABLE users ADD COLUMN masters_imported_at TIMESTAMP"
+        )
+        self.conn.execute(
+            "ALTER TABLE appointments ADD COLUMN masters_id TEXT"
+        )
+        self.conn.execute(
+            "CREATE TABLE masters_session (id INTEGER PRIMARY KEY, phone TEXT)"
+        )
+        self.conn.execute(
+            """
+            INSERT INTO users
+                (phone, first_name, masters_registered, masters_group,
+                 masters_appointments_total, masters_imported_at)
+            VALUES ('+79990000001', 'Legacy', '2024-01-01', 'VIP', 12,
+                    '2026-01-01 10:00:00')
+            """
+        )
         self.conn.execute(
             """
             INSERT INTO appointments
                 (platform, platform_user_id, client_name, phone, services,
                  total_price, appointment_time, status, masters_id)
-            VALUES
-                ('masters', 0, 'Клиент (Masters)', '', 'Стрижка (МУЖСКАЯ)', 0,
-                 '2026-10-27 14:00:00', 'confirmed', 'mst_2026-10-27_1400'),
-                ('masters', 0, 'Клиент (Masters)', '', 'Стрижка (МУЖСКАЯ)', 0,
-                 '2026-10-27 10:00:00', 'confirmed', 'mst_2026-10-27_1000'),
-                ('telegram', 123456, 'Реальный Клиент', '+79998887766', 'Стрижка', 2300,
-                 '2026-10-30 15:00:00', 'confirmed', 'mst_real_record_1')
+            VALUES ('masters', 0, 'Legacy Client', '+79990000001',
+                    'Стрижка + Борода', 3000, '2026-12-01 14:00:00',
+                    'confirmed', 'legacy-1')
             """
         )
         self.conn.commit()
 
         import importlib
 
-        mod = importlib.import_module(
-            "core_bot.database.migrations.versions.006_remove_guessed_placeholders"
+        migration = importlib.import_module(
+            "core_bot.database.migrations.versions.008_site_sync_cleanup"
         )
-        mod.apply(self.conn)
+        migration.apply(self.conn)
 
-        rows = self.conn.execute(
-            "SELECT masters_id FROM appointments ORDER BY id"
-        ).fetchall()
-        remaining = [r["masters_id"] for r in rows]
-        self.assertEqual(remaining, ["mst_real_record_1"])
+        user_row = self.conn.execute(
+            "SELECT * FROM users WHERE phone = %s", ("+79990000001",)
+        ).fetchone()
+        self.assertEqual(user_row["source_registered"], "2024-01-01")
+        self.assertEqual(user_row["client_group"], "VIP")
+        self.assertEqual(user_row["visits_total"], 12)
+        self.assertFalse(any(column.startswith("masters_") for column in self._columns("users")))
+
+        appointment_row = self.conn.execute(
+            "SELECT * FROM appointments WHERE phone = %s", ("+79990000001",)
+        ).fetchone()
+        self.assertEqual(appointment_row["duration_min"], 135)
+        self.assertEqual(appointment_row["platform"], "manual")
+        self.assertNotIn("masters_id", self._columns("appointments"))
+        self.assertNotIn("masters_session", self._tables())
 
 
 if __name__ == "__main__":

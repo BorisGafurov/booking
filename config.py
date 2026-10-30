@@ -10,12 +10,13 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 
 BOOKING_URL = os.getenv(
     "BOOKING_URL",
-    "https://mst.link/boris_gafurov/price?cid=vddrm99a3uu0o9cgk508u6uctp",
+    "https://srezforma.ru",
 )
+WEB_APP_URL = os.getenv("WEB_APP_URL", "").strip() or BOOKING_URL
 
-SALON_ADDRESS = os.getenv("SALON_ADDRESS", "Саратов, ул. имени Е.И. Пугачёва, 110")
-SALON_LATITUDE = float(os.getenv("SALON_LATITUDE", "51.536988"))
-SALON_LONGITUDE = float(os.getenv("SALON_LONGITUDE", "46.013896"))
+SALON_ADDRESS = os.getenv("SALON_ADDRESS", "Саратов, ул. Пугачёва, 110 (2-я дверь после арки, между Bookberry и Ozon)")
+SALON_LATITUDE = float(os.getenv("SALON_LATITUDE", "51.537009"))
+SALON_LONGITUDE = float(os.getenv("SALON_LONGITUDE", "46.013908"))
 WORK_HOURS = os.getenv("WORK_HOURS", "Вторник и суббота: 10:00–19:00")
 
 ADMIN_IDS = {

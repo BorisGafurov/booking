@@ -18,7 +18,6 @@ from services.appointments import (
     cancel_appointment,
     complete_appointment,
     confirm_appointment_by_client,
-    confirm_manual_appointment_masters_sms,
     create_manual_appointment,
     get_appointment,
     get_appointments_counts,
@@ -27,7 +26,6 @@ from services.appointments import (
     get_master_appointments,
     get_master_day_schedule,
     get_upcoming_days_schedule,
-    pending_manual_bookings,
     reschedule_appointment,
     set_master_day_schedule,
     update_appointment_price_and_service,
@@ -39,16 +37,7 @@ from services.client_import import (
     import_clients_from_text,
     update_appointment_client_details,
 )
-from services.masters import get_service_options_for_creation
-from services.masters_sync import (
-    confirm_master_login,
-    disconnect_masters_session,
-    get_active_masters_session,
-    get_suggested_master_phone,
-    pending_master_logins,
-    request_master_login,
-    sync_masters_appointments,
-)
+from services.booking import get_service_options_for_creation
 from services.referrals import (
     build_referral_link,
     get_active_rewards,
@@ -115,7 +104,7 @@ def admin_menu_keyboard() -> InlineKeyboardMarkup:
             [InlineKeyboardButton(text="🕒 Рабочий график", callback_data="admin:sched:0")],
             [InlineKeyboardButton(text="⏳ Ожидают подтверждения", callback_data="admin:pending:0")],
             [InlineKeyboardButton(text="💰 Активные бонусы", callback_data="admin:rewards:0")],
-            [InlineKeyboardButton(text="🔄 Синхронизация Masters", callback_data="admin:masters")],
+            [InlineKeyboardButton(text="🌐 Синхронизация «Срез»", callback_data="admin:sync")],
             [InlineKeyboardButton(text="📢 Сделать рассылку", callback_data="admin:broadcast")],
         ]
     )
@@ -456,7 +445,6 @@ async def admin_appt_detail(callback: CallbackQuery):
     price = appt.get("total_price") or 0
     time_fmt = format_dt(appt["appointment_time"])
     platform = appt.get("platform") or "telegram"
-    masters_id = appt.get("masters_id") or "—"
 
     card_text = (
         f"📋 <b>Карточка записи #{appt['id']}</b>\n\n"
@@ -466,8 +454,7 @@ async def admin_appt_detail(callback: CallbackQuery):
         f"💰 <b>Стоимость:</b> {price} ₽\n"
         f"⏰ <b>Дата и время:</b> {time_fmt}\n"
         f"📌 <b>Статус:</b> {st_text}\n"
-        f"🌐 <b>Источник:</b> {platform.upper()}\n"
-        f"🔄 <b>Masters ID:</b> <code>{masters_id}</code>"
+        f"🌐 <b>Источник:</b> {platform.upper()}"
     )
 
     try:
@@ -733,7 +720,7 @@ async def admin_create_start(callback: CallbackQuery):
     if callback.message:
         await _edit_or_send(callback.message, 
             "➕ <b>Создание новой записи мастером</b>\n\n"
-            "<b>Шаг 1 из 4:</b> Выберите услугу из Masters или введите другое название:",
+            "<b>Шаг 1 из 4:</b> Выберите услугу или введите другое название:",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
             parse_mode="HTML",
         )
@@ -844,7 +831,7 @@ async def admin_create_day_chosen(callback: CallbackQuery):
     if free_slots:
         lines.append(f"🟢 <b>Свободные окна:</b> {', '.join(free_slots)}")
     else:
-        lines.append("⚠️ <i>На этот день нет свободных окон в Masters</i>")
+        lines.append("⚠️ <i>На этот день нет свободных окон</i>")
 
     if busy_appts:
         lines.append("\n🔴 <b>Уже занято в расписании:</b>")
@@ -905,7 +892,7 @@ async def admin_create_busy_clicked(callback: CallbackQuery):
 
     slots_info = await asyncio.to_thread(get_day_time_slots_status, day_key)
     b_appt = next((b for b in slots_info.get("busy_appts", []) if b["time"] == time_val), None)
-    details = f"{b_appt['client_name']} ({b_appt['services']})" if b_appt else "запись из Masters"
+    details = f"{b_appt['client_name']} ({b_appt['services']})" if b_appt else "занятый слот"
 
     text = (
         f"⚠️ <b>Внимание: на {day_key} в {time_val} уже есть запись!</b>\n\n"
@@ -1192,169 +1179,34 @@ async def noop(callback: CallbackQuery):
     await callback.answer()
 
 
-# Masters integration
-@router.callback_query(F.data == "admin:masters")
-async def admin_masters_status(callback: CallbackQuery):
+# Shared schedule status
+@router.callback_query(F.data == "admin:sync")
+async def admin_sync_status(callback: CallbackQuery):
     if not callback.from_user or not is_admin(callback.from_user.id):
         await callback.answer("Нет доступа.", show_alert=True)
         return
 
-    session = get_active_masters_session()
-    if session:
-        text = (
-            "✅ <b>Синхронизация Masters подключена</b>\n\n"
-            f"📱 Номер мастера: <code>{session['master_phone']}</code>\n"
-            "Записи из Masters автоматически синхронизируются каждые 10 минут, "
-            "а клиенты получают напоминания о стрижке накануне вечером и за 2 часа.\n\n"
-            "Вы можете запустить принудительную синхронизацию прямо сейчас:"
-        )
-        kb = InlineKeyboardMarkup(
-            inline_keyboard=[
-                [InlineKeyboardButton(text="🔄 Синхронизировать сейчас", callback_data="admin:masters_sync")],
-                [InlineKeyboardButton(text="🚪 Отключить аккаунт Masters", callback_data="admin:masters_logout")],
-                [InlineKeyboardButton(text="⬅️ Меню админки", callback_data="admin:menu")],
-            ]
-        )
-    else:
-        suggested_phone = get_suggested_master_phone()
-        text = (
-            "🔗 <b>Подключение аккаунта Masters</b>\n\n"
-            "Бот может автоматически забирать все записи из твоего личного кабинета Masters "
-            "и бесплатно рассылать клиентам напоминания о визите накануне вечером и за 2 часа.\n\n"
-            f"📱 <b>Номер мастера для входа:</b> <code>{suggested_phone}</code>\n\n"
-            "Нажмите кнопку ниже, чтобы отправить проверочный код по СМС, или укажите другой номер:"
-        )
-        kb = InlineKeyboardMarkup(
-            inline_keyboard=[
-                [InlineKeyboardButton(text=f"📲 Запросить СМС на {suggested_phone}", callback_data=f"admin:masters_request:{suggested_phone}")],
-                [InlineKeyboardButton(text="✏️ Ввести другой номер", callback_data="admin:masters_enter_phone")],
-                [InlineKeyboardButton(text="⬅️ Меню админки", callback_data="admin:menu")],
-            ]
-        )
-
-    try:
-        if callback.message:
-            await _edit_or_send(callback.message, text, reply_markup=kb, parse_mode="HTML")
-    except TelegramBadRequest:
-        pass
-    await callback.answer()
-
-
-@router.callback_query(F.data == "admin:masters_enter_phone")
-async def admin_masters_enter_phone(callback: CallbackQuery):
-    if not callback.from_user or not is_admin(callback.from_user.id):
-        await callback.answer("Нет доступа.", show_alert=True)
-        return
-
-    user_id = callback.from_user.id
-    pending_master_logins[user_id] = {"awaiting_phone": True}
     text = (
-        "📱 <b>Введите номер телефона мастера</b>\n\n"
-        "Напишите в ответном сообщении номер, зарегистрированный в сервисе Masters "
-        "(например, <code>+79991234567</code>):"
+        "🌐 <b>Единая база «Срез»</b>\n\n"
+        "Все 3 бота (Telegram, VK, MAX) и сайт <b>srezforma.ru</b> работают через общую базу данных в режиме реального времени.\n\n"
+        "• Любая запись через бота или сайт мгновенно бронирует время во всей системе.\n"
+        "• При отмене записи слот сразу же освобождается везде.\n"
+        "• Расписание, услуги и занятость — единые для ботов и сайта.\n\n"
+        "Вы можете управлять записями прямо в боте или в веб-CRM:"
     )
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="⬅️ Назад", callback_data="admin:masters")],
+            [InlineKeyboardButton(text="🌐 Открыть сайт / CRM «Срез»", url="https://srezforma.ru?view=crm")],
+            [InlineKeyboardButton(text="⬅️ Меню админки", callback_data="admin:menu")],
         ]
     )
+
     try:
         if callback.message:
             await _edit_or_send(callback.message, text, reply_markup=kb, parse_mode="HTML")
     except TelegramBadRequest:
         pass
     await callback.answer()
-
-
-@router.callback_query(F.data.startswith("admin:masters_request"))
-async def admin_masters_request_code(callback: CallbackQuery):
-    if not callback.from_user or not is_admin(callback.from_user.id):
-        await callback.answer("Нет доступа.", show_alert=True)
-        return
-
-    user_id = callback.from_user.id
-    parts = (callback.data or "").split(":", 2)
-    phone = parts[2] if len(parts) > 2 and parts[2] else get_suggested_master_phone()
-
-    if not phone:
-        pending_master_logins[user_id] = {"awaiting_phone": True}
-        try:
-            if callback.message:
-                await _edit_or_send(callback.message, 
-                    "📱 <b>Введите номер телефона мастера</b>\n\n"
-                    "Напишите номер, зарегистрированный в сервисе Masters (например, <code>+79991234567</code>):",
-                    reply_markup=InlineKeyboardMarkup(
-                        inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="admin:masters")]]
-                    ),
-                    parse_mode="HTML",
-                )
-        except TelegramBadRequest:
-            pass
-        await callback.answer()
-        return
-
-    await callback.answer("Запрашиваю код в Masters...")
-    success, msg, session_data = request_master_login(phone)
-
-    if not success:
-        pending_master_logins[user_id] = {"awaiting_phone": True}
-        try:
-            if callback.message:
-                await _edit_or_send(callback.message, 
-                    f"❌ <b>{msg}</b>\n\n"
-                    f"Проверьте номер или напишите другой номер телефона мастера в ответном сообщении:\n"
-                    f"<i>(например, <code>+79991234567</code>)</i>",
-                    reply_markup=InlineKeyboardMarkup(
-                        inline_keyboard=[
-                            [InlineKeyboardButton(text="✏️ Ввести номер вручную", callback_data="admin:masters_enter_phone")],
-                            [InlineKeyboardButton(text="⬅️ Назад", callback_data="admin:masters")],
-                        ]
-                    ),
-                    parse_mode="HTML",
-                )
-        except TelegramBadRequest:
-            pass
-        return
-
-    pending_master_logins[user_id] = session_data
-    try:
-        if callback.message:
-            await _edit_or_send(callback.message, 
-                f"📩 <b>Код подтверждения отправлен</b>\n\n"
-                f"На номер <code>{session_data['phone_formatted']}</code> отправлено СМС от Masters.\n\n"
-                "👉 <b>Напишите 4 цифры из СМС в ответном сообщении:</b>",
-                reply_markup=InlineKeyboardMarkup(
-                    inline_keyboard=[
-                        [InlineKeyboardButton(text="✏️ Ввести другой номер", callback_data="admin:masters_enter_phone")],
-                        [InlineKeyboardButton(text="⬅️ Отмена", callback_data="admin:masters")],
-                    ]
-                ),
-                parse_mode="HTML",
-            )
-    except TelegramBadRequest:
-        pass
-
-
-@router.callback_query(F.data == "admin:masters_sync")
-async def admin_masters_sync_now(callback: CallbackQuery):
-    if not callback.from_user or not is_admin(callback.from_user.id):
-        await callback.answer("Нет доступа.", show_alert=True)
-        return
-
-    await callback.answer("Синхронизирую записи...")
-    ok, count, msg = sync_masters_appointments()
-    await callback.answer(msg, show_alert=True)
-
-
-@router.callback_query(F.data == "admin:masters_logout")
-async def admin_masters_disconnect(callback: CallbackQuery):
-    if not callback.from_user or not is_admin(callback.from_user.id):
-        await callback.answer("Нет доступа.", show_alert=True)
-        return
-
-    disconnect_masters_session()
-    await callback.answer("Синхронизация Masters отключена.", show_alert=True)
-    await admin_masters_status(callback)
 
 
 # Broadcast flow
@@ -1463,10 +1315,9 @@ async def admin_clients_list(callback: CallbackQuery):
     if action == "import":
         admin_clients_state[callback.from_user.id] = {"action": "awaiting_import"}
         text = (
-            "📥 <b>Импорт базы клиентов из Masters</b>\n\n"
-            "Вы можете выгрузить базу клиентов из Masters и загрузить в бота:\n"
-            "1. В приложении или на сайте Masters: <b>Клиенты ➔ Экспорт базы (в Excel / CSV)</b>.\n"
-            "2. <b>Отправьте полученный файл (.xlsx или .csv) прямо в этот чат</b> как документ.\n\n"
+            "📥 <b>Импорт базы клиентов</b>\n\n"
+            "Вы можете загрузить базу клиентов в бота:\n"
+            "1. <b>Отправьте файл (.xlsx или .csv) прямо в этот чат</b> как документ.\n\n"
             "<i>Либо просто отправьте список клиентов сообщением в чат в формате:\n"
             "<code>Иван Иванов +79271234567\n"
             "Алексей 89053214455</code></i>"
@@ -1501,7 +1352,7 @@ async def admin_clients_list(callback: CallbackQuery):
         f"👥 <b>База клиентов</b> ({stats['total']} всего, с телефонами: {stats['with_phone']}):\n\n"
     )
     if not clients:
-        text += "<i>В базе пока нет сохранённых клиентов.\nНажмите кнопку «📥 Импорт из Masters», чтобы загрузить выгрузку Excel / CSV или список контактов.</i>"
+        text += "<i>В базе пока нет сохранённых клиентов.\nНажмите кнопку «📥 Импорт клиентов», чтобы загрузить выгрузку Excel / CSV или список контактов.</i>"
     else:
         for c in clients:
             c_name = f"{c['first_name'] or ''} {c['last_name'] or ''}".strip() or "Без имени"
@@ -1518,7 +1369,7 @@ async def admin_clients_list(callback: CallbackQuery):
         rows.append(nav_row)
 
     rows.append([
-        InlineKeyboardButton(text="📥 Импорт из Masters (Excel / CSV)", callback_data="admin:clients:import"),
+        InlineKeyboardButton(text="📥 Импорт клиентов (Excel / CSV)", callback_data="admin:clients:import"),
     ])
     rows.append([
         InlineKeyboardButton(text="🔍 Поиск клиента", callback_data="admin:clients:search"),
@@ -1680,10 +1531,10 @@ async def admin_document_handler(message: Message):
     user_id = message.from_user.id
     fn = doc.file_name or "file.xlsx"
     if not fn.lower().endswith((".xlsx", ".csv", ".tsv", ".txt")):
-        await message.answer("⚠️ Пожалуйста, отправьте файл выгрузки Masters в формате <code>.xlsx</code> или <code>.csv</code>.")
+        await message.answer("⚠️ Пожалуйста, отправьте файл в формате <code>.xlsx</code> или <code>.csv</code>.")
         return
 
-    status_msg = await message.answer("⏳ Читаю и обрабатываю файл выгрузки клиентов из Masters...")
+    status_msg = await message.answer("⏳ Читаю и обрабатываю файл выгрузки клиентов...")
     try:
         file = await message.bot.get_file(doc.file_id)
         file_io = io.BytesIO()
@@ -1717,8 +1568,7 @@ def _has_active_admin_draft(message: Message) -> bool:
         return False
     uid = message.from_user.id
     return (
-        uid in pending_master_logins
-        or uid in admin_broadcast_drafts
+        uid in admin_broadcast_drafts
         or uid in admin_resched_drafts
         or uid in admin_create_drafts
         or uid in admin_edit_client_drafts
@@ -1727,81 +1577,13 @@ def _has_active_admin_draft(message: Message) -> bool:
     )
 
 
-# Message dispatcher for text inputs (SMS, Broadcast, Reschedule, Create appointment)
+# Message dispatcher for text inputs (Broadcast, Reschedule, Create appointment)
 @router.message(F.text, ~F.text.startswith("/"), _has_active_admin_draft)
 async def handle_admin_text_inputs(message: Message):
     if not message.from_user:
         return
     user_id = message.from_user.id
     raw_text = message.text.strip()
-
-    # 1. Master SMS login
-    if user_id in pending_master_logins and raw_text.isdigit() and len(raw_text) == 4:
-        session_data = pending_master_logins.get(user_id)
-        if session_data and not session_data.get("awaiting_phone"):
-            success, msg = confirm_master_login(session_data, raw_text)
-            if not success:
-                await message.answer(
-                    f"❌ <b>{msg}</b>\n\nПопробуйте ввести код ещё раз:",
-                    reply_markup=InlineKeyboardMarkup(
-                        inline_keyboard=[
-                            [InlineKeyboardButton(text="✏️ Ввести другой номер", callback_data="admin:masters_enter_phone")],
-                            [InlineKeyboardButton(text="⬅️ Меню админки", callback_data="admin:menu")],
-                        ]
-                    ),
-                    parse_mode="HTML",
-                )
-                return
-            pending_master_logins.pop(user_id, None)
-            ok, count, sync_msg = sync_masters_appointments()
-            await message.answer(
-                "🎉 <b>Аккаунт Masters успешно подключен!</b>\n\n"
-                f"✅ {sync_msg}\n"
-                "Теперь бот будет автоматически отправлять клиентам напоминания накануне вечером и за 2 часа до начала визита.",
-                reply_markup=admin_menu_keyboard(),
-                parse_mode="HTML",
-            )
-            return
-
-    # 2. Master phone input
-    if user_id in pending_master_logins and pending_master_logins.get(user_id, {}).get("awaiting_phone"):
-        if is_phone_number(raw_text):
-            await message.answer("⏳ Запрашиваю проверочный код в Masters...")
-            success, msg, session_data = request_master_login(raw_text)
-            if not success:
-                pending_master_logins[user_id] = {"awaiting_phone": True}
-                await message.answer(
-                    f"❌ <b>{msg}</b>\n\n"
-                    "Попробуйте ввести номер телефона мастера ещё раз (например, <code>+79991234567</code>):",
-                    reply_markup=InlineKeyboardMarkup(
-                        inline_keyboard=[[InlineKeyboardButton(text="⬅️ Меню админки", callback_data="admin:menu")]]
-                    ),
-                    parse_mode="HTML",
-                )
-                return
-            pending_master_logins[user_id] = session_data
-            await message.answer(
-                f"📩 <b>Код подтверждения отправлен</b>\n\n"
-                f"На номер <code>{session_data['phone_formatted']}</code> отправлено СМС от Masters.\n\n"
-                "👉 <b>Напишите 4 цифры из СМС в ответном сообщении:</b>",
-                reply_markup=InlineKeyboardMarkup(
-                    inline_keyboard=[
-                        [InlineKeyboardButton(text="✏️ Ввести другой номер", callback_data="admin:masters_enter_phone")],
-                        [InlineKeyboardButton(text="⬅️ Меню админки", callback_data="admin:menu")],
-                    ]
-                ),
-                parse_mode="HTML",
-            )
-            return
-        else:
-            await message.answer(
-                "⚠️ Пожалуйста, введите корректный номер телефона мастера (например, <code>+79991234567</code>):",
-                reply_markup=InlineKeyboardMarkup(
-                    inline_keyboard=[[InlineKeyboardButton(text="⬅️ Меню админки", callback_data="admin:menu")]]
-                ),
-                parse_mode="HTML",
-            )
-            return
 
     if not is_admin(user_id):
         return
@@ -2073,12 +1855,7 @@ async def handle_admin_text_inputs(message: Message):
                 platform="manual",
             )
 
-            if ok and appt_id in pending_manual_bookings:
-                # Masters sent an SMS code to the client — ask admin to relay it.
-                create_draft["step"] = "awaiting_masters_sms"
-                create_draft["appt_id"] = appt_id
-            else:
-                admin_create_drafts.pop(user_id, None)
+            admin_create_drafts.pop(user_id, None)
 
             if ok:
                 await message.answer(
@@ -2097,31 +1874,4 @@ async def handle_admin_text_inputs(message: Message):
                 )
             else:
                 await message.answer(f"❌ Ошибка создания записи: {res_msg}")
-            return
-
-        if step == "awaiting_masters_sms":
-            code = raw_text.strip()
-            if not code.isdigit() or len(code) != 4:
-                await message.answer("⚠️ Код из СМС должен содержать 4 цифры. Перешлите код, который получил клиент:")
-                return
-
-            appt_id = create_draft.get("appt_id")
-            ok_sms, msg_sms = await asyncio.to_thread(
-                confirm_manual_appointment_masters_sms, appt_id, code
-            )
-            admin_create_drafts.pop(user_id, None)
-            if ok_sms:
-                await message.answer(
-                    f"✅ {msg_sms}",
-                    reply_markup=InlineKeyboardMarkup(
-                        inline_keyboard=[
-                            [InlineKeyboardButton(text="📋 К календарю записей", callback_data="admin:appts:today:0")],
-                            [InlineKeyboardButton(text="⬅️ Главное меню", callback_data="admin:menu")],
-                        ]
-                    ),
-                )
-            else:
-                await message.answer(
-                    f"⚠️ {msg_sms}\n\nЗапись остаётся в боте. Код можно запросить у клиента и отправить ещё раз, пока Masters не отклонит попытки."
-                )
             return

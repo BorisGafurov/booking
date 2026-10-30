@@ -25,8 +25,7 @@ sys.modules[__name__] = _mod
 
 SERVICES_TO_PROXY = [
     "appointments",
-    "masters",
-    "masters_sync",
+    "booking",
     "referrals",
     "client_import",
     "recommendations",
