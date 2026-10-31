@@ -1,5 +1,6 @@
 import asyncio
 import datetime
+import html
 import logging
 import os
 from aiogram import Bot
@@ -13,6 +14,12 @@ from services.appointments import (
     get_due_evening_reminders,
     get_due_retention_reminders,
     mark_reminder_sent,
+)
+from services.reviews import (
+    get_pending_notifications,
+    mark_notification_failed,
+    mark_notification_sent,
+    mark_notification_skipped,
 )
 
 logger = logging.getLogger(__name__)
@@ -67,6 +74,17 @@ def _get_retention_keyboard() -> InlineKeyboardMarkup:
                     callback_data="menu:booking",
                 ),
             ],
+        ]
+    )
+
+
+def _get_review_invite_keyboard(appointment_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text=f"⭐ {n}", callback_data=f"review:rate:{appointment_id}:{n}")
+                for n in range(1, 6)
+            ]
         ]
     )
 
@@ -297,6 +315,67 @@ async def run_reminder_worker(bot: Bot, platform: str = "telegram"):
                     logger.info("Отправлено retention напоминание клиенту #%s (appt #%s)", target_user_id, appt["id"])
                 except Exception as send_err:
                     logger.warning("Ошибка отправки retention напоминания #%s: %s", appt["id"], send_err)
+
+            # 5. Review invitations (sent when master confirms payment in CRM)
+            invites = get_pending_notifications(platform, "review_invite")
+            for invite in invites:
+                target_user_id = invite.get("recipient_id")
+                if not target_user_id:
+                    mark_notification_skipped(invite["id"], "missing_recipient")
+                    continue
+
+                if invite.get("existing_review_id"):
+                    mark_notification_skipped(invite["id"], "already_reviewed")
+                    continue
+
+                services_name = invite.get("services") or "Стрижка"
+                text = (
+                    "✂️ <b>Спасибо, что посетил салон Срез!</b>\n\n"
+                    f"Визит: <b>{html.escape(str(services_name))}</b>\n\n"
+                    "Надеемся, стрижка принесла удовольствие и отличный настрой. "
+                    "Пожалуйста, оцени качество визита от 1 до 5 звёзд:"
+                )
+                try:
+                    await bot.send_message(
+                        chat_id=target_user_id,
+                        text=text,
+                        reply_markup=_get_review_invite_keyboard(invite["appointment_id"]),
+                        parse_mode="HTML",
+                    )
+                    mark_notification_sent(invite["id"])
+                    logger.info("Отправлено приглашение оставить отзыв клиенту #%s (appt #%s)", target_user_id, invite["appointment_id"])
+                except Exception as send_err:
+                    logger.warning("Ошибка отправки приглашения к отзыву #%s: %s", invite["id"], send_err)
+                    mark_notification_failed(invite["id"], str(send_err))
+
+            # 6. Master new review notifications (sent to admin/master when client reviews)
+            master_alerts = get_pending_notifications(platform, "master_new_review")
+            for alert in master_alerts:
+                rating = alert.get("rating") or 5
+                stars = "⭐" * int(rating)
+                client_name = alert.get("first_name") or "Клиент"
+                phone = alert.get("phone") or "—"
+                services_str = alert.get("services") or "Визит"
+                comment = alert.get("comment") or ""
+                alert_text = (
+                    f"⭐ <b>Новый отзыв: {rating}/5</b> ({stars})\n\n"
+                    f"👤 <b>Клиент:</b> {html.escape(str(client_name))}\n"
+                    f"📱 <b>Телефон:</b> {html.escape(str(phone))}\n"
+                    f"✂️ <b>Услуга:</b> {html.escape(str(services_str))}\n\n"
+                    f"«{html.escape(str(comment))}»\n\n"
+                    "🌐 <i>Отзыв опубликован на сайте srezforma.ru</i>"
+                )
+                admin_recipients = set(ADMIN_IDS) | set(MASTER_TELEGRAM_IDS)
+                for admin_id in admin_recipients:
+                    try:
+                        await bot.send_message(
+                            chat_id=admin_id,
+                            text=alert_text,
+                            parse_mode="HTML",
+                        )
+                    except Exception as a_err:
+                        logger.warning("Не удалось уведомить админа %s о новом отзыве: %s", admin_id, a_err)
+                mark_notification_sent(alert["id"])
 
         except Exception as e:
             logger.error("Ошибка в цикле reminder worker: %s", e)

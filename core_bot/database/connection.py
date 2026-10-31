@@ -118,6 +118,9 @@ class DBConnection:
     def commit(self):
         self.raw_conn.commit()
 
+    def rollback(self):
+        self.raw_conn.rollback()
+
     def close(self):
         self.raw_conn.close()
 

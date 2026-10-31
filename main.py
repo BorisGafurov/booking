@@ -13,6 +13,7 @@ from handlers.booking import router as booking_router
 from handlers.my_appointments import router as my_appointments_router
 from handlers.navigation import router as navigation_router
 from handlers.referrals import router as referrals_router
+from handlers.reviews import router as reviews_router
 from handlers.start import router as start_router
 from keyboards.menu import get_main_menu
 from services.reminder_worker import run_reminder_worker
@@ -51,6 +52,7 @@ async def main():
     dp.include_router(my_appointments_router)
     dp.include_router(navigation_router)
     dp.include_router(advice_router)
+    dp.include_router(reviews_router)
     dp.include_router(fallback_router)
 
     default_properties = DefaultBotProperties(parse_mode=ParseMode.HTML)

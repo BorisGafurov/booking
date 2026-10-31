@@ -23,6 +23,7 @@ from services.appointments import (
     reschedule_appointment,
 )
 from services.booking import get_schedule
+from services.reviews import get_reviewable_for_platform
 
 logger = logging.getLogger(__name__)
 router = Router()
@@ -50,8 +51,16 @@ def _appt_text(appt: dict) -> str:
     )
 
 
-def _my_appts_keyboard(appts: list[dict]) -> InlineKeyboardMarkup:
+def _my_appts_keyboard(appts: list[dict], reviewable: list[dict] | None = None) -> InlineKeyboardMarkup:
     rows: list[list[InlineKeyboardButton]] = []
+    if reviewable:
+        for r in reviewable:
+            rows.append([
+                InlineKeyboardButton(
+                    text=f"⭐ Оставить отзыв ({_fmt_dt(r['appointment_time'])})",
+                    callback_data=f"review:start:{r['id']}",
+                )
+            ])
     for a in appts:
         rows.append([
             InlineKeyboardButton(
@@ -71,20 +80,33 @@ def _my_appts_keyboard(appts: list[dict]) -> InlineKeyboardMarkup:
 
 async def _show_my_appointments(target: Message | CallbackQuery, user_id: int):
     appts = await asyncio.to_thread(get_user_upcoming_appointments, "telegram", user_id)
-    if not appts:
-        text = (
-            "📋 <b>У вас нет активных записей.</b>\n\n"
-            "Запишитесь на удобное время — и запись появится здесь."
+    reviewable = await asyncio.to_thread(get_reviewable_for_platform, "telegram", user_id)
+
+    parts: list[str] = []
+    if reviewable:
+        rev_lines = [
+            f"• <b>{r.get('services') or 'Визит'}</b> ({_fmt_dt(r['appointment_time'])})"
+            for r in reviewable[:3]
+        ]
+        parts.append(
+            "⭐ <b>Ожидает вашего отзыва:</b>\n"
+            + "\n".join(rev_lines)
+            + "\n<i>Нажмите кнопку ниже, чтобы оценить визит 👇</i>"
         )
-        kb = InlineKeyboardMarkup(
-            inline_keyboard=[[InlineKeyboardButton(text="✂️ Записаться", callback_data="menu:booking")]]
-        )
-    else:
+
+    if appts:
         blocks = "\n\n".join(
             f"#{a['id']}. {_appt_text(a)}" for a in appts
         )
-        text = f"📋 <b>Ваши записи:</b>\n\n{blocks}"
-        kb = _my_appts_keyboard(appts)
+        parts.append(f"📋 <b>Ваши активные записи:</b>\n\n{blocks}")
+    elif not reviewable:
+        parts.append(
+            "📋 <b>У вас нет активных записей.</b>\n\n"
+            "Запишитесь на удобное время — и запись появится здесь."
+        )
+
+    text = "\n\n".join(parts)
+    kb = _my_appts_keyboard(appts, reviewable)
 
     if isinstance(target, CallbackQuery):
         await _edit_or_send(target.message, text, reply_markup=kb, parse_mode="HTML")

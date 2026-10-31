@@ -44,6 +44,7 @@ class TestDatabaseMigrations(unittest.TestCase):
         self.assertIn("004_data_cleanups", applied)
         self.assertIn("007_client_extra_fields", applied)
         self.assertIn("008_site_sync_cleanup", applied)
+        self.assertIn("009_reviews", applied)
 
         expected_tables = {
             "schema_migrations",
@@ -53,6 +54,8 @@ class TestDatabaseMigrations(unittest.TestCase):
             "appointments",
             "user_roles",
             "master_schedule",
+            "reviews",
+            "review_notifications",
         }
         self.assertTrue(expected_tables.issubset(self._tables()))
 
@@ -72,7 +75,37 @@ class TestDatabaseMigrations(unittest.TestCase):
         appointment_columns = self._columns("appointments")
         self.assertIn("duration_min", appointment_columns)
         self.assertIn("notes", appointment_columns)
+        self.assertIn("payment_confirmed", appointment_columns)
+        self.assertIn("paid_at", appointment_columns)
         self.assertNotIn("masters_id", appointment_columns)
+
+        review_columns = self._columns("reviews")
+        for column in (
+            "id",
+            "user_id",
+            "appointment_id",
+            "rating",
+            "comment",
+            "source",
+            "status",
+            "created_at",
+            "updated_at",
+        ):
+            self.assertIn(column, review_columns)
+
+        notification_columns = self._columns("review_notifications")
+        for column in (
+            "kind",
+            "appointment_id",
+            "review_id",
+            "user_id",
+            "platform",
+            "recipient_id",
+            "status",
+            "attempts",
+            "sent_at",
+        ):
+            self.assertIn(column, notification_columns)
 
         applied_set = get_applied_migrations(self.conn)
         self.assertEqual(len(applied_set), len(applied))
