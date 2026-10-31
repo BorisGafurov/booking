@@ -116,6 +116,7 @@ def _save_user_unified(
     uname = username or domain
     with get_connection() as conn:
         user = None
+        # 1. Search by platform IDs
         if telegram_id:
             row = conn.execute("SELECT * FROM users WHERE telegram_id = %s", (telegram_id,)).fetchone()
             user = dict(row) if row else None
@@ -126,30 +127,48 @@ def _save_user_unified(
             row = conn.execute("SELECT * FROM users WHERE max_user_id = %s", (max_user_id,)).fetchone()
             user = dict(row) if row else None
 
+        # 2. Search by normalized phone if not found by platform ID
+        if not user and phone:
+            row = conn.execute("SELECT * FROM users WHERE phone = %s", (phone,)).fetchone()
+            user = dict(row) if row else None
+
         if not user:
-            cursor = conn.execute(
-                """
-                INSERT INTO users (telegram_id, vk_id, max_user_id, username, first_name, last_name, phone)
-                VALUES (%s, %s, %s, %s, %s, %s, %s)
-                RETURNING id;
-                """,
-                (telegram_id, vk_id, max_user_id, uname, first_name, last_name, phone),
-            )
-            inserted_id = cursor.fetchone()[0]
+            if conn.is_pg:
+                cursor = conn.execute(
+                    """
+                    INSERT INTO users (telegram_id, vk_id, max_user_id, username, first_name, last_name, phone)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    RETURNING id;
+                    """,
+                    (telegram_id, vk_id, max_user_id, uname, first_name, last_name, phone),
+                )
+                inserted_id = cursor.fetchone()[0]
+            else:
+                conn.execute(
+                    """
+                    INSERT INTO users (telegram_id, vk_id, max_user_id, username, first_name, last_name, phone)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s);
+                    """,
+                    (telegram_id, vk_id, max_user_id, uname, first_name, last_name, phone),
+                )
+                inserted_id = conn.raw_conn.execute("SELECT last_insert_rowid()").fetchone()[0]
             conn.commit()
             return inserted_id, True
 
         conn.execute(
             """
             UPDATE users
-            SET username = %s,
-                first_name = %s,
-                last_name = %s,
+            SET username = COALESCE(%s, username),
+                first_name = COALESCE(%s, first_name),
+                last_name = COALESCE(%s, last_name),
                 phone = COALESCE(%s, phone),
+                telegram_id = COALESCE(%s, telegram_id),
+                vk_id = COALESCE(%s, vk_id),
+                max_user_id = COALESCE(%s, max_user_id),
                 updated_at = CURRENT_TIMESTAMP
             WHERE id = %s;
             """,
-            (uname, first_name, last_name, phone, user["id"]),
+            (uname, first_name, last_name, phone, telegram_id, vk_id, max_user_id, user["id"]),
         )
         conn.commit()
         return user["id"], False

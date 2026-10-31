@@ -63,21 +63,24 @@ def apply(conn) -> None:
     # 2. Every review is a separate row, linked to the client and the visit.
     #    appointment_id is unique: one review per visit. Old reviews are never
     #    overwritten; a client can edit their own review for 24 hours.
+    #    appointment_id can be NULL for imported VK community reviews.
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS reviews (
             id SERIAL PRIMARY KEY,
             user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-            appointment_id INTEGER NOT NULL UNIQUE REFERENCES appointments(id) ON DELETE CASCADE,
+            appointment_id INTEGER UNIQUE REFERENCES appointments(id) ON DELETE CASCADE,
             rating SMALLINT NOT NULL CHECK (rating BETWEEN 1 AND 5),
             comment TEXT NOT NULL,
             source VARCHAR(16) NOT NULL DEFAULT 'site',
             status VARCHAR(16) NOT NULL DEFAULT 'published',
+            external_id VARCHAR(64) UNIQUE,
             created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
             updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
         );
         """
     )
+    _add_column_if_missing(conn, "reviews", "external_id", "VARCHAR(64)", "TEXT")
 
     # 3. Cross-process notification outbox. The site and bots share PostgreSQL;
     #    each bot worker picks up messages for its own platform.

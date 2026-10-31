@@ -379,7 +379,7 @@ def get_public_reviews(limit: int = 20, offset: int = 0) -> dict[str, Any]:
                    a.services, a.appointment_time
             FROM reviews r
             JOIN users u ON u.id = r.user_id
-            JOIN appointments a ON a.id = r.appointment_id
+            LEFT JOIN appointments a ON a.id = r.appointment_id
             WHERE r.status = 'published'
             ORDER BY r.created_at DESC
             LIMIT %s OFFSET %s
@@ -453,7 +453,7 @@ def get_master_reviews(limit: int = 100, offset: int = 0, rating: int | None = N
                    a.services, a.total_price, a.appointment_time, a.platform
             FROM reviews r
             JOIN users u ON u.id = r.user_id
-            JOIN appointments a ON a.id = r.appointment_id
+            LEFT JOIN appointments a ON a.id = r.appointment_id
             {where}
             ORDER BY r.created_at DESC
             LIMIT %s OFFSET %s
@@ -530,28 +530,29 @@ def get_master_reviews(limit: int = 100, offset: int = 0, rating: int | None = N
 def _insert_review(
     conn,
     user_id: int,
-    appointment_id: int,
+    appointment_id: int | None,
     rating: int,
     comment: str,
     source: str,
+    external_id: str | None = None,
 ) -> dict[str, Any]:
     if conn.is_pg:
         row = conn.execute(
             """
-            INSERT INTO reviews (user_id, appointment_id, rating, comment, source, status)
-            VALUES (%s, %s, %s, %s, %s, 'published')
+            INSERT INTO reviews (user_id, appointment_id, rating, comment, source, status, external_id)
+            VALUES (%s, %s, %s, %s, %s, 'published', %s)
             RETURNING *
             """,
-            (user_id, appointment_id, rating, comment, source),
+            (user_id, appointment_id, rating, comment, source, external_id),
         ).fetchone()
         return dict(row)
 
     conn.execute(
         """
-        INSERT INTO reviews (user_id, appointment_id, rating, comment, source, status)
-        VALUES (%s, %s, %s, %s, %s, 'published')
+        INSERT INTO reviews (user_id, appointment_id, rating, comment, source, status, external_id)
+        VALUES (%s, %s, %s, %s, %s, 'published', %s)
         """,
-        (user_id, appointment_id, rating, comment, source),
+        (user_id, appointment_id, rating, comment, source, external_id),
     )
     row_id = conn.raw_conn.execute("SELECT last_insert_rowid()").fetchone()[0]
     row = conn.execute("SELECT * FROM reviews WHERE id = %s", (row_id,)).fetchone()
@@ -649,6 +650,76 @@ def create_review(
             return False, "Не удалось сохранить отзыв. Попробуйте ещё раз.", None
 
     return True, "Спасибо за отзыв! Он опубликован.", review
+
+
+def import_external_review(
+    platform: str,
+    platform_user_id: int,
+    rating: int,
+    comment: str,
+    author_name: str,
+    external_id: str,
+    author_last_name: str = "",
+) -> tuple[bool, str, dict[str, Any] | None]:
+    """
+    Imports an external review (e.g. from VK group reviews) without requiring
+    a prior appointment. If the user doesn't exist, a new user row is created.
+    If the review has already been imported, returns the existing review.
+    """
+    ok, parsed_rating, normalized_comment, error = validate_review(rating, comment)
+    if not ok:
+        return False, error or "Проверьте оценку и текст.", None
+
+    with get_connection() as conn:
+        # Check if external_id already exists to prevent duplicate imports
+        row = conn.execute(
+            "SELECT * FROM reviews WHERE external_id = %s", (str(external_id),)
+        ).fetchone()
+        if row:
+            return True, "Отзыв уже был импортирован ранее.", dict(row)
+
+        # Find or create user
+        user = _get_user(conn, platform=platform, platform_user_id=platform_user_id)
+        if not user:
+            col = _PLATFORM_COLUMNS.get(platform, "vk_id")
+            if conn.is_pg:
+                u_row = conn.execute(
+                    f"""
+                    INSERT INTO users ({col}, first_name, last_name, role)
+                    VALUES (%s, %s, %s, 'client')
+                    RETURNING *
+                    """,
+                    (platform_user_id, author_name, author_last_name),
+                ).fetchone()
+                user = dict(u_row)
+            else:
+                conn.execute(
+                    f"""
+                    INSERT INTO users ({col}, first_name, last_name, role)
+                    VALUES (%s, %s, %s, 'client')
+                    """,
+                    (platform_user_id, author_name, author_last_name),
+                )
+                uid = conn.raw_conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+                user = dict(conn.execute("SELECT * FROM users WHERE id = %s", (uid,)).fetchone())
+
+        try:
+            review = _insert_review(
+                conn,
+                user_id=int(user["id"]),
+                appointment_id=None,
+                rating=parsed_rating,
+                comment=normalized_comment,
+                source=platform,
+                external_id=str(external_id),
+            )
+            _queue_master_notification(conn, int(review["id"]), int(user["id"]))
+            conn.commit()
+            return True, "Отзыв успешно импортирован.", review
+        except Exception as exc:
+            logger.warning("Error importing external review %s: %s", external_id, exc)
+            conn.rollback()
+            return False, str(exc), None
 
 
 def update_review(

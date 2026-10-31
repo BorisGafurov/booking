@@ -84,7 +84,13 @@ def _get_review_invite_keyboard(appointment_id: int) -> InlineKeyboardMarkup:
             [
                 InlineKeyboardButton(text=f"⭐ {n}", callback_data=f"review:rate:{appointment_id}:{n}")
                 for n in range(1, 6)
-            ]
+            ],
+            [
+                InlineKeyboardButton(
+                    text="💬 Оставить отзыв в группе ВКонтакте",
+                    url="https://vk.ru/reviews-242475554",
+                )
+            ],
         ]
     )
 
