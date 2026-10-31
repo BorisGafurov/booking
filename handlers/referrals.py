@@ -180,6 +180,7 @@ def admin_appt_card_keyboard(appt: dict, current_filter: str, offset: int) -> In
     rows = []
     appt_id = appt["id"]
     status = appt.get("status", "confirmed")
+    is_paid = bool(appt.get("payment_confirmed"))
 
     if status != "completed" and status != "cancelled":
         rows.append([
@@ -196,6 +197,15 @@ def admin_appt_card_keyboard(appt: dict, current_filter: str, offset: int) -> In
         rows.append([
             InlineKeyboardButton(text="🗓 Перенести", callback_data=f"admin:resched_start:{appt_id}:{current_filter}:{offset}"),
             InlineKeyboardButton(text="❌ Отменить запись", callback_data=f"admin:cancel_appt:{appt_id}:{current_filter}:{offset}"),
+        ])
+    elif status == "completed":
+        if not is_paid:
+            rows.append([
+                InlineKeyboardButton(text="💰 Визит оплачен", callback_data=f"admin:paid_appt:{appt_id}:{current_filter}:{offset}")
+            ])
+        rows.append([
+            InlineKeyboardButton(text="✏️ Изменить клиента (имя / тел.)", callback_data=f"admin:edit_client:{appt_id}:{current_filter}:{offset}"),
+            InlineKeyboardButton(text="💰 Изменить цену / услугу", callback_data=f"admin:edit_price:{appt_id}:{current_filter}:{offset}"),
         ])
     else:
         rows.append([
@@ -430,8 +440,9 @@ async def admin_appt_detail(callback: CallbackQuery):
         return
 
     st = appt.get("status", "confirmed")
+    is_paid = bool(appt.get("payment_confirmed"))
     if st == "completed":
-        st_text = "✂️ Завершена (клиент пострижен)"
+        st_text = "✂️ Завершена (оплачена)" if is_paid else "✂️ Завершена (ожидает оплаты)"
     elif st == "cancelled":
         st_text = "❌ Отменена"
     elif appt.get("client_confirmed"):
@@ -499,6 +510,25 @@ async def admin_complete_appt_handler(callback: CallbackQuery):
             logger.warning("Не удалось отправить уведомление рефереру: %s", e)
 
     await callback.answer(msg[:200], show_alert=False)
+    # Refresh card
+    updated_appt = get_appointment(appt_id)
+    if updated_appt and callback.message:
+        await admin_appt_detail(callback)
+
+
+@router.callback_query(F.data.startswith("admin:paid_appt:"))
+async def admin_paid_appt_handler(callback: CallbackQuery):
+    if not callback.from_user or not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа.", show_alert=True)
+        return
+
+    parts = callback.data.split(":")
+    appt_id = int(parts[2])
+
+    from services.reviews import mark_appointment_paid
+    ok, msg, appt, invite = mark_appointment_paid(appt_id)
+    await callback.answer(msg[:200], show_alert=not ok)
+
     # Refresh card
     updated_appt = get_appointment(appt_id)
     if updated_appt and callback.message:

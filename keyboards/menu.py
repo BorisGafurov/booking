@@ -24,6 +24,9 @@ def get_main_menu(is_admin: bool = False) -> ReplyKeyboardMarkup:
             KeyboardButton(text="🎁 Пригласить друга"),
             KeyboardButton(text="🧴 Советы и товары"),
         ],
+        [
+            KeyboardButton(text="⭐ Мои отзывы"),
+        ],
     ]
 
     if is_admin:

@@ -13,6 +13,7 @@ from services.reviews import (
     can_review_platform_appointment,
     create_review_from_platform,
     get_reviewable_for_platform,
+    get_reviews_for_platform,
 )
 
 logger = logging.getLogger(__name__)
@@ -45,6 +46,54 @@ def get_cancel_keyboard() -> InlineKeyboardMarkup:
             [InlineKeyboardButton(text="❌ Отменить написание отзыва", callback_data="review:cancel")]
         ]
     )
+
+
+@router.message(F.text.in_({"⭐ Мои отзывы", "Мои отзывы", "/reviews", "/my_reviews"}))
+async def show_my_reviews(message: Message):
+    if not message.from_user:
+        return
+    user_id = message.from_user.id
+    reviews = get_reviews_for_platform("telegram", user_id)
+    reviewable = get_reviewable_for_platform("telegram", user_id)
+
+    lines = ["⭐ <b>Мои отзывы</b>\n"]
+
+    if not reviews and not reviewable:
+        lines.append(
+            "У тебя пока нет оставленных отзывов.\n\n"
+            "После того как визит состоится и мастер подтвердит оплату, "
+            "здесь появится возможность оценить стрижку и сервис! 💈"
+        )
+        await message.answer("\n".join(lines), parse_mode="HTML")
+        return
+
+    # If there are completed visits without review yet, show buttons to review them
+    if reviewable:
+        lines.append("✂️ <b>Визиты, ожидающие вашего отзыва:</b>")
+        buttons = []
+        for v in reviewable[:3]:
+            svc = v.get("services") or "Визит"
+            time_str = str(v.get("appointment_time") or "")[:10]
+            lines.append(f"• {html.escape(svc)} ({time_str})")
+            buttons.append([
+                InlineKeyboardButton(
+                    text=f"✍️ Оставить отзыв ({svc[:15]})",
+                    callback_data=f"review:start:{v['id']}",
+                )
+            ])
+        lines.append("")
+
+    if reviews:
+        lines.append("📋 <b>Ваша история отзывов:</b>\n")
+        for r in reviews[:5]:
+            stars = "⭐" * int(r.get("rating") or 5)
+            created = str(r.get("created_at") or "")[:10]
+            comment = html.escape(str(r.get("comment") or ""))
+            svc = html.escape(str(r.get("services") or "Стрижка"))
+            lines.append(f"{stars} ({r.get('rating')}/5) · <i>{created}</i>\n✂️ {svc}\n«{comment}»\n")
+
+    keyboard = InlineKeyboardMarkup(inline_keyboard=buttons) if reviewable else None
+    await message.answer("\n".join(lines), reply_markup=keyboard, parse_mode="HTML")
 
 
 @router.callback_query(F.data.startswith("review:start:"))

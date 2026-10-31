@@ -322,6 +322,13 @@ def create_review_from_platform(
     )
 
 
+def get_reviews_for_platform(platform: str, platform_user_id: int, limit: int = 50) -> list[dict[str, Any]]:
+    user = get_user_for_platform(platform, platform_user_id)
+    if not user:
+        return []
+    return get_reviews_for_user(int(user["id"]), limit=limit)
+
+
 def get_reviews_for_user(user_id: int, limit: int = 50) -> list[dict[str, Any]]:
     with get_connection() as conn:
         rows = conn.execute(
