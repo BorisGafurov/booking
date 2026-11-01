@@ -66,7 +66,8 @@ def get_pg_pool():
                 min_size=0,
                 max_size=10,
                 max_idle=300,
-                kwargs={"row_factory": dict_row, "connect_timeout": 3},
+                check=ConnectionPool.check_connection,
+                kwargs={"row_factory": dict_row, "connect_timeout": 5},
                 open=True,
             )
         except Exception as e:
@@ -157,23 +158,25 @@ def get_connection() -> Generator[DBConnection, None, None]:
     global _pg_unreachable, _last_pg_check
     now = time.time()
     if _pg_unreachable:
-        # Fail closed: never silently switch to SQLite when the fallback is disabled.
-        if not ALLOW_SQLITE_FALLBACK:
+        if now - _last_pg_check > 30:
+            # Backoff window expired: attempt to reconnect to PostgreSQL on this call
+            _pg_unreachable = False
+            _last_pg_check = now
+        elif not ALLOW_SQLITE_FALLBACK:
+            # Fail closed during active cooldown: do not fall back to SQLite when disabled
             logger.critical(
-                "PostgreSQL is marked unreachable and SQLite fallback is disabled; refusing connection"
+                "PostgreSQL is marked unreachable and SQLite fallback is disabled; refusing connection (cooling down for %.1fs)",
+                max(0.0, 30.0 - (now - _last_pg_check)),
             )
             raise RuntimeError(
                 "Database connection error: PostgreSQL unavailable and SQLite fallback disabled"
             )
-        if now - _last_pg_check > 60:
-            _pg_unreachable = False
-            _last_pg_check = now
 
     if IS_POSTGRES and not _pg_unreachable:
         pool = get_pg_pool()
         if pool is not None:
             try:
-                with pool.connection(timeout=1.5) as conn:
+                with pool.connection(timeout=5.0) as conn:
                     yield DBConnection(conn, is_pg=True)
                     return
             except Exception as pe:
@@ -188,7 +191,7 @@ def get_connection() -> Generator[DBConnection, None, None]:
                 conn = psycopg.connect(
                     DATABASE_URL,
                     row_factory=dict_row,
-                    connect_timeout=2,
+                    connect_timeout=5,
                 )
                 try:
                     with conn:

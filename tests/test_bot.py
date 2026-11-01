@@ -212,12 +212,13 @@ class TestBookingBot(unittest.IsolatedAsyncioTestCase):
     def test_keyboards(self):
         menu_admin = get_main_menu(is_admin=True)
         self.assertIsNotNone(menu_admin)
-        self.assertEqual(len(menu_admin.keyboard), 4)
+        self.assertEqual(len(menu_admin.keyboard), 5)
 
         menu_user = get_main_menu(is_admin=False)
-        self.assertEqual(len(menu_user.keyboard), 3)
+        self.assertEqual(len(menu_user.keyboard), 4)
         flat_texts = [b.text for row in menu_user.keyboard for b in row]
         self.assertIn("📋 Мои записи", flat_texts)
+        self.assertIn("⭐ Мои отзывы", flat_texts)
 
         booking_kb = get_booking_keyboard()
         self.assertIsNotNone(booking_kb)
@@ -1193,6 +1194,7 @@ class TestBookingBot(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(get_appointment(appt_id)["status"], "completed")
 
     def test_postgres_split_brain_protection(self):
+        import time
         from unittest.mock import patch
         import core_bot.database.connection as conn_mod
 
@@ -1215,6 +1217,13 @@ class TestBookingBot(unittest.IsolatedAsyncioTestCase):
                     with conn_mod.get_connection():
                         pass
                 self.assertIn("SQLite fallback disabled", str(ctx2.exception))
+
+                # After backoff interval, _pg_unreachable is reset so reconnection is re-attempted
+                conn_mod._last_pg_check = time.time() - 35
+                with self.assertRaises(RuntimeError) as ctx3:
+                    with conn_mod.get_connection():
+                        pass
+                self.assertIn("SQLite fallback disabled", str(ctx3.exception))
         finally:
             conn_mod._pg_unreachable = prev_unreachable
             conn_mod._last_pg_check = prev_check
