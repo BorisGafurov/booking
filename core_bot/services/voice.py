@@ -7,12 +7,14 @@ import json
 logger = logging.getLogger(__name__)
 
 ZVONOK_API_URL = "https://zvonok.com/manager/cabapi_external/api/v1/phones/call/"
+DEFAULT_PUBLIC_KEY = "07cd1e782fa3c265d1ce53c0dedd5036"
+DEFAULT_CAMPAIGN_ID = "1852297522"
 
 
 def is_voice_configured() -> bool:
-    """Checks whether Zvonok.com credentials are set up in the environment."""
-    public_key = os.getenv("ZVONOK_PUBLIC_KEY", "").strip()
-    campaign_id = os.getenv("ZVONOK_CAMPAIGN_ID", "").strip()
+    """Checks whether Zvonok.com credentials are set up in the environment or defaults."""
+    public_key = os.getenv("ZVONOK_PUBLIC_KEY", DEFAULT_PUBLIC_KEY).strip()
+    campaign_id = os.getenv("ZVONOK_CAMPAIGN_ID", DEFAULT_CAMPAIGN_ID).strip()
     return bool(public_key and campaign_id)
 
 
@@ -22,8 +24,8 @@ def send_voice_reminder(appointment: dict) -> bool:
     Returns True if the call was successfully queued, False otherwise.
     Never raises exceptions, ensuring safe fallback.
     """
-    public_key = os.getenv("ZVONOK_PUBLIC_KEY", "").strip()
-    campaign_id = os.getenv("ZVONOK_CAMPAIGN_ID", "").strip()
+    public_key = os.getenv("ZVONOK_PUBLIC_KEY", DEFAULT_PUBLIC_KEY).strip()
+    campaign_id = os.getenv("ZVONOK_CAMPAIGN_ID", DEFAULT_CAMPAIGN_ID).strip()
     enabled = os.getenv("VOICE_REMINDERS_ENABLED", "true").lower() in ("1", "true", "yes")
 
     if not enabled:
