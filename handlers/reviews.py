@@ -169,7 +169,10 @@ async def handle_review_cancel_callback(callback: CallbackQuery):
     await callback.answer("Отменено")
 
 
-@router.message(F.text)
+@router.message(
+    F.text,
+    lambda msg: bool(msg.from_user and msg.from_user.id in user_pending_review),
+)
 async def handle_review_comment_input(message: Message):
     if not message.from_user or not message.text:
         return

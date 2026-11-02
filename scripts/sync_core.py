@@ -31,6 +31,7 @@ SERVICES_TO_PROXY = [
     "recommendations",
     "reviews",
     "voice",
+    "notify",
 ]
 
 

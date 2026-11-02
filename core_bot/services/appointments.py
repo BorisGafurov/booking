@@ -55,6 +55,7 @@ def create_or_update_appointment(
     platform: str = "telegram",
     platform_user_id: int = 0,
     duration_min: int | None = None,
+    validate_schedule: bool = False,
 ) -> int:
     """
     Creates a booking in the shared «Срез» database.
@@ -194,6 +195,17 @@ def create_or_update_appointment(
             conn.commit()
             return existing_row["id"]
 
+        if validate_schedule and platform in ("telegram", "vk", "max", "web") and platform != "manual":
+            from core_bot.services.booking import is_slot_available
+            avail, reason = is_slot_available(
+                appointment_time,
+                duration_min=duration,
+            )
+            if not avail:
+                if conn.is_pg:
+                    conn.raw_conn.rollback()
+                raise SlotUnavailableError(reason)
+
         overlap = find_overlapping_appointment(conn, appointment_time, duration)
         if overlap:
             conn.raw_conn.rollback()
@@ -223,6 +235,7 @@ def create_or_update_appointment(
                 ),
             ).fetchone()
             conn.commit()
+            queue_master_event({"id": res["id"], "user_id": user_db_id}, "master_booking_created", platform)
             return res["id"]
 
         conn.execute(
@@ -247,6 +260,7 @@ def create_or_update_appointment(
         cursor = conn.raw_conn.execute("SELECT last_insert_rowid()")
         row_id = cursor.fetchone()[0]
         conn.commit()
+        queue_master_event({"id": row_id, "user_id": user_db_id}, "master_booking_created", platform)
         return row_id
 
 
@@ -263,12 +277,29 @@ def _check_appointment_access(
         return True
 
     try:
-        from core_bot.services.referrals import is_master_user, get_user_by_platform_id
+        from core_bot.services.referrals import (
+            get_user_by_platform_id,
+            is_master_user,
+            normalize_phone,
+        )
+
         if is_master_user(platform_user_id, platform):
             return True
 
         if appt.get("platform") == platform and appt.get("platform_user_id") == platform_user_id:
             return True
+
+        # The same client may act from another messenger after profiles were
+        # merged (or after booking on the website). Allow access when the
+        # appointment belongs to the caller's user row or the same phone.
+        caller = get_user_by_platform_id(platform_user_id, platform=platform)
+        if caller:
+            if appt.get("user_id") and int(appt["user_id"]) == int(caller["id"]):
+                return True
+            appt_phone = normalize_phone(appt.get("phone") or "")
+            caller_phone = normalize_phone(caller.get("phone") or "")
+            if appt_phone and caller_phone and appt_phone == caller_phone:
+                return True
 
     except Exception as e:
         logger.error("Error in _check_appointment_access: %s", e)
@@ -301,6 +332,7 @@ def cancel_appointment(
         conn.commit()
         res = dict(appt)
         res["status"] = "cancelled"
+        queue_master_event(res, "master_booking_cancelled", platform)
 
     return True, "Запись успешно отменена", res
 
@@ -322,6 +354,7 @@ def confirm_appointment_by_client(
         if appt["status"] == "cancelled":
             return False, "Запись уже отменена", appt
 
+        was_confirmed = bool(appt.get("client_confirmed"))
         val = True if conn.is_pg else 1
         conn.execute(
             "UPDATE appointments SET client_confirmed = %s, updated_at = CURRENT_TIMESTAMP WHERE id = %s",
@@ -330,6 +363,8 @@ def confirm_appointment_by_client(
         conn.commit()
         res = dict(appt)
         res["client_confirmed"] = True
+        if not was_confirmed:
+            queue_master_event(res, "master_booking_confirmed", platform)
 
     return True, "Запись успешно подтверждена", res
 
@@ -516,9 +551,11 @@ def reschedule_appointment(
             """,
             (dt_val, val_false, val_false, val_false, appointment_id),
         )
+        conn.execute("DELETE FROM reminder_deliveries WHERE appointment_id = %s", (appointment_id,))
         conn.commit()
         appt["appointment_time"] = new_datetime
         appt["status"] = "confirmed"
+        queue_master_event(appt, "master_booking_rescheduled", platform)
 
     return True, "Запись успешно перенесена!", appt
 
@@ -801,6 +838,119 @@ def get_upcoming_days_schedule(days_ahead: int = 14) -> list[dict]:
     return result
 
 
+_REMINDER_FLAGS = {
+    "evening": "reminder_evening_sent",
+    "morning": "reminder_morning_sent",
+    "2h": "reminder_2h_sent",
+    "retention": "retention_18d_sent",
+}
+
+
+def _delivery_conditions(kind: str) -> str:
+    """SQL for "this reminder was not yet delivered on the current platform".
+
+    The legacy global flag is kept to avoid re-notifying historical visits
+    after the upgrade: once at least one platform recorded a delivery, the
+    remaining platforms may catch up on their own.
+    """
+    flag = _REMINDER_FLAGS[kind]
+    return f"""
+        AND NOT EXISTS (
+            SELECT 1 FROM reminder_deliveries d
+            WHERE d.appointment_id = appointments.id
+              AND d.kind = %s AND d.platform = %s
+        )
+        AND (
+            {flag} = FALSE
+            OR EXISTS (
+                SELECT 1 FROM reminder_deliveries d2
+                WHERE d2.appointment_id = appointments.id AND d2.kind = %s
+            )
+        )
+    """
+
+
+def record_reminder_delivery(
+    appointment_id: int,
+    reminder_type: str,
+    platform: str,
+    status: str = "sent",
+    error: str | None = None,
+) -> None:
+    """Records delivery (or a skip) for one appointment/kind/platform."""
+    if not appointment_id or not reminder_type or not platform:
+        return
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT id FROM reminder_deliveries WHERE appointment_id = %s AND kind = %s AND platform = %s",
+            (appointment_id, reminder_type, platform),
+        ).fetchone()
+        if row:
+            conn.execute(
+                "UPDATE reminder_deliveries SET status = %s, last_error = %s, sent_at = CURRENT_TIMESTAMP WHERE id = %s",
+                (status, error, row["id"]),
+            )
+        else:
+            conn.execute(
+                """
+                INSERT INTO reminder_deliveries
+                    (appointment_id, kind, platform, status, last_error, sent_at)
+                VALUES (%s, %s, %s, %s, %s, CURRENT_TIMESTAMP)
+                """,
+                (appointment_id, reminder_type, platform, status, error),
+            )
+        conn.commit()
+
+
+def clear_reminder_deliveries(appointment_id: int) -> None:
+    """Drops delivery marks after a reschedule so reminders can fire again."""
+    if not appointment_id:
+        return
+    with get_connection() as conn:
+        conn.execute("DELETE FROM reminder_deliveries WHERE appointment_id = %s", (appointment_id,))
+        conn.commit()
+
+
+_MASTER_EVENT_PLATFORMS = ("telegram", "vk", "max")
+
+
+def queue_master_event(appointment: dict[str, Any] | None, kind: str, source_platform: str | None) -> None:
+    """Queues a master alert for all messengers except the one that already
+    alerted the master synchronously in its own handler."""
+    if not appointment or not appointment.get("id"):
+        return
+    source = (source_platform or "").lower()
+    if source not in _MASTER_EVENT_PLATFORMS:
+        return
+    platforms = [p for p in _MASTER_EVENT_PLATFORMS if p != source]
+    if not platforms:
+        return
+    try:
+        with get_connection() as conn:
+            for platform in platforms:
+                exists = conn.execute(
+                    """
+                    SELECT id FROM review_notifications
+                    WHERE kind = %s AND appointment_id = %s AND platform = %s
+                    LIMIT 1
+                    """,
+                    (kind, appointment["id"], platform),
+                ).fetchone()
+                if exists:
+                    continue
+                conn.execute(
+                    """
+                    INSERT INTO review_notifications
+                        (kind, appointment_id, user_id, platform, status)
+                    VALUES (%s, %s, %s, %s, 'pending')
+                    """,
+                    (kind, appointment["id"], appointment.get("user_id"), platform),
+                )
+            conn.commit()
+    except Exception as exc:  # notification is best-effort, booking must succeed
+        logger.warning("Не удалось поставить уведомление мастера в очередь: %s", exc)
+
+
 def get_due_evening_reminders(platform: str | None = None) -> list[dict]:
     """
     Find appointments scheduled for tomorrow where reminder_evening_sent is False.
@@ -817,18 +967,16 @@ def get_due_evening_reminders(platform: str | None = None) -> list[dict]:
         query = """
             SELECT * FROM appointments
             WHERE status = 'confirmed'
-              AND reminder_evening_sent = FALSE
               AND appointment_time >= %s AND appointment_time < %s
         """
         t_start = tomorrow_start if conn.is_pg else tomorrow_start.strftime("%Y-%m-%d %H:%M:%S")
         t_end = tomorrow_end if conn.is_pg else tomorrow_end.strftime("%Y-%m-%d %H:%M:%S")
         params = [t_start, t_end]
         if platform:
-            if platform == "telegram":
-                query += " AND (platform = %s OR platform IN ('web', 'manual') OR platform IS NULL OR platform = '')"
-            else:
-                query += " AND platform = %s"
-            params.append(platform)
+            query += _delivery_conditions("evening")
+            params.extend(["evening", platform, "evening"])
+        else:
+            query += " AND reminder_evening_sent = FALSE"
         query += " ORDER BY appointment_time ASC"
 
         rows = conn.execute(query, tuple(params)).fetchall()
@@ -854,7 +1002,6 @@ def get_due_confirmation_followup_reminders(platform: str | None = None) -> list
             SELECT * FROM appointments
             WHERE status = 'confirmed'
               AND reminder_evening_sent = TRUE
-              AND reminder_morning_sent = FALSE
               AND client_confirmed = FALSE
               AND appointment_time >= %s AND appointment_time < %s
               AND appointment_time > %s
@@ -864,11 +1011,10 @@ def get_due_confirmation_followup_reminders(platform: str | None = None) -> list
         t_min = min_time if conn.is_pg else min_time.strftime("%Y-%m-%d %H:%M:%S")
         params = [t_start, t_end, t_min]
         if platform:
-            if platform == "telegram":
-                query += " AND (platform = %s OR platform IN ('web', 'manual') OR platform IS NULL OR platform = '')"
-            else:
-                query += " AND platform = %s"
-            params.append(platform)
+            query += _delivery_conditions("morning")
+            params.extend(["morning", platform, "morning"])
+        else:
+            query += " AND reminder_morning_sent = FALSE"
         query += " ORDER BY appointment_time ASC"
 
         rows = conn.execute(query, tuple(params)).fetchall()
@@ -886,18 +1032,16 @@ def get_due_2h_reminders(platform: str | None = None) -> list[dict]:
         query = """
             SELECT * FROM appointments
             WHERE status = 'confirmed'
-              AND reminder_2h_sent = FALSE
               AND appointment_time > %s AND appointment_time <= %s
         """
         p_now = now if conn.is_pg else now.strftime("%Y-%m-%d %H:%M:%S")
         p_limit = limit if conn.is_pg else limit.strftime("%Y-%m-%d %H:%M:%S")
         params = [p_now, p_limit]
         if platform:
-            if platform == "telegram":
-                query += " AND (platform = %s OR platform IN ('web', 'manual') OR platform IS NULL OR platform = '')"
-            else:
-                query += " AND platform = %s"
-            params.append(platform)
+            query += _delivery_conditions("2h")
+            params.extend(["2h", platform, "2h"])
+        else:
+            query += " AND reminder_2h_sent = FALSE"
         query += " ORDER BY appointment_time ASC"
 
         rows = conn.execute(query, tuple(params)).fetchall()
@@ -920,18 +1064,16 @@ def get_due_retention_reminders(platform: str | None = None) -> list[dict]:
         query = """
             SELECT * FROM appointments
             WHERE status = 'completed'
-              AND retention_18d_sent = FALSE
               AND appointment_time <= %s AND appointment_time >= %s
         """
         p_older = older_than if conn.is_pg else older_than.strftime("%Y-%m-%d %H:%M:%S")
         p_newer = newer_than if conn.is_pg else newer_than.strftime("%Y-%m-%d %H:%M:%S")
         params = [p_older, p_newer]
         if platform:
-            if platform == "telegram":
-                query += " AND (platform = %s OR platform IN ('web', 'manual') OR platform IS NULL OR platform = '')"
-            else:
-                query += " AND platform = %s"
-            params.append(platform)
+            query += _delivery_conditions("retention")
+            params.extend(["retention", platform, "retention"])
+        else:
+            query += " AND retention_18d_sent = FALSE"
         query += " ORDER BY appointment_time ASC"
 
         rows = conn.execute(query, tuple(params)).fetchall()

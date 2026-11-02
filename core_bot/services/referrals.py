@@ -155,6 +155,21 @@ def _save_user_unified(
             conn.commit()
             return inserted_id, True
 
+        # Exact phone match: merge this platform profile into the phone owner.
+        if phone:
+            normalized = normalize_phone(phone)
+            if normalized:
+                phone = normalized
+                owner = conn.execute("SELECT * FROM users WHERE phone = %s", (normalized,)).fetchone()
+                if owner and owner["id"] != user["id"]:
+                    if merge_users(conn, owner["id"], user["id"]):
+                        user = dict(
+                            conn.execute("SELECT * FROM users WHERE id = %s", (owner["id"],)).fetchone()
+                        )
+                    else:
+                        # Same-platform ID conflict: keep the existing phone.
+                        phone = None
+
         conn.execute(
             """
             UPDATE users
@@ -656,14 +671,189 @@ PHONE_CONFLICT_MESSAGE = (
     "Аккаунты не объединены; запись можно оформить на этот номер. "
     "Для объединения профилей обратитесь к мастеру."
 )
+PROFILE_MERGED_MESSAGE = (
+    "Номер привязан, профили объединены. "
+    "Теперь записи, бонусы и отзывы доступны с одного аккаунта во всех ботах."
+)
+
+
+def _table_columns(conn, table: str) -> set[str]:
+    if conn.is_pg:
+        rows = conn.execute(
+            """
+            SELECT column_name FROM information_schema.columns
+            WHERE table_schema = 'public' AND table_name = %s
+            """,
+            (table,),
+        ).fetchall()
+        return {row["column_name"] for row in rows}
+    rows = conn.raw_conn.execute(f"PRAGMA table_info({table})").fetchall()
+    return {row["name"] for row in rows}
+
+
+def merge_users(conn, primary_id: int, secondary_id: int) -> bool:
+    """Merges ``secondary_id`` into ``primary_id`` (primary keeps the phone).
+
+    Used only for an explicit exact-phone match. All client history is moved to
+    the surviving profile so appointments, reviews, referrals and bonuses stay
+    in one place.
+    """
+    if not primary_id or not secondary_id or primary_id == secondary_id:
+        return True
+
+    # Never absorb or delete a master/admin profile through a phone match.
+    try:
+        privileged = conn.execute(
+            """
+            SELECT 1 FROM user_roles
+            WHERE user_id IN (%s, %s) AND role IN ('admin', 'master') AND is_active = TRUE
+            LIMIT 1
+            """,
+            (primary_id, secondary_id),
+        ).fetchone()
+        if privileged:
+            logger.warning("Refusing to merge users %s and %s: master/admin profile", primary_id, secondary_id)
+            return False
+    except Exception:
+        pass
+
+    primary_row = conn.execute("SELECT * FROM users WHERE id = %s", (primary_id,)).fetchone()
+    secondary_row = conn.execute("SELECT * FROM users WHERE id = %s", (secondary_id,)).fetchone()
+    if not primary_row or not secondary_row:
+        return False
+    primary = dict(primary_row)
+    secondary = dict(secondary_row)
+
+    # Never merge a configured master/admin bot account with a client profile.
+    try:
+        from config import ADMIN_IDS
+
+        for candidate in (primary, secondary):
+            for column in ("telegram_id", "vk_id", "max_user_id"):
+                if candidate.get(column) and int(candidate[column]) in ADMIN_IDS:
+                    logger.warning(
+                        "Refusing to merge users %s and %s: configured admin account",
+                        primary_id,
+                        secondary_id,
+                    )
+                    return False
+    except ImportError:
+        pass
+
+    # Two different IDs in the same column (e.g. two Telegram accounts) cannot
+    # be stored in one profile. Refuse rather than silently losing an identity.
+    for column in ("telegram_id", "vk_id", "max_user_id"):
+        if primary.get(column) and secondary.get(column) and primary[column] != secondary[column]:
+            logger.warning("Cannot merge users %s and %s: both have %s", primary_id, secondary_id, column)
+            return False
+
+    columns = _table_columns(conn, "users")
+    merged_values = {
+        "telegram_id": primary.get("telegram_id") or secondary.get("telegram_id"),
+        "vk_id": primary.get("vk_id") or secondary.get("vk_id"),
+        "max_user_id": primary.get("max_user_id") or secondary.get("max_user_id"),
+        "username": primary.get("username") or secondary.get("username"),
+        "first_name": primary.get("first_name") or secondary.get("first_name"),
+        "last_name": primary.get("last_name") or secondary.get("last_name"),
+    }
+    if "password_hash" in columns:
+        merged_values["password_hash"] = primary.get("password_hash") or secondary.get("password_hash")
+
+    # Free the unique platform columns on the row that is about to be deleted,
+    # otherwise copying its IDs to the primary row hits a UNIQUE constraint.
+    conn.execute(
+        "UPDATE users SET telegram_id = NULL, vk_id = NULL, max_user_id = NULL WHERE id = %s",
+        (secondary_id,),
+    )
+
+    set_parts = []
+    params = []
+    for column, value in merged_values.items():
+        if column in columns:
+            set_parts.append(f"{column} = %s")
+            params.append(value)
+    if set_parts:
+        params.append(primary_id)
+        conn.execute(
+            f"UPDATE users SET {', '.join(set_parts)}, updated_at = CURRENT_TIMESTAMP WHERE id = %s",
+            tuple(params),
+        )
+
+    # Move all client history to the surviving profile.
+    conn.execute("UPDATE appointments SET user_id = %s WHERE user_id = %s", (primary_id, secondary_id))
+    conn.execute("UPDATE reviews SET user_id = %s WHERE user_id = %s", (primary_id, secondary_id))
+    conn.execute("UPDATE review_notifications SET user_id = %s WHERE user_id = %s", (primary_id, secondary_id))
+    conn.execute("UPDATE user_roles SET user_id = %s WHERE user_id = %s", (primary_id, secondary_id))
+    try:
+        conn.execute(
+            "UPDATE client_login_codes SET user_id = %s WHERE user_id = %s",
+            (primary_id, secondary_id),
+        )
+    except Exception:
+        pass
+
+    # Rewards have a unique (user_id, referral_id) index; drop only duplicates.
+    conn.execute(
+        """
+        DELETE FROM rewards
+        WHERE user_id = %s
+          AND referral_id IS NOT NULL
+          AND EXISTS (
+              SELECT 1 FROM rewards r2
+              WHERE r2.user_id = %s AND r2.referral_id = rewards.referral_id
+          )
+        """,
+        (secondary_id, primary_id),
+    )
+    conn.execute("UPDATE rewards SET user_id = %s WHERE user_id = %s", (primary_id, secondary_id))
+
+    # Referrals: invited_user_id is unique, so keep the existing row if any.
+    invited_rows = conn.execute(
+        "SELECT id FROM referrals WHERE invited_user_id = %s", (secondary_id,)
+    ).fetchall()
+    for invited_row in invited_rows:
+        existing = conn.execute(
+            "SELECT id FROM referrals WHERE invited_user_id = %s LIMIT 1", (primary_id,)
+        ).fetchone()
+        if existing:
+            conn.execute("DELETE FROM referrals WHERE id = %s", (invited_row["id"],))
+        else:
+            conn.execute(
+                "UPDATE referrals SET invited_user_id = %s WHERE id = %s",
+                (primary_id, invited_row["id"]),
+            )
+    conn.execute(
+        "UPDATE referrals SET referrer_user_id = %s WHERE referrer_user_id = %s",
+        (primary_id, secondary_id),
+    )
+    # Preserve already earned rewards before removing self-referral relationship
+    conn.execute(
+        """
+        UPDATE rewards
+        SET referral_id = NULL
+        WHERE referral_id IN (
+            SELECT id FROM referrals WHERE referrer_user_id = invited_user_id
+        )
+        """
+    )
+    # A merged pair can no longer refer itself.
+    conn.execute("DELETE FROM referrals WHERE referrer_user_id = invited_user_id")
+
+    conn.execute("DELETE FROM users WHERE id = %s", (secondary_id,))
+    conn.commit()
+    logger.info("Merged user profile %s into %s by phone match", secondary_id, primary_id)
+    return True
 
 
 def link_user_phone(user_identifier: int, phone: str, platform: str | None = None) -> tuple[bool, str]:
     """Attach a phone to the current platform profile.
 
-    A phone number is NOT proof of identity: it can be entered by anyone. Therefore
-    profiles are never merged automatically. A conflicting number is reported to the
-    user and left untouched; the booking flow may still use it for the appointment.
+    If the exact phone already belongs to another profile, the two profiles are
+    merged automatically (enabled by the project owner's explicit choice). The
+    phone owner survives and receives all appointments, reviews, referrals and
+    rewards from the current bot profile. A merge is refused when both profiles
+    already contain different IDs for the same messenger, because one of those
+    identities would be lost.
     """
     if platform is None:
         platform = get_current_platform()
@@ -675,11 +865,16 @@ def link_user_phone(user_identifier: int, phone: str, platform: str | None = Non
     with get_connection() as conn:
         current_user = _find_user(conn, user_identifier, platform)
         existing = conn.execute(
-            "SELECT id FROM users WHERE phone = %s",
+            "SELECT * FROM users WHERE phone = %s",
             (clean_phone,),
         ).fetchone()
 
         if existing and (not current_user or existing["id"] != current_user["id"]):
+            # Exact phone match: merge the current bot profile into the profile
+            # that already owns the phone (the phone just entered becomes the
+            # shared identity).
+            if current_user and merge_users(conn, existing["id"], current_user["id"]):
+                return True, PROFILE_MERGED_MESSAGE
             logger.warning(
                 "Phone conflict: refusing to merge accounts for platform=%s user=%s",
                 platform,

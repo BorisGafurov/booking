@@ -497,31 +497,11 @@ async def admin_complete_appt_handler(callback: CallbackQuery):
         return
 
     if ref_notify:
-        if ref_notify.get("referrer_telegram_id"):
-            try:
-                invited_name = html.escape(ref_notify["invited_first_name"])
-                await callback.bot.send_message(
-                    ref_notify["referrer_telegram_id"],
-                    f"🎉 <b>Отличные новости!</b>\n"
-                    f"Твой друг <b>{invited_name}</b> посетил салон!\n"
-                    f"Тебе начислен бонус: <b>{ref_notify['amount']} ₽</b>.\n\n"
-                    f"💰 Доступный баланс бонусов: <b>{ref_notify['new_balance']} ₽</b>.\n"
-                    "Ты можешь списать их при следующем визите к мастеру!",
-                )
-            except Exception as e:
-                logger.warning("Не удалось отправить уведомление рефереру: %s", e)
-
-        if ref_notify.get("invited_telegram_id"):
-            try:
-                await callback.bot.send_message(
-                    ref_notify["invited_telegram_id"],
-                    "🎁 <b>Спасибо за визит!</b>\n"
-                    "Так как ты пришёл по рекомендации друга, тебе начислено <b>300 ₽</b> бонусов на повторный визит!\n\n"
-                    f"💰 Твой баланс бонусов: <b>{ref_notify.get('invited_new_balance', 300)} ₽</b>.\n"
-                    "Ты сможешь списать их при следующей стрижке!",
-                )
-            except Exception as e:
-                logger.warning("Не удалось отправить уведомление приглашенному другу: %s", e)
+        try:
+            from core_bot.services.notify import notify_referral_reward
+            notify_referral_reward(ref_notify)
+        except Exception as e:
+            logger.warning("Не удалось отправить реферальное уведомление: %s", e)
 
     await callback.answer(msg[:200], show_alert=False)
     # Refresh card
@@ -574,12 +554,10 @@ async def admin_cancel_appt_handler(callback: CallbackQuery):
     offset = int(parts[4]) if len(parts) > 4 and parts[4].isdigit() else 0
 
     ok, msg, appt = cancel_appointment(appt_id)
-    if ok and appt and appt.get("platform_user_id") and appt.get("platform") == "telegram":
+    if ok and appt:
         try:
-            await callback.bot.send_message(
-                chat_id=appt["platform_user_id"],
-                text="❌ <b>Ваша запись была отменена мастером.</b>\n\nЕсли у вас возникли вопросы или вы хотите подобрать другое время, напишите мастеру.",
-            )
+            from core_bot.services.notify import notify_appointment_cancelled_by_master
+            notify_appointment_cancelled_by_master(appt)
         except Exception as e:
             logger.warning("Failed to notify client about cancel: %s", e)
 
@@ -687,18 +665,10 @@ async def admin_resched_time_chosen(callback: CallbackQuery):
         return
 
     ok, msg, appt = reschedule_appointment(appt_id, new_dt)
-    if ok and appt and appt.get("platform_user_id") and appt.get("platform") == "telegram":
+    if ok and appt:
         try:
-            await callback.bot.send_message(
-                chat_id=appt["platform_user_id"],
-                text=(
-                    "🗓 <b>Ваша запись перенесена мастером!</b>\n\n"
-                    f"⏰ Новое время: <b>{format_dt(new_dt)}</b>\n"
-                    f"✂️ Услуга: {appt.get('services')}\n"
-                    f"💰 Стоимость: {appt.get('total_price')} ₽\n\n"
-                    "Ждем вас!"
-                ),
-            )
+            from core_bot.services.notify import notify_appointment_rescheduled_by_master
+            notify_appointment_rescheduled_by_master(appt, format_dt(new_dt))
         except Exception as e:
             logger.warning("Failed to notify client about reschedule: %s", e)
 
@@ -1801,18 +1771,10 @@ async def handle_admin_text_inputs(message: Message):
             return
 
         ok, msg, appt = reschedule_appointment(appt_id, new_dt)
-        if ok and appt and appt.get("platform_user_id") and appt.get("platform") == "telegram":
+        if ok and appt:
             try:
-                await message.bot.send_message(
-                    chat_id=appt["platform_user_id"],
-                    text=(
-                        "🗓 <b>Ваша запись перенесена мастером!</b>\n\n"
-                        f"⏰ Новое время: <b>{format_dt(new_dt)}</b>\n"
-                        f"✂️ Услуга: {appt.get('services')}\n"
-                        f"💰 Стоимость: {appt.get('total_price')} ₽\n\n"
-                        "Ждем вас!"
-                    ),
-                )
+                from core_bot.services.notify import notify_appointment_rescheduled_by_master
+                notify_appointment_rescheduled_by_master(appt, format_dt(new_dt))
             except Exception as e:
                 logger.warning("Failed to notify client: %s", e)
 

@@ -571,30 +571,56 @@ def _queue_master_notification(conn, review_id: int, user_id: int) -> None:
 
 
 def _queue_review_invite(conn, appointment: dict[str, Any], user: dict[str, Any] | None) -> dict[str, Any] | None:
-    recipient = _platform_user_id(appointment, user)
-    if not recipient:
-        return None
-    platform, recipient_id = recipient
-    exists = conn.execute(
-        """
-        SELECT id FROM review_notifications
-        WHERE kind = 'review_invite' AND appointment_id = %s
-        LIMIT 1
-        """,
-        (appointment["id"],),
-    ).fetchone()
-    if exists:
-        return {"platform": platform, "recipient_id": recipient_id, "already_queued": True}
+    """Queues one review invitation per linked messenger (Telegram/VK/MAX)."""
+    targets: list[tuple[str, int]] = []
+    appt_platform = str(appointment.get("platform") or "").lower()
+    appt_user_id = int(appointment.get("platform_user_id") or 0)
+    if appt_platform in _PLATFORM_COLUMNS and appt_user_id:
+        targets.append((appt_platform, appt_user_id))
 
-    conn.execute(
-        """
-        INSERT INTO review_notifications
-            (kind, appointment_id, user_id, platform, recipient_id, status)
-        VALUES ('review_invite', %s, %s, %s, %s, 'pending')
-        """,
-        (appointment["id"], appointment.get("user_id"), platform, recipient_id),
-    )
-    return {"platform": platform, "recipient_id": recipient_id, "already_queued": False}
+    if user:
+        for platform, column in _PLATFORM_COLUMNS.items():
+            value = user.get(column)
+            if value:
+                pair = (platform, int(value))
+                if pair not in targets:
+                    targets.append(pair)
+
+    if not targets:
+        return None
+
+    queued: list[tuple[str, int]] = []
+    already: list[str] = []
+    for platform, recipient_id in targets:
+        exists = conn.execute(
+            """
+            SELECT id FROM review_notifications
+            WHERE kind = 'review_invite' AND appointment_id = %s AND platform = %s
+            LIMIT 1
+            """,
+            (appointment["id"], platform),
+        ).fetchone()
+        if exists:
+            already.append(platform)
+            continue
+
+        conn.execute(
+            """
+            INSERT INTO review_notifications
+                (kind, appointment_id, user_id, platform, recipient_id, status)
+            VALUES ('review_invite', %s, %s, %s, %s, 'pending')
+            """,
+            (appointment["id"], appointment.get("user_id"), platform, recipient_id),
+        )
+        queued.append((platform, recipient_id))
+
+    first = queued[0] if queued else targets[0]
+    return {
+        "platform": first[0],
+        "recipient_id": first[1],
+        "platforms": [platform for platform, _ in targets],
+        "already_queued": not queued and bool(already),
+    }
 
 
 def create_review(

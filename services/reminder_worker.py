@@ -14,6 +14,7 @@ from services.appointments import (
     get_due_evening_reminders,
     get_due_retention_reminders,
     mark_reminder_sent,
+    record_reminder_delivery,
 )
 from services.reviews import (
     get_pending_notifications,
@@ -139,8 +140,9 @@ def _resolve_platform_user_id(appt: dict, platform: str) -> int | None:
     if is_master_phone(norm_phone):
         return None
 
+    appt_platform = str(appt.get("platform") or "").lower()
     user_id = appt.get("platform_user_id")
-    if user_id and user_id != 0:
+    if user_id and user_id != 0 and appt_platform in ("", "web", "manual", platform):
         if _is_master_or_admin(user_id, platform):
             return None
         return user_id
@@ -170,32 +172,7 @@ def _resolve_platform_user_id(appt: dict, platform: str) -> int | None:
                 found_id = row[col]
                 if _is_master_or_admin(found_id, platform):
                     return None
-                conn.execute(
-                    "UPDATE appointments SET platform_user_id = %s, platform = %s WHERE id = %s",
-                    (found_id, platform, appt["id"]),
-                )
-                conn.commit()
                 return found_id
-
-            # If current platform is telegram and appointment came from web/manual,
-            # reassign to vk or max if the user is registered in those bots
-            if platform == "telegram" and appt.get("platform") in ("web", "manual", None, ""):
-                vk_val = row["vk_id"] if "vk_id" in row.keys() else None
-                max_val = row["max_user_id"] if "max_user_id" in row.keys() else None
-                if vk_val and not _is_master_or_admin(vk_val, "vk"):
-                    conn.execute(
-                        "UPDATE appointments SET platform_user_id = %s, platform = 'vk' WHERE id = %s",
-                        (vk_val, appt["id"]),
-                    )
-                    conn.commit()
-                    return "reassigned"
-                if max_val and not _is_master_or_admin(max_val, "max"):
-                    conn.execute(
-                        "UPDATE appointments SET platform_user_id = %s, platform = 'max' WHERE id = %s",
-                        (max_val, appt["id"]),
-                    )
-                    conn.commit()
-                    return "reassigned"
     return None
 
 
@@ -217,9 +194,12 @@ async def run_reminder_worker(bot: Bot, platform: str = "telegram"):
                             from core_bot.services.voice import is_voice_configured, send_voice_reminder
                             if is_voice_configured():
                                 send_voice_reminder(appt)
+                                record_reminder_delivery(appt["id"], "evening", platform, "voice")
+                                mark_reminder_sent(appt["id"], "evening")
+                                continue
                         except Exception as v_err:
                             logger.warning("Voice reminder error: %s", v_err)
-                    mark_reminder_sent(appt["id"], "evening")
+                    record_reminder_delivery(appt["id"], "evening", platform, "skipped", "no_recipient")
                     continue
 
                 dt = appt["appointment_time"]
@@ -246,6 +226,7 @@ async def run_reminder_worker(bot: Bot, platform: str = "telegram"):
                         reply_markup=_get_confirmation_keyboard(appt["id"]),
                         parse_mode="HTML",
                     )
+                    record_reminder_delivery(appt["id"], "evening", platform)
                     mark_reminder_sent(appt["id"], "evening")
                     logger.info("Отправлено вечернее напоминание клиенту #%s (appt #%s)", target_user_id, appt["id"])
                 except Exception as send_err:
@@ -263,9 +244,12 @@ async def run_reminder_worker(bot: Bot, platform: str = "telegram"):
                             from core_bot.services.voice import is_voice_configured, send_voice_reminder
                             if is_voice_configured():
                                 send_voice_reminder(appt)
+                                record_reminder_delivery(appt["id"], "morning", platform, "voice")
+                                mark_reminder_sent(appt["id"], "morning")
+                                continue
                         except Exception as v_err:
                             logger.warning("Voice reminder error: %s", v_err)
-                    mark_reminder_sent(appt["id"], "morning")
+                    record_reminder_delivery(appt["id"], "morning", platform, "skipped", "no_recipient")
                     continue
 
                 dt = appt["appointment_time"]
@@ -289,6 +273,7 @@ async def run_reminder_worker(bot: Bot, platform: str = "telegram"):
                         reply_markup=_get_confirmation_keyboard(appt["id"]),
                         parse_mode="HTML",
                     )
+                    record_reminder_delivery(appt["id"], "morning", platform)
                     mark_reminder_sent(appt["id"], "morning")
                     logger.info("Отправлено утреннее напоминание о подтверждении клиенту #%s (appt #%s)", target_user_id, appt["id"])
                 except Exception as send_err:
@@ -301,7 +286,7 @@ async def run_reminder_worker(bot: Bot, platform: str = "telegram"):
                 if target_user_id == "reassigned":
                     continue
                 if not target_user_id:
-                    mark_reminder_sent(appt["id"], "2h")
+                    record_reminder_delivery(appt["id"], "2h", platform, "skipped", "no_recipient")
                     continue
 
                 dt = appt["appointment_time"]
@@ -338,6 +323,7 @@ async def run_reminder_worker(bot: Bot, platform: str = "telegram"):
                         reply_markup=reply_markup,
                         parse_mode="HTML",
                     )
+                    record_reminder_delivery(appt["id"], "2h", platform)
                     mark_reminder_sent(appt["id"], "2h")
                     logger.info("Отправлено 2ч напоминание клиенту #%s (appt #%s, confirmed=%s)", target_user_id, appt["id"], is_confirmed)
                 except Exception as send_err:
@@ -350,7 +336,7 @@ async def run_reminder_worker(bot: Bot, platform: str = "telegram"):
                 if target_user_id == "reassigned":
                     continue
                 if not target_user_id:
-                    mark_reminder_sent(appt["id"], "retention")
+                    record_reminder_delivery(appt["id"], "retention", platform, "skipped", "no_recipient")
                     continue
 
                 text = (
@@ -365,6 +351,7 @@ async def run_reminder_worker(bot: Bot, platform: str = "telegram"):
                         reply_markup=_get_retention_keyboard(),
                         parse_mode="HTML",
                     )
+                    record_reminder_delivery(appt["id"], "retention", platform)
                     mark_reminder_sent(appt["id"], "retention")
                     logger.info("Отправлено retention напоминание клиенту #%s (appt #%s)", target_user_id, appt["id"])
                 except Exception as send_err:
@@ -430,6 +417,34 @@ async def run_reminder_worker(bot: Bot, platform: str = "telegram"):
                     except Exception as a_err:
                         logger.warning("Не удалось уведомить админа %s о новом отзыве: %s", admin_id, a_err)
                 mark_notification_sent(alert["id"])
+
+            # 7. Master alerts about bookings made in the other messengers.
+            event_titles = {
+                "master_booking_created": "🔥 <b>Новая онлайн-запись через бота!</b>",
+                "master_booking_confirmed": "✅ <b>Клиент подтвердил запись!</b>",
+                "master_booking_cancelled": "⚠️ <b>Клиент отменил запись!</b>",
+                "master_booking_rescheduled": "🔄 <b>Клиент перенёс запись</b>",
+            }
+            for event_kind, event_title in event_titles.items():
+                events = get_pending_notifications(platform, event_kind)
+                for event in events:
+                    client_name = " ".join(
+                        part for part in (event.get("first_name"), event.get("last_name")) if part
+                    ) or "Клиент"
+                    event_text = (
+                        f"{event_title}\n\n"
+                        f"👤 <b>Клиент:</b> {html.escape(str(client_name))}\n"
+                        f"📱 <b>Телефон:</b> {html.escape(str(event.get('phone') or '—'))}\n"
+                        f"✂️ <b>Услуги:</b> {html.escape(str(event.get('services') or '—'))}\n"
+                        f"📅 <b>Время:</b> {html.escape(str(event.get('appointment_time') or '—'))}\n"
+                        f"💰 <b>Сумма:</b> {event.get('total_price') or '—'} ₽"
+                    )
+                    for admin_id in set(ADMIN_IDS) | set(MASTER_TELEGRAM_IDS):
+                        try:
+                            await bot.send_message(chat_id=admin_id, text=event_text, parse_mode="HTML")
+                        except Exception as a_err:
+                            logger.warning("Не удалось уведомить админа %s (%s): %s", admin_id, event_kind, a_err)
+                    mark_notification_sent(event["id"])
 
         except Exception as e:
             logger.error("Ошибка в цикле reminder worker: %s", e)

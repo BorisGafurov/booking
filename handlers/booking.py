@@ -239,10 +239,12 @@ async def _create_booking_and_notify(
             platform="telegram",
             platform_user_id=user_id,
             duration_min=calc["duration_minutes"],
+            validate_schedule=True,
         )
-    except SlotUnavailableError:
+    except SlotUnavailableError as err:
+        reason_msg = str(err).strip() or "Это время уже занято."
         text = (
-            "⚠️ <b>Это время уже занято.</b>\n\n"
+            f"⚠️ <b>{html.escape(reason_msg)}</b>\n\n"
             "Пожалуйста, выберите другой слот или запишитесь через сайт «Срез»:"
         )
         if isinstance(target_msg_or_cb, CallbackQuery):
