@@ -45,6 +45,8 @@ class TestDatabaseMigrations(unittest.TestCase):
         self.assertIn("007_client_extra_fields", applied)
         self.assertIn("008_site_sync_cleanup", applied)
         self.assertIn("009_reviews", applied)
+        self.assertIn("010_traffic_metrics", applied)
+        self.assertIn("011_dual_referral_rewards", applied)
 
         expected_tables = {
             "schema_migrations",

@@ -150,16 +150,22 @@ class TestBookingBot(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(v_notify["referrer_telegram_id"], 1001)
         self.assertEqual(v_notify["amount"], 300)
         self.assertEqual(v_notify["new_balance"], 300)
+        self.assertEqual(v_notify["invited_telegram_id"], 2002)
+        self.assertEqual(v_notify["invited_new_balance"], 300)
 
         # Try to confirm again (idempotent / should fail)
         v_again, _, _ = mark_referral_visited(ref_entry["id"])
         self.assertFalse(v_again)
 
-        # 9. Check stats after confirmation
+        # 9. Check stats after confirmation (both inviter and friend receive 300 ₽)
         stats_after = get_referral_stats(1001)
         self.assertEqual(stats_after["confirmed"], 1)
         self.assertEqual(stats_after["active_rewards_count"], 1)
         self.assertEqual(stats_after["active_rewards_sum"], 300)
+
+        invited_stats_after = get_referral_stats(2002)
+        self.assertEqual(invited_stats_after["active_rewards_count"], 1)
+        self.assertEqual(invited_stats_after["active_rewards_sum"], 300)
 
         # 10. Check active rewards for admin
         rewards_list, total_rewards = get_active_rewards(limit=10, offset=0)
@@ -575,11 +581,15 @@ class TestBookingBot(unittest.IsolatedAsyncioTestCase):
         updated_appt = get_appointment(appt_id)
         self.assertEqual(updated_appt["status"], "completed")
 
-        # Check rewards balance for referrer
+        # Check rewards balance for referrer and friend
         rewards, total = get_active_rewards()
-        self.assertEqual(total, 1)
-        self.assertEqual(rewards[0]["user_db_id"], ref_id)
-        self.assertEqual(rewards[0]["amount"], 300)
+        self.assertEqual(total, 2)
+        referrer_rewards = [r for r in rewards if r["user_db_id"] == ref_id]
+        friend_rewards = [r for r in rewards if r["user_db_id"] == friend_id]
+        self.assertEqual(len(referrer_rewards), 1)
+        self.assertEqual(referrer_rewards[0]["amount"], 300)
+        self.assertEqual(len(friend_rewards), 1)
+        self.assertEqual(friend_rewards[0]["amount"], 300)
 
     def test_manual_appointment_flow(self):
         from services.appointments import create_manual_appointment, get_appointment

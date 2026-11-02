@@ -32,7 +32,7 @@ def apply(conn) -> None:
             CREATE TABLE IF NOT EXISTS rewards (
                 id SERIAL PRIMARY KEY,
                 user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-                referral_id INTEGER NOT NULL UNIQUE REFERENCES referrals(id) ON DELETE CASCADE,
+                referral_id INTEGER REFERENCES referrals(id) ON DELETE CASCADE,
                 amount INTEGER NOT NULL DEFAULT 300,
                 status VARCHAR(32) NOT NULL DEFAULT 'active',
                 created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
@@ -121,7 +121,7 @@ def apply(conn) -> None:
             CREATE TABLE IF NOT EXISTS rewards (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id INTEGER NOT NULL,
-                referral_id INTEGER NOT NULL UNIQUE,
+                referral_id INTEGER,
                 amount INTEGER NOT NULL DEFAULT 300,
                 status TEXT NOT NULL DEFAULT 'active',
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,

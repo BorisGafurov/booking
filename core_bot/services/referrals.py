@@ -425,6 +425,10 @@ def mark_referral_visited(referral_id: int) -> tuple[bool, str, dict | None]:
                 referrer.telegram_id AS referrer_telegram_id,
                 referrer.vk_id AS referrer_vk_id,
                 referrer.max_user_id AS referrer_max_id,
+                invited.id AS invited_user_id,
+                invited.telegram_id AS invited_telegram_id,
+                invited.vk_id AS invited_vk_id,
+                invited.max_user_id AS invited_max_id,
                 invited.first_name AS invited_first_name
             FROM referrals r
             JOIN users referrer ON referrer.id = r.referrer_user_id
@@ -453,12 +457,22 @@ def mark_referral_visited(referral_id: int) -> tuple[bool, str, dict | None]:
             (referral_id,),
         )
 
+        # 1. Award bonus to the inviter (referrer)
         conn.execute(
             """
             INSERT INTO rewards (user_id, referral_id, amount, status)
             VALUES (%s, %s, %s, 'active');
             """,
             (referral["referrer_user_id"], referral_id, REFERRAL_REWARD_AMOUNT),
+        )
+
+        # 2. Award bonus to the invited friend for repeat visit
+        conn.execute(
+            """
+            INSERT INTO rewards (user_id, referral_id, amount, status)
+            VALUES (%s, %s, %s, 'active');
+            """,
+            (referral["invited_user_id"], referral_id, REFERRAL_REWARD_AMOUNT),
         )
 
         rewards_sum_row = conn.execute(
@@ -470,6 +484,15 @@ def mark_referral_visited(referral_id: int) -> tuple[bool, str, dict | None]:
             (referral["referrer_user_id"],),
         ).fetchone()
 
+        invited_sum_row = conn.execute(
+            """
+            SELECT COALESCE(SUM(amount), 0) AS total_sum
+            FROM rewards
+            WHERE user_id = %s AND status = 'active';
+            """,
+            (referral["invited_user_id"],),
+        ).fetchone()
+
         conn.commit()
 
         notify_data = {
@@ -478,12 +501,18 @@ def mark_referral_visited(referral_id: int) -> tuple[bool, str, dict | None]:
             "referrer_telegram_id": referral["referrer_telegram_id"],
             "referrer_vk_id": referral["referrer_vk_id"],
             "referrer_max_id": referral["referrer_max_id"],
+            "invited_db_id": referral["invited_user_id"],
+            "invited_id": referral["invited_user_id"],
+            "invited_telegram_id": referral.get("invited_telegram_id"),
+            "invited_vk_id": referral.get("invited_vk_id"),
+            "invited_max_id": referral.get("invited_max_id"),
             "invited_first_name": referral["invited_first_name"] or "друг",
             "amount": REFERRAL_REWARD_AMOUNT,
             "new_balance": rewards_sum_row["total_sum"],
+            "invited_new_balance": invited_sum_row["total_sum"],
         }
 
-    return True, f"Визит подтвержден. Бонус {REFERRAL_REWARD_TEXT} начислен.", notify_data
+    return True, f"Визит подтвержден. Начислены бонусы по {REFERRAL_REWARD_TEXT} пригласившему и приглашенному другу.", notify_data
 
 
 def get_active_rewards(limit: int = 15, offset: int = 0) -> tuple[list[dict], int]:

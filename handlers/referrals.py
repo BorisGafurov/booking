@@ -340,7 +340,8 @@ async def referrals(message: Message):
     await message.answer(
         "🎁 <b>Приглашай друзей и получай бонусы!</b>\n\n"
         "Отправь свою персональную ссылку другу. "
-        f"Когда он впервые придет на стрижку или уход, тебе начислится <b>{REFERRAL_REWARD_TEXT}</b>!\n\n"
+        f"Когда он впервые придет на стрижку или уход, тебе начислится <b>{REFERRAL_REWARD_TEXT}</b>, "
+        f"и другу начислится <b>{REFERRAL_REWARD_TEXT}</b> на повторный визит!\n\n"
         f"🔗 <b>Твоя реферальная ссылка:</b>\n<code>{referral_link}</code>\n\n"
         "📊 <b>Твоя статистика:</b>\n"
         f"• Переходов по ссылке: <b>{stats['started']}</b>\n"
@@ -496,18 +497,31 @@ async def admin_complete_appt_handler(callback: CallbackQuery):
         return
 
     if ref_notify:
-        try:
-            invited_name = html.escape(ref_notify["invited_first_name"])
-            await callback.bot.send_message(
-                ref_notify["referrer_telegram_id"],
-                f"🎉 <b>Отличные новости!</b>\n"
-                f"Твой друг <b>{invited_name}</b> посетил салон!\n"
-                f"Тебе начислен бонус: <b>{ref_notify['amount']} ₽</b>.\n\n"
-                f"💰 Доступный баланс бонусов: <b>{ref_notify['new_balance']} ₽</b>.\n"
-                "Ты можешь списать их при следующем визите к мастеру!",
-            )
-        except Exception as e:
-            logger.warning("Не удалось отправить уведомление рефереру: %s", e)
+        if ref_notify.get("referrer_telegram_id"):
+            try:
+                invited_name = html.escape(ref_notify["invited_first_name"])
+                await callback.bot.send_message(
+                    ref_notify["referrer_telegram_id"],
+                    f"🎉 <b>Отличные новости!</b>\n"
+                    f"Твой друг <b>{invited_name}</b> посетил салон!\n"
+                    f"Тебе начислен бонус: <b>{ref_notify['amount']} ₽</b>.\n\n"
+                    f"💰 Доступный баланс бонусов: <b>{ref_notify['new_balance']} ₽</b>.\n"
+                    "Ты можешь списать их при следующем визите к мастеру!",
+                )
+            except Exception as e:
+                logger.warning("Не удалось отправить уведомление рефереру: %s", e)
+
+        if ref_notify.get("invited_telegram_id"):
+            try:
+                await callback.bot.send_message(
+                    ref_notify["invited_telegram_id"],
+                    "🎁 <b>Спасибо за визит!</b>\n"
+                    "Так как ты пришёл по рекомендации друга, тебе начислено <b>300 ₽</b> бонусов на повторный визит!\n\n"
+                    f"💰 Твой баланс бонусов: <b>{ref_notify.get('invited_new_balance', 300)} ₽</b>.\n"
+                    "Ты сможешь списать их при следующей стрижке!",
+                )
+            except Exception as e:
+                logger.warning("Не удалось отправить уведомление приглашенному другу: %s", e)
 
     await callback.answer(msg[:200], show_alert=False)
     # Refresh card
@@ -1134,18 +1148,31 @@ async def confirm_visit(callback: CallbackQuery):
     success, text, notify_data = mark_referral_visited(referral_id)
 
     if success and notify_data:
-        try:
-            invited_name = html.escape(notify_data["invited_first_name"])
-            await callback.bot.send_message(
-                notify_data["referrer_telegram_id"],
-                f"🎉 <b>Отличные новости!</b>\n"
-                f"Твой друг <b>{invited_name}</b> посетил салон!\n"
-                f"Тебе начислен бонус: <b>{notify_data['amount']} ₽</b>.\n\n"
-                f"💰 Доступный баланс бонусов: <b>{notify_data['new_balance']} ₽</b>.\n"
-                "Ты можешь списать их при следующем визите к мастеру!",
-            )
-        except Exception as e:
-            logger.warning("Не удалось отправить уведомление рефереру: %s", e)
+        if notify_data.get("referrer_telegram_id"):
+            try:
+                invited_name = html.escape(notify_data["invited_first_name"])
+                await callback.bot.send_message(
+                    notify_data["referrer_telegram_id"],
+                    f"🎉 <b>Отличные новости!</b>\n"
+                    f"Твой друг <b>{invited_name}</b> посетил салон!\n"
+                    f"Тебе начислен бонус: <b>{notify_data['amount']} ₽</b>.\n\n"
+                    f"💰 Доступный баланс бонусов: <b>{notify_data['new_balance']} ₽</b>.\n"
+                    "Ты можешь списать их при следующем визите к мастеру!",
+                )
+            except Exception as e:
+                logger.warning("Не удалось отправить уведомление рефереру: %s", e)
+
+        if notify_data.get("invited_telegram_id"):
+            try:
+                await callback.bot.send_message(
+                    notify_data["invited_telegram_id"],
+                    "🎁 <b>Спасибо за визит!</b>\n"
+                    "Так как ты пришёл по рекомендации друга, тебе начислено <b>300 ₽</b> бонусов на повторный визит!\n\n"
+                    f"💰 Твой баланс бонусов: <b>{notify_data.get('invited_new_balance', 300)} ₽</b>.\n"
+                    "Ты сможешь списать их при следующей стрижке!",
+                )
+            except Exception as e:
+                logger.warning("Не удалось отправить уведомление приглашенному другу: %s", e)
 
     referrals_list, total = get_pending_referrals(limit=PAGE_SIZE, offset=offset)
 

@@ -432,7 +432,7 @@ def complete_appointment(appointment_id: int) -> tuple[bool, str, dict | None, d
 
     msg = "Визит успешно отмечен! Запись выполнена."
     if referral_notify_data:
-        msg += f" Другу начислен бонус за рекомендацию: {referral_notify_data.get('amount', 300)} ₽!"
+        msg += f" Другу и клиенту начислены бонусы по {referral_notify_data.get('amount', 300)} ₽!"
 
     return True, msg, appt, referral_notify_data
 
