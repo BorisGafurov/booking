@@ -87,7 +87,7 @@ def send_voice_reminder(appointment: dict) -> bool:
             headers={"Content-Type": "application/x-www-form-urlencoded"},
             method="POST",
         )
-        with urllib.request.urlopen(req, timeout=10) as resp:
+        with urllib.request.urlopen(req, timeout=25) as resp:
             resp_body = resp.read().decode("utf-8", errors="replace")
             logger.info("Zvonok звонок успешно поставлен в очередь для %s: %s", phone, resp_body[:200])
             return True
