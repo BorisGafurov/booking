@@ -152,9 +152,15 @@ def _resolve_platform_user_id(appt: dict, platform: str) -> int | None:
             return None
         row = None
         if appt.get("user_id"):
-            row = conn.execute(f"SELECT id, phone, {col} FROM users WHERE id = %s", (appt["user_id"],)).fetchone()
+            row = conn.execute(
+                "SELECT id, phone, telegram_id, vk_id, max_user_id FROM users WHERE id = %s",
+                (appt["user_id"],),
+            ).fetchone()
         if not row and norm_phone:
-            row = conn.execute(f"SELECT id, phone, {col} FROM users WHERE phone = %s", (norm_phone,)).fetchone()
+            row = conn.execute(
+                "SELECT id, phone, telegram_id, vk_id, max_user_id FROM users WHERE phone = %s",
+                (norm_phone,),
+            ).fetchone()
 
         if row:
             row_phone = normalize_phone(row["phone"] or "")
@@ -170,6 +176,26 @@ def _resolve_platform_user_id(appt: dict, platform: str) -> int | None:
                 )
                 conn.commit()
                 return found_id
+
+            # If current platform is telegram and appointment came from web/manual,
+            # reassign to vk or max if the user is registered in those bots
+            if platform == "telegram" and appt.get("platform") in ("web", "manual", None, ""):
+                vk_val = row["vk_id"] if "vk_id" in row.keys() else None
+                max_val = row["max_user_id"] if "max_user_id" in row.keys() else None
+                if vk_val and not _is_master_or_admin(vk_val, "vk"):
+                    conn.execute(
+                        "UPDATE appointments SET platform_user_id = %s, platform = 'vk' WHERE id = %s",
+                        (vk_val, appt["id"]),
+                    )
+                    conn.commit()
+                    return "reassigned"
+                if max_val and not _is_master_or_admin(max_val, "max"):
+                    conn.execute(
+                        "UPDATE appointments SET platform_user_id = %s, platform = 'max' WHERE id = %s",
+                        (max_val, appt["id"]),
+                    )
+                    conn.commit()
+                    return "reassigned"
     return None
 
 
@@ -183,6 +209,8 @@ async def run_reminder_worker(bot: Bot, platform: str = "telegram"):
             evening_due = get_due_evening_reminders(platform=platform)
             for appt in evening_due:
                 target_user_id = _resolve_platform_user_id(appt, platform)
+                if target_user_id == "reassigned":
+                    continue
                 if not target_user_id:
                     if platform == "telegram":
                         try:
@@ -227,6 +255,8 @@ async def run_reminder_worker(bot: Bot, platform: str = "telegram"):
             morning_due = get_due_confirmation_followup_reminders(platform=platform)
             for appt in morning_due:
                 target_user_id = _resolve_platform_user_id(appt, platform)
+                if target_user_id == "reassigned":
+                    continue
                 if not target_user_id:
                     if platform == "telegram":
                         try:
@@ -268,6 +298,8 @@ async def run_reminder_worker(bot: Bot, platform: str = "telegram"):
             two_h_due = get_due_2h_reminders(platform=platform)
             for appt in two_h_due:
                 target_user_id = _resolve_platform_user_id(appt, platform)
+                if target_user_id == "reassigned":
+                    continue
                 if not target_user_id:
                     mark_reminder_sent(appt["id"], "2h")
                     continue
@@ -315,6 +347,8 @@ async def run_reminder_worker(bot: Bot, platform: str = "telegram"):
             retention_due = get_due_retention_reminders(platform=platform)
             for appt in retention_due:
                 target_user_id = _resolve_platform_user_id(appt, platform)
+                if target_user_id == "reassigned":
+                    continue
                 if not target_user_id:
                     mark_reminder_sent(appt["id"], "retention")
                     continue

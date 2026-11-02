@@ -824,7 +824,10 @@ def get_due_evening_reminders(platform: str | None = None) -> list[dict]:
         t_end = tomorrow_end if conn.is_pg else tomorrow_end.strftime("%Y-%m-%d %H:%M:%S")
         params = [t_start, t_end]
         if platform:
-            query += " AND platform = %s"
+            if platform == "telegram":
+                query += " AND (platform = %s OR platform IN ('web', 'manual') OR platform IS NULL OR platform = '')"
+            else:
+                query += " AND platform = %s"
             params.append(platform)
         query += " ORDER BY appointment_time ASC"
 
@@ -861,7 +864,10 @@ def get_due_confirmation_followup_reminders(platform: str | None = None) -> list
         t_min = min_time if conn.is_pg else min_time.strftime("%Y-%m-%d %H:%M:%S")
         params = [t_start, t_end, t_min]
         if platform:
-            query += " AND platform = %s"
+            if platform == "telegram":
+                query += " AND (platform = %s OR platform IN ('web', 'manual') OR platform IS NULL OR platform = '')"
+            else:
+                query += " AND platform = %s"
             params.append(platform)
         query += " ORDER BY appointment_time ASC"
 
@@ -887,7 +893,10 @@ def get_due_2h_reminders(platform: str | None = None) -> list[dict]:
         p_limit = limit if conn.is_pg else limit.strftime("%Y-%m-%d %H:%M:%S")
         params = [p_now, p_limit]
         if platform:
-            query += " AND platform = %s"
+            if platform == "telegram":
+                query += " AND (platform = %s OR platform IN ('web', 'manual') OR platform IS NULL OR platform = '')"
+            else:
+                query += " AND platform = %s"
             params.append(platform)
         query += " ORDER BY appointment_time ASC"
 
@@ -918,7 +927,10 @@ def get_due_retention_reminders(platform: str | None = None) -> list[dict]:
         p_newer = newer_than if conn.is_pg else newer_than.strftime("%Y-%m-%d %H:%M:%S")
         params = [p_older, p_newer]
         if platform:
-            query += " AND platform = %s"
+            if platform == "telegram":
+                query += " AND (platform = %s OR platform IN ('web', 'manual') OR platform IS NULL OR platform = '')"
+            else:
+                query += " AND platform = %s"
             params.append(platform)
         query += " ORDER BY appointment_time ASC"
 

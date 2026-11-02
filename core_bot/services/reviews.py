@@ -560,13 +560,14 @@ def _insert_review(
 
 
 def _queue_master_notification(conn, review_id: int, user_id: int) -> None:
-    conn.execute(
-        """
-        INSERT INTO review_notifications (kind, review_id, user_id, platform, status)
-        VALUES ('master_new_review', %s, %s, 'telegram', 'pending')
-        """,
-        (review_id, user_id),
-    )
+    for plat in ("telegram", "vk", "max"):
+        conn.execute(
+            """
+            INSERT INTO review_notifications (kind, review_id, user_id, platform, status)
+            VALUES ('master_new_review', %s, %s, %s, 'pending')
+            """,
+            (review_id, user_id, plat),
+        )
 
 
 def _queue_review_invite(conn, appointment: dict[str, Any], user: dict[str, Any] | None) -> dict[str, Any] | None:
