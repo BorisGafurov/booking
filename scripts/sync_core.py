@@ -30,6 +30,7 @@ SERVICES_TO_PROXY = [
     "client_import",
     "recommendations",
     "reviews",
+    "voice",
 ]
 
 

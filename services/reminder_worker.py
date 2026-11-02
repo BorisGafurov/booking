@@ -184,6 +184,13 @@ async def run_reminder_worker(bot: Bot, platform: str = "telegram"):
             for appt in evening_due:
                 target_user_id = _resolve_platform_user_id(appt, platform)
                 if not target_user_id:
+                    if platform == "telegram":
+                        try:
+                            from core_bot.services.voice import is_voice_configured, send_voice_reminder
+                            if is_voice_configured():
+                                send_voice_reminder(appt)
+                        except Exception as v_err:
+                            logger.warning("Voice reminder error: %s", v_err)
                     mark_reminder_sent(appt["id"], "evening")
                     continue
 
@@ -221,6 +228,13 @@ async def run_reminder_worker(bot: Bot, platform: str = "telegram"):
             for appt in morning_due:
                 target_user_id = _resolve_platform_user_id(appt, platform)
                 if not target_user_id:
+                    if platform == "telegram":
+                        try:
+                            from core_bot.services.voice import is_voice_configured, send_voice_reminder
+                            if is_voice_configured():
+                                send_voice_reminder(appt)
+                        except Exception as v_err:
+                            logger.warning("Voice reminder error: %s", v_err)
                     mark_reminder_sent(appt["id"], "morning")
                     continue
 
