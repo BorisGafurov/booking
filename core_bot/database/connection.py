@@ -158,7 +158,7 @@ def get_connection() -> Generator[DBConnection, None, None]:
     global _pg_unreachable, _last_pg_check
     now = time.time()
     if _pg_unreachable:
-        if now - _last_pg_check > 30:
+        if now - _last_pg_check > 5:
             # Backoff window expired: attempt to reconnect to PostgreSQL on this call
             _pg_unreachable = False
             _last_pg_check = now
@@ -166,7 +166,7 @@ def get_connection() -> Generator[DBConnection, None, None]:
             # Fail closed during active cooldown: do not fall back to SQLite when disabled
             logger.critical(
                 "PostgreSQL is marked unreachable and SQLite fallback is disabled; refusing connection (cooling down for %.1fs)",
-                max(0.0, 30.0 - (now - _last_pg_check)),
+                max(0.0, 5.0 - (now - _last_pg_check)),
             )
             raise RuntimeError(
                 "Database connection error: PostgreSQL unavailable and SQLite fallback disabled"

@@ -976,17 +976,21 @@ def get_user_role(platform_user_id: int, platform: str | None = None) -> str | N
     except ImportError:
         pass
 
-    with get_connection() as conn:
-        row = conn.execute(
-            """
-            SELECT role FROM user_roles
-            WHERE platform = %s AND platform_user_id = %s AND is_active = TRUE
-            ORDER BY id DESC LIMIT 1
-            """,
-            (platform, platform_user_id),
-        ).fetchone()
-        if row:
-            return dict(row)["role"]
+    try:
+        with get_connection() as conn:
+            row = conn.execute(
+                """
+                SELECT role FROM user_roles
+                WHERE platform = %s AND platform_user_id = %s AND is_active = TRUE
+                ORDER BY id DESC LIMIT 1
+                """,
+                (platform, platform_user_id),
+            ).fetchone()
+            if row:
+                return dict(row)["role"]
+            return None
+    except Exception as e:
+        logger.warning("Error fetching user role for %s (%s): %s", platform_user_id, platform, e)
         return None
 
 
@@ -999,15 +1003,23 @@ def is_admin_user(platform_user_id: int, platform: str | None = None) -> bool:
             return True
     except ImportError:
         pass
-    return get_user_role(platform_user_id, platform) == "admin"
+    try:
+        return get_user_role(platform_user_id, platform) == "admin"
+    except Exception as e:
+        logger.warning("Error in is_admin_user for %s (%s): %s", platform_user_id, platform, e)
+        return False
 
 
 def is_master_user(platform_user_id: int, platform: str | None = None) -> bool:
     if platform is None:
         platform = get_current_platform()
-    if is_admin_user(platform_user_id, platform):
-        return True
-    return get_user_role(platform_user_id, platform) in ("admin", "master")
+    try:
+        if is_admin_user(platform_user_id, platform):
+            return True
+        return get_user_role(platform_user_id, platform) in ("admin", "master")
+    except Exception as e:
+        logger.warning("Error in is_master_user for %s (%s): %s", platform_user_id, platform, e)
+        return False
 
 
 def get_all_master_ids(platform: str | None = None) -> list[int]:
