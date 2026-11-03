@@ -1102,3 +1102,84 @@ def mark_reminder_sent(appointment_id: int, reminder_type: str) -> None:
             (val, appointment_id),
         )
         conn.commit()
+
+
+def check_and_queue_unconfirmed_2h_alerts() -> int:
+    """
+    Checks for appointments starting today where 2h reminder was sent at least 15 minutes ago,
+    the client has not confirmed (client_confirmed is False),
+    and master notification has not yet been queued.
+    Queues 'master_unconfirmed_2h' for all messenger platforms ('telegram', 'vk', 'max').
+    Returns the number of appointments newly queued.
+    """
+    now = get_current_saratov_time()
+    now_utc = datetime.datetime.now(datetime.timezone.utc)
+
+    cutoff_15m = now - datetime.timedelta(minutes=15)
+    cutoff_15m_utc = now_utc - datetime.timedelta(minutes=15)
+    limit_105m = now + datetime.timedelta(minutes=105)
+
+    with get_connection() as conn:
+        p_now = now if conn.is_pg else now.strftime("%Y-%m-%d %H:%M:%S")
+        p_cutoff = cutoff_15m if conn.is_pg else cutoff_15m_utc.strftime("%Y-%m-%d %H:%M:%S")
+        p_limit = limit_105m if conn.is_pg else limit_105m.strftime("%Y-%m-%d %H:%M:%S")
+        p_false = False if conn.is_pg else 0
+        p_true = True if conn.is_pg else 1
+
+        query = """
+            SELECT a.id, a.user_id, a.appointment_time
+            FROM appointments a
+            WHERE a.status = 'confirmed'
+              AND (a.client_confirmed IS NULL OR a.client_confirmed = %s)
+              AND a.appointment_time > %s
+              AND (
+                  EXISTS (
+                      SELECT 1 FROM reminder_deliveries rd
+                      WHERE rd.appointment_id = a.id
+                        AND rd.kind = '2h'
+                        AND rd.status = 'sent'
+                        AND rd.sent_at <= %s
+                  )
+                  OR (
+                      a.reminder_2h_sent = %s
+                      AND a.appointment_time <= %s
+                  )
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM review_notifications rn
+                  WHERE rn.appointment_id = a.id
+                    AND rn.kind = 'master_unconfirmed_2h'
+              )
+            ORDER BY a.appointment_time ASC
+        """
+        rows = conn.execute(query, (p_false, p_now, p_cutoff, p_true, p_limit)).fetchall()
+        queued_count = 0
+        for row in rows:
+            appt_id = row["id"]
+            user_id = row["user_id"]
+            for platform in ("telegram", "vk", "max"):
+                exists = conn.execute(
+                    """
+                    SELECT id FROM review_notifications
+                    WHERE kind = 'master_unconfirmed_2h'
+                      AND appointment_id = %s
+                      AND platform = %s
+                    LIMIT 1
+                    """,
+                    (appt_id, platform),
+                ).fetchone()
+                if not exists:
+                    conn.execute(
+                        """
+                        INSERT INTO review_notifications
+                            (kind, appointment_id, user_id, platform, status)
+                        VALUES ('master_unconfirmed_2h', %s, %s, %s, 'pending')
+                        """,
+                        (appt_id, user_id, platform),
+                    )
+            queued_count += 1
+        if queued_count > 0:
+            conn.commit()
+            logger.info("Поставлено в очередь уведомлений мастера о неподтверждённых 2ч записях: %d", queued_count)
+        return queued_count
+

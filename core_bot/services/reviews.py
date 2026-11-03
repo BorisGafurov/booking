@@ -872,6 +872,7 @@ def get_pending_notifications(
             SELECT n.*,
                    a.services, a.total_price, a.appointment_time, a.status AS appointment_status,
                    a.payment_confirmed, a.platform AS appointment_platform,
+                   a.client_name AS appt_client_name, a.phone AS appt_phone, a.client_confirmed,
                    u.first_name, u.last_name, u.phone, u.username,
                    r.rating, r.comment, r.created_at AS review_created_at,
                    (SELECT id FROM reviews rr WHERE rr.appointment_id = n.appointment_id LIMIT 1) AS existing_review_id

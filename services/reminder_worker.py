@@ -9,6 +9,7 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from config import ADMIN_IDS
 from services.appointments import (
     SARATOV_TZ,
+    check_and_queue_unconfirmed_2h_alerts,
     get_due_2h_reminders,
     get_due_confirmation_followup_reminders,
     get_due_evening_reminders,
@@ -342,6 +343,12 @@ async def run_reminder_worker(bot: Bot, platform: str = "telegram"):
                 except Exception as send_err:
                     logger.warning("Ошибка отправки 2ч напоминания #%s: %s", appt["id"], send_err)
 
+            # 3.1. Check for unconfirmed 2h reminders (15 min after reminder delivery) and queue master alerts
+            try:
+                check_and_queue_unconfirmed_2h_alerts()
+            except Exception as unconfirmed_err:
+                logger.warning("Ошибка проверки неподтверждённых записей (2ч+15мин): %s", unconfirmed_err)
+
             # 4. 2.5 weeks retention reminder
             retention_due = get_due_retention_reminders(platform=platform)
             for appt in retention_due:
@@ -460,6 +467,52 @@ async def run_reminder_worker(bot: Bot, platform: str = "telegram"):
                         except Exception as a_err:
                             logger.warning("Не удалось уведомить админа %s (%s): %s", admin_id, event_kind, a_err)
                     mark_notification_sent(event["id"])
+
+            # 8. Master alerts: client did not confirm 15 mins after 2h reminder
+            unconfirmed_alerts = get_pending_notifications(platform, "master_unconfirmed_2h")
+            for alert in unconfirmed_alerts:
+                if alert.get("client_confirmed") or alert.get("appointment_status") != "confirmed":
+                    mark_notification_skipped(alert["id"], "already_confirmed_or_not_active")
+                    continue
+
+                client_name = (
+                    " ".join(part for part in (alert.get("first_name"), alert.get("last_name")) if part)
+                    or alert.get("appt_client_name")
+                    or "Клиент"
+                )
+                client_first_name = client_name.split()[0] if client_name and client_name != "Клиент" else ""
+                greeting = f"Здравствуйте, {client_first_name}!" if client_first_name else "Здравствуйте!"
+                phone = alert.get("phone") or alert.get("appt_phone") or "—"
+                services_name = alert.get("services") or "Стрижка"
+
+                dt = alert.get("appointment_time")
+                if isinstance(dt, str):
+                    dt = datetime.datetime.fromisoformat(dt)
+                dt_local = dt.astimezone(SARATOV_TZ) if (dt and hasattr(dt, "astimezone") and dt.tzinfo) else dt
+                time_str = dt_local.strftime("%H:%M") if dt_local else "—"
+
+                pm_text = (
+                    f"{greeting} Напоминаю о вашей записи сегодня в {time_str} ({services_name}). "
+                    "Подскажите, пожалуйста, всё ли в силе, вы сможете подойти?"
+                )
+
+                alert_text = (
+                    "⚠️ <b>Внимание: клиент не подтвердил запись!</b>\n"
+                    "<i>Прошло 15 минут после напоминания за 2 часа, подтверждение не получено.</i>\n\n"
+                    f"👤 <b>Клиент:</b> {html.escape(str(client_name))}\n"
+                    f"📱 <b>Телефон:</b> {html.escape(str(phone))}\n"
+                    f"✂️ <b>Услуги:</b> {html.escape(str(services_name))}\n"
+                    f"⏰ <b>Время:</b> {time_str}\n\n"
+                    "📋 <b>Текст для отправки клиенту в ЛС (нажмите, чтобы скопировать):</b>\n"
+                    f"<code>{html.escape(pm_text)}</code>"
+                )
+
+                for admin_id in set(ADMIN_IDS) | set(MASTER_TELEGRAM_IDS):
+                    try:
+                        await bot.send_message(chat_id=admin_id, text=alert_text, parse_mode="HTML")
+                    except Exception as a_err:
+                        logger.warning("Не удалось уведомить админа TG %s (master_unconfirmed_2h): %s", admin_id, a_err)
+                mark_notification_sent(alert["id"])
 
         except Exception as e:
             logger.error("Ошибка в цикле reminder worker: %s", e)

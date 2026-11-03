@@ -81,6 +81,7 @@ class TestReviewStorage(unittest.TestCase):
             finally:
                 conn.close()
 
+        self.test_connection = test_connection
         self.connection_patcher = patch.object(reviews, "get_connection", test_connection)
         self.connection_patcher.start()
 
@@ -263,6 +264,128 @@ class TestReviewStorage(unittest.TestCase):
         # After review, can_review returns False
         can_again, _, _ = reviews.can_review_platform_appointment("telegram", 1001, self.appointment_id)
         self.assertFalse(can_again)
+
+    def test_check_and_queue_unconfirmed_2h_alerts(self):
+        import datetime
+        from unittest.mock import patch as inner_patch
+        from core_bot.services import appointments as appts_mod
+
+        now = appts_mod.get_current_saratov_time()
+        now_utc = datetime.datetime.now(datetime.timezone.utc)
+
+        # 1. Active unconfirmed appointment where 2h reminder was sent 20 min ago
+        appt_time = now + datetime.timedelta(minutes=100)
+        self.conn.execute(
+            """
+            INSERT INTO appointments (
+                user_id, platform, platform_user_id, client_name, phone, services,
+                total_price, appointment_time, status, client_confirmed, reminder_2h_sent
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'confirmed', 0, 1)
+            """,
+            (
+                self.user_id,
+                "telegram",
+                1001,
+                "Иван Петров",
+                "+79990000001",
+                "Мужская стрижка",
+                1500,
+                appt_time.strftime("%Y-%m-%d %H:%M:%S"),
+            ),
+        )
+        row_id = self.conn.raw_conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+
+        sent_at_20m_ago = (now_utc - datetime.timedelta(minutes=20)).strftime("%Y-%m-%d %H:%M:%S")
+        self.conn.execute(
+            """
+            INSERT INTO reminder_deliveries (appointment_id, kind, platform, status, sent_at)
+            VALUES (%s, '2h', 'telegram', 'sent', %s)
+            """,
+            (row_id, sent_at_20m_ago),
+        )
+        self.conn.commit()
+
+        # 2. Confirmed appointment -> should not be queued
+        self.conn.execute(
+            """
+            INSERT INTO appointments (
+                user_id, platform, platform_user_id, client_name, phone, services,
+                total_price, appointment_time, status, client_confirmed, reminder_2h_sent
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'confirmed', 1, 1)
+            """,
+            (
+                self.user_id,
+                "telegram",
+                1001,
+                "Иван Подтвержденный",
+                "+79990000001",
+                "Мужская стрижка",
+                1500,
+                appt_time.strftime("%Y-%m-%d %H:%M:%S"),
+            ),
+        )
+        conf_id = self.conn.raw_conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        self.conn.execute(
+            """
+            INSERT INTO reminder_deliveries (appointment_id, kind, platform, status, sent_at)
+            VALUES (%s, '2h', 'telegram', 'sent', %s)
+            """,
+            (conf_id, sent_at_20m_ago),
+        )
+        self.conn.commit()
+
+        # 3. Appointment where 2h reminder was sent only 5 minutes ago -> should not be queued yet
+        sent_at_5m_ago = (now_utc - datetime.timedelta(minutes=5)).strftime("%Y-%m-%d %H:%M:%S")
+        self.conn.execute(
+            """
+            INSERT INTO appointments (
+                user_id, platform, platform_user_id, client_name, phone, services,
+                total_price, appointment_time, status, client_confirmed, reminder_2h_sent
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'confirmed', 0, 1)
+            """,
+            (
+                self.user_id,
+                "telegram",
+                1001,
+                "Иван Подождет",
+                "+79990000001",
+                "Мужская стрижка",
+                1500,
+                (now + datetime.timedelta(minutes=115)).strftime("%Y-%m-%d %H:%M:%S"),
+            ),
+        )
+        recent_id = self.conn.raw_conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        self.conn.execute(
+            """
+            INSERT INTO reminder_deliveries (appointment_id, kind, platform, status, sent_at)
+            VALUES (%s, '2h', 'telegram', 'sent', %s)
+            """,
+            (recent_id, sent_at_5m_ago),
+        )
+        self.conn.commit()
+
+        with inner_patch.object(appts_mod, "get_connection", self.test_connection):
+            queued = appts_mod.check_and_queue_unconfirmed_2h_alerts()
+            self.assertEqual(queued, 1)
+
+            # Calling again should be idempotent (0 newly queued)
+            queued_again = appts_mod.check_and_queue_unconfirmed_2h_alerts()
+            self.assertEqual(queued_again, 0)
+
+        # Check that rows were created for telegram, vk, max
+        notifications = self.conn.execute(
+            "SELECT platform, kind, appointment_id FROM review_notifications WHERE kind = 'master_unconfirmed_2h'"
+        ).fetchall()
+        self.assertEqual(len(notifications), 3)
+        platforms = {n["platform"] for n in notifications}
+        self.assertEqual(platforms, {"telegram", "vk", "max"})
+
+        # Check get_pending_notifications returns client info correctly
+        tg_alerts = reviews.get_pending_notifications("telegram", "master_unconfirmed_2h")
+        self.assertEqual(len(tg_alerts), 1)
+        self.assertEqual(tg_alerts[0]["appt_client_name"], "Иван Петров")
+        self.assertEqual(tg_alerts[0]["services"], "Мужская стрижка")
+        self.assertFalse(tg_alerts[0]["client_confirmed"])
 
 
 if __name__ == "__main__":

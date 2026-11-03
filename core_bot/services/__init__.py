@@ -3,6 +3,7 @@ from core_bot.services.appointments import (
     SlotUnavailableError,
     adjust_master_day_hours,
     cancel_appointment,
+    check_and_queue_unconfirmed_2h_alerts,
     complete_appointment,
     confirm_appointment_by_client,
     create_manual_appointment,
