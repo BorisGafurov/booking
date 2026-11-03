@@ -210,9 +210,21 @@ async def handle_review_comment_input(message: Message):
         return
 
     user_pending_review.pop(user_id, None)
+    next_booking_kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="✂️ Записаться на следующий визит",
+                    callback_data="menu:booking",
+                )
+            ]
+        ]
+    )
     await message.answer(
         "🎉 <b>Спасибо за твой отзыв!</b>\n\n"
         "Он успешно опубликован и теперь виден на нашем сайте <b>srezforma.ru</b> в разделе «Отзывы».\n\n"
-        "Будем рады видеть тебя снова! 💈",
+        "Будем рады видеть тебя снова! 💈\n"
+        "Ты можешь сразу выбрать удобное время на следующий визит:",
+        reply_markup=next_booking_kb,
         parse_mode="HTML",
     )

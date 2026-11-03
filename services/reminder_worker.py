@@ -88,6 +88,12 @@ def _get_review_invite_keyboard(appointment_id: int) -> InlineKeyboardMarkup:
             ],
             [
                 InlineKeyboardButton(
+                    text="✂️ Записаться на следующий визит",
+                    callback_data="menu:booking",
+                )
+            ],
+            [
+                InlineKeyboardButton(
                     text="💬 Оставить отзыв в группе ВКонтакте",
                     url="https://vk.ru/reviews-242475554",
                 )
@@ -380,8 +386,10 @@ async def run_reminder_worker(bot: Bot, platform: str = "telegram"):
                 text = (
                     "✂️ <b>Спасибо, что посетил салон Срез!</b>\n\n"
                     f"Визит: <b>{html.escape(str(services_name))}</b>\n\n"
-                    "Надеемся, стрижка принесла удовольствие и отличный настрой. "
-                    "Пожалуйста, оцени качество визита от 1 до 5 звёзд:"
+                    "Надеемся, стрижка принесла удовольствие и отличный настрой! 💈\n"
+                    "Пожалуйста, оцени качество визита от 1 до 5 звёзд ниже.\n\n"
+                    "📅 <b>Хочешь сразу запланировать следующий визит?</b>\n"
+                    "Чтобы зафиксировать удобный день и время заранее, нажми кнопку ниже 👇"
                 )
                 try:
                     await bot.send_message(
