@@ -2,7 +2,6 @@ import logging
 import os
 import urllib.parse
 import urllib.request
-import json
 
 logger = logging.getLogger(__name__)
 
@@ -21,6 +20,7 @@ def is_voice_configured() -> bool:
 def send_voice_reminder(appointment: dict) -> bool:
     """
     Triggers an interactive voice robocall via Zvonok.com.
+    Plays the campaign's universal audio track configured in Zvonok cabinet.
     Returns True if the call was successfully queued, False otherwise.
     Never raises exceptions, ensuring safe fallback.
     """
@@ -46,51 +46,10 @@ def send_voice_reminder(appointment: dict) -> bool:
         logger.warning("Некорректный номер для звонка Zvonok: %s", raw_phone)
         return False
 
-    client_name = appointment.get("client_name") or "Клиент"
-    time_str = ""
-    day_word = "сегодня"
-    dt = appointment.get("appointment_time")
-    if dt:
-        try:
-            import datetime
-            from zoneinfo import ZoneInfo
-            saratov_tz = ZoneInfo("Europe/Saratov")
-            now_local = datetime.datetime.now(saratov_tz).date()
-            if isinstance(dt, str):
-                dt = datetime.datetime.fromisoformat(dt)
-            dt_local = dt.astimezone(saratov_tz) if getattr(dt, "tzinfo", None) else dt
-            time_str = dt_local.strftime("%H:%M")
-            if hasattr(dt_local, "date"):
-                appt_date = dt_local.date()
-                if appt_date == now_local:
-                    day_word = "сегодня"
-                elif appt_date == now_local + datetime.timedelta(days=1):
-                    day_word = "завтра"
-                else:
-                    day_word = dt_local.strftime("%d.%m")
-        except Exception:
-            time_str = ""
-            day_word = "сегодня"
-
-    # Synthesized text for dynamic campaigns (with Zvonok stress markup)
-    if time_str:
-        text = (
-            f"Здравствуйте, {client_name}! Вас приветствует голосовой ассистент Срез. "
-            f"Напоминаем о вашей записи к мастеру Борису Гаф+урову {day_word} в {time_str}. "
-            f"Пожалуйста, подтвердите визит. Нажмите один, если придёте. Нажмите два, если хотите отменить запись."
-        )
-    else:
-        text = (
-            f"Здравствуйте, {client_name}! Вас приветствует голосовой ассистент Срез. "
-            f"Напоминаем о вашей записи к мастеру Борису Гаф+урову. "
-            f"Пожалуйста, подтвердите визит. Нажмите один, если придёте. Нажмите два, если хотите отменить запись."
-        )
-
     payload = {
         "public_key": public_key,
         "phone": phone,
         "campaign_id": campaign_id,
-        "text": text,
     }
 
     try:
