@@ -5,7 +5,7 @@ from config import BOOKING_URL, WEB_APP_URL
 from services.booking import SERVICES, calculate_services
 
 
-def _get_site_inline_btn(text: str = "🌐 Открыть сайт / Запись онлайн") -> InlineKeyboardButton:
+def _get_site_inline_btn(text: str = "🌐 Перейти на сайт") -> InlineKeyboardButton:
     if WEB_APP_URL and WEB_APP_URL.startswith("https://"):
         return InlineKeyboardButton(text=text, web_app=WebAppInfo(url=WEB_APP_URL))
     return InlineKeyboardButton(text=text, url=WEB_APP_URL or BOOKING_URL)
@@ -15,7 +15,7 @@ def get_booking_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
-                _get_site_inline_btn("🌐 Записаться на сайте / Мини-Апп")
+                _get_site_inline_btn("🌐 Перейти на сайт")
             ]
         ]
     )
@@ -55,7 +55,7 @@ def get_services_keyboard(selected_keys: list[str] | set[str]) -> InlineKeyboard
     rows.append([InlineKeyboardButton(text=next_text, callback_data="book:choose_day")])
 
     # Site / Mini App button
-    rows.append([_get_site_inline_btn("🌐 Открыть сайт / Запись онлайн")])
+    rows.append([_get_site_inline_btn("🌐 Перейти на сайт")])
 
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -76,7 +76,7 @@ def get_days_keyboard(days_map: dict[str, Any]) -> InlineKeyboardMarkup:
 
     rows.append([
         InlineKeyboardButton(text="◀️ К выбору услуг", callback_data="book:services"),
-        _get_site_inline_btn("🌐 На сайт"),
+        _get_site_inline_btn("🌐 Перейти на сайт"),
     ])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -95,6 +95,6 @@ def get_slots_keyboard(slots: list[dict[str, Any]]) -> InlineKeyboardMarkup:
 
     rows.append([
         InlineKeyboardButton(text="◀️ Выбрать другой день", callback_data="book:choose_day"),
-        _get_site_inline_btn("🌐 На сайт"),
+        _get_site_inline_btn("🌐 Перейти на сайт"),
     ])
     return InlineKeyboardMarkup(inline_keyboard=rows)
