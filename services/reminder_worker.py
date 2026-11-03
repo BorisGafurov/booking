@@ -189,16 +189,15 @@ async def run_reminder_worker(bot: Bot, platform: str = "telegram"):
                 if target_user_id == "reassigned":
                     continue
                 if not target_user_id:
-                    if platform == "telegram":
-                        try:
-                            from core_bot.services.voice import is_voice_configured, send_voice_reminder
-                            if is_voice_configured():
-                                send_voice_reminder(appt)
-                                record_reminder_delivery(appt["id"], "evening", platform, "voice")
-                                mark_reminder_sent(appt["id"], "evening")
-                                continue
-                        except Exception as v_err:
-                            logger.warning("Voice reminder error: %s", v_err)
+                    try:
+                        from core_bot.services.voice import is_voice_configured, send_voice_reminder
+                        if is_voice_configured():
+                            send_voice_reminder(appt)
+                            record_reminder_delivery(appt["id"], "evening", platform, "voice")
+                            mark_reminder_sent(appt["id"], "evening")
+                            continue
+                    except Exception as v_err:
+                        logger.warning("Voice reminder error: %s", v_err)
                     record_reminder_delivery(appt["id"], "evening", platform, "skipped", "no_recipient")
                     continue
 
@@ -239,16 +238,15 @@ async def run_reminder_worker(bot: Bot, platform: str = "telegram"):
                 if target_user_id == "reassigned":
                     continue
                 if not target_user_id:
-                    if platform == "telegram":
-                        try:
-                            from core_bot.services.voice import is_voice_configured, send_voice_reminder
-                            if is_voice_configured():
-                                send_voice_reminder(appt)
-                                record_reminder_delivery(appt["id"], "morning", platform, "voice")
-                                mark_reminder_sent(appt["id"], "morning")
-                                continue
-                        except Exception as v_err:
-                            logger.warning("Voice reminder error: %s", v_err)
+                    try:
+                        from core_bot.services.voice import is_voice_configured, send_voice_reminder
+                        if is_voice_configured():
+                            send_voice_reminder(appt)
+                            record_reminder_delivery(appt["id"], "morning", platform, "voice")
+                            mark_reminder_sent(appt["id"], "morning")
+                            continue
+                    except Exception as v_err:
+                        logger.warning("Voice reminder error: %s", v_err)
                     record_reminder_delivery(appt["id"], "morning", platform, "skipped", "no_recipient")
                     continue
 
@@ -278,6 +276,15 @@ async def run_reminder_worker(bot: Bot, platform: str = "telegram"):
                     logger.info("Отправлено утреннее напоминание о подтверждении клиенту #%s (appt #%s)", target_user_id, appt["id"])
                 except Exception as send_err:
                     logger.warning("Ошибка отправки утреннего напоминания #%s: %s", appt["id"], send_err)
+
+                # Дополнительно совершаем робозвонок с подтверждением через Zvonok
+                try:
+                    from core_bot.services.voice import is_voice_configured, send_voice_reminder
+                    if is_voice_configured():
+                        send_voice_reminder(appt)
+                        record_reminder_delivery(appt["id"], "morning", platform, "voice")
+                except Exception as v_err:
+                    logger.warning("Voice reminder error in morning followup: %s", v_err)
 
             # 3. 2h express reminder
             two_h_due = get_due_2h_reminders(platform=platform)
