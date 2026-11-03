@@ -1,6 +1,6 @@
 import html
 import logging
-from aiogram import Router
+from aiogram import F, Router
 from aiogram.filters import CommandObject, CommandStart
 from aiogram.types import Message
 
@@ -11,9 +11,26 @@ from services.referrals import register_referral, save_user
 logger = logging.getLogger(__name__)
 router = Router()
 
+START_TEXTS = {
+    "начать",
+    "начни",
+    "старт",
+    "start",
+    "/start",
+    "меню",
+    "главное меню",
+    "menu",
+    "привет",
+    "здравствуйте",
+    "хай",
+    "записаться",
+    "запись",
+}
+
 
 @router.message(CommandStart())
-async def start(message: Message, command: CommandObject):
+@router.message(F.text.lower().in_(START_TEXTS))
+async def start(message: Message, command: CommandObject | None = None):
     user = message.from_user
     if not user:
         return
@@ -28,8 +45,14 @@ async def start(message: Message, command: CommandObject):
     text = "Привет! Выбери нужный раздел:"
     extra_text = ""
 
-    if command.args and command.args.startswith("ref_"):
-        referrer_part = command.args.replace("ref_", "", 1)
+    raw_args = command.args if (command and command.args) else None
+    if not raw_args and message.text:
+        parts = message.text.strip().split()
+        if len(parts) > 1 and parts[0].lower() in ("/start", "start", "начать"):
+            raw_args = parts[1]
+
+    if raw_args and raw_args.startswith("ref_"):
+        referrer_part = raw_args.replace("ref_", "", 1)
 
         if referrer_part.isdigit():
             referrer_telegram_id = int(referrer_part)
