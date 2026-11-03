@@ -123,6 +123,12 @@ def _rebuild_sqlite_appointments(conn) -> None:
     common = [name for name in APPOINTMENT_COLUMNS if name in existing or name == "duration_min"]
     column_list = ", ".join(common)
     conn.execute("ALTER TABLE appointments RENAME TO appointments_legacy_008")
+    try:
+        conn.execute(
+            "UPDATE appointments_legacy_008 SET user_id = NULL WHERE user_id IS NOT NULL AND user_id NOT IN (SELECT id FROM users)"
+        )
+    except Exception:
+        pass
     conn.execute(
         """
         CREATE TABLE appointments (
