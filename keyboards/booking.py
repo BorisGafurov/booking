@@ -83,10 +83,10 @@ def get_days_keyboard(days_map: dict[str, Any]) -> InlineKeyboardMarkup:
 
 def get_slots_keyboard(slots: list[dict[str, Any]]) -> InlineKeyboardMarkup:
     rows = []
-    # 4 time buttons per row
-    for i in range(0, len(slots), 4):
+    # 3 time buttons per row for spacious, unclipped buttons on mobile screens
+    for i in range(0, len(slots), 3):
         row = []
-        for s in slots[i : i + 4]:
+        for s in slots[i : i + 3]:
             row.append(InlineKeyboardButton(text=f"🕒 {s['time']}", callback_data=f"book:slot:{s['timestamp']}"))
         rows.append(row)
 
