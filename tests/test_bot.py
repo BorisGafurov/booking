@@ -1257,6 +1257,29 @@ class TestBookingBot(unittest.IsolatedAsyncioTestCase):
         btn_texts = [btn.text for row in kb_arg.inline_keyboard for btn in row]
         self.assertTrue(any("CRM «Срез»" in t for t in btn_texts))
 
+    def test_parse_admin_client_info_and_custom_time(self):
+        from core_bot.services.booking import parse_admin_client_info, parse_admin_custom_time
+
+        # Formatted phone + name + price
+        phone, name, price = parse_admin_client_info("+7 (906) 150-98-98 Иван 1500")
+        self.assertEqual(phone, "+79061509898")
+        self.assertEqual(name, "Иван")
+        self.assertEqual(price, 1500)
+
+        # 8 format phone with spaces/dashes
+        phone2, name2, price2 = parse_admin_client_info("8 (906) 150-98-98 Владимир", default_price=2300)
+        self.assertEqual(phone2, "+79061509898")
+        self.assertEqual(name2, "Владимир")
+        self.assertEqual(price2, 2300)
+
+        # Custom time parsing
+        time_str, rest = parse_admin_custom_time("16.00 +7 (906) 150-98-98 Иван 1500")
+        self.assertEqual(time_str, "16:00")
+        p3, n3, pr3 = parse_admin_client_info(rest)
+        self.assertEqual(p3, "+79061509898")
+        self.assertEqual(n3, "Иван")
+        self.assertEqual(pr3, 1500)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -13,6 +13,7 @@ No third-party booking service is involved.
 
 import datetime
 import logging
+import re
 from typing import Any
 from zoneinfo import ZoneInfo
 
