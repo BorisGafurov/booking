@@ -28,9 +28,12 @@ from core_bot.services.appointments import (
 from core_bot.services.booking import (
     SERVICES,
     calculate_services,
+    generate_day_slots,
     get_schedule,
     get_service_options_for_creation,
     map_service_name_to_keys,
+    parse_admin_client_info,
+    parse_admin_custom_time,
 )
 from core_bot.services.client_import import import_clients_from_file
 from core_bot.services.recommendations import (

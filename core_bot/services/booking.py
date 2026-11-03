@@ -52,11 +52,31 @@ SERVICES: dict[str, dict[str, Any]] = {
 
 DEFAULT_SERVICE_KEYS = ["hair"]
 
-# Standard slot grid: Tue/Sat, 10:00-19:00, 75-minute steps.
+# Standard slot grid: 15-minute step in free ranges between start_time and end_time.
+SLOT_STEP_MINUTES = 15
 DEFAULT_SLOTS = ["10:00", "11:15", "12:30", "14:00", "15:15", "16:30", "17:45"]
 WORKING_WEEKDAYS = {1, 5}  # Tuesday=1, Saturday=5
 DEFAULT_START_TIME = "10:00"
 DEFAULT_END_TIME = "19:00"
+
+
+def generate_day_slots(
+    start_time: str,
+    end_time: str,
+    duration_min: int = 75,
+    step_min: int = 15,
+) -> list[str]:
+    """Generates candidate start times with a given step within the working interval."""
+    start_min = _time_to_minutes(start_time)
+    end_min = _time_to_minutes(end_time)
+    slots: list[str] = []
+    curr = start_min
+    while curr + duration_min <= end_min:
+        h = curr // 60
+        m = curr % 60
+        slots.append(f"{h:02d}:{m:02d}")
+        curr += step_min
+    return slots
 
 # In-memory UI selections. They are per-process and intentionally ephemeral.
 user_selected_services: dict[int, set[str]] = {}
@@ -319,7 +339,10 @@ def get_days_schedule(
         slots: list[dict[str, Any]] = []
         if is_working:
             day_start, day_end = _day_bounds(day_key, start_time, end_time)
-            for time_str in DEFAULT_SLOTS:
+            candidate_times = generate_day_slots(
+                start_time, end_time, duration_min=duration, step_min=SLOT_STEP_MINUTES
+            )
+            for time_str in candidate_times:
                 slot_start = datetime.datetime.combine(
                     cur_date,
                     datetime.time(hour=int(time_str[:2]), minute=int(time_str[3:])),
@@ -448,7 +471,10 @@ def get_day_time_slots_status(day_key: str) -> dict[str, Any]:
 
     all_slots = []
     free_slots = []
-    for time_str in DEFAULT_SLOTS:
+    candidate_times = generate_day_slots(
+        sched["start_time"], sched["end_time"], duration_min=75, step_min=SLOT_STEP_MINUTES
+    )
+    for time_str in candidate_times:
         slot_start = datetime.datetime.combine(
             datetime.date.fromisoformat(day_key),
             datetime.time(hour=int(time_str[:2]), minute=int(time_str[3:])),
@@ -470,3 +496,58 @@ def get_day_time_slots_status(day_key: str) -> dict[str, Any]:
         "all_slots": all_slots,
         "sched": sched,
     }
+
+
+def parse_admin_custom_time(raw_text: str) -> tuple[str | None, str]:
+    """
+    Extracts time string 'HH:MM' from user text (e.g. '16.00', '16:00', '16-00', '16 00').
+    Returns (time_str, remaining_text).
+    """
+    m = re.search(r"\b([01]?\d|2[0-3])[:.\-]([0-5]\d)\b", raw_text)
+    if not m:
+        m = re.search(r"\b([01]?\d|2[0-3])\s+([0-5]\d)\b", raw_text)
+    if not m:
+        return None, raw_text
+    h, mm = int(m.group(1)), int(m.group(2))
+    time_str = f"{h:02d}:{mm:02d}"
+    rest = raw_text[:m.start()] + " " + raw_text[m.end():]
+    return time_str, rest.strip()
+
+
+def parse_admin_client_info(raw_text: str, default_price: int = 2300) -> tuple[str | None, str, int]:
+    """
+    Extracts (phone, client_name, price) from raw text.
+    Handles formatted phones like +7 (000) 000-00-00, 8 (000) 000-00-00, etc.
+    """
+    phone_pattern = re.compile(
+        r"(?:\+?[78][\s\-\(]*\d{3}[\s\-\)]*[\s\-]*\d{3}[\s\-]*\d{2}[\s\-]*\d{2}|\b[78]\d{10}\b|\b9\d{9}\b)"
+    )
+    phone_match = phone_pattern.search(raw_text)
+    if not phone_match:
+        digits = re.sub(r"\D", "", raw_text)
+        if len(digits) == 10 or (len(digits) == 11 and digits[0] in ("7", "8")):
+            phone = normalize_phone(digits)
+            text_without_phone = re.sub(r"\d", "", raw_text)
+        else:
+            return None, "Клиент", default_price
+    else:
+        matched_str = phone_match.group(0)
+        phone = normalize_phone(matched_str)
+        text_without_phone = raw_text[:phone_match.start()] + " " + raw_text[phone_match.end():]
+
+    price = default_price
+    price_match = re.search(r"\b(\d{3,5})\s*(?:₽|руб)?\b", text_without_phone)
+    if price_match:
+        try:
+            cand_price = int(price_match.group(1))
+            if 100 <= cand_price <= 50000:
+                price = cand_price
+                text_without_phone = text_without_phone[:price_match.start()] + " " + text_without_phone[price_match.end():]
+        except ValueError:
+            pass
+
+    cleaned_name = re.sub(r"[()\",:;]", " ", text_without_phone)
+    name_parts = [p.strip() for p in cleaned_name.split() if p.strip()]
+    name = " ".join(name_parts) if name_parts else "Клиент"
+
+    return phone, name, price

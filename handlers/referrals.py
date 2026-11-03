@@ -37,7 +37,13 @@ from services.client_import import (
     import_clients_from_text,
     update_appointment_client_details,
 )
-from services.booking import get_service_options_for_creation
+from services.booking import (
+    SERVICES,
+    calculate_services,
+    get_service_options_for_creation,
+    parse_admin_client_info,
+    parse_admin_custom_time,
+)
 from services.referrals import (
     build_referral_link,
     get_active_rewards,
@@ -707,6 +713,39 @@ async def admin_resched_custom_start(callback: CallbackQuery):
     await callback.answer()
 
 
+def _render_admin_create_services_screen(selected_keys: set[str]) -> tuple[str, InlineKeyboardMarkup]:
+    calc = calculate_services(selected_keys)
+    names_str = " + ".join(calc["names"]) if calc["names"] else "Ничего не выбрано"
+    text = (
+        "➕ <b>Создание новой записи мастером</b>\n\n"
+        "<b>Шаг 1 из 4: Выберите услуги</b>\n\n"
+        "💡 <i>Нажмите на услугу, чтобы отметить её галочкой ✅ или снять ⚪️:</i>\n\n"
+        f"📋 <b>Выбрано:</b> {html.escape(names_str)}\n"
+        f"💰 <b>Итого:</b> {calc['total_price']} ₽ ({calc['duration_text']})\n\n"
+        "<i>После выбора нажмите кнопку «📅 Выбрать дату»:</i>"
+    )
+    rows = []
+    active_keys = set(calc["keys"])
+    for key, info in SERVICES.items():
+        is_sel = key in active_keys
+        icon = "✅" if is_sel else "⚪️"
+        rows.append([
+            InlineKeyboardButton(
+                text=f"{icon} {info['name']} · {info['price']} ₽ ({info['duration_text']})",
+                callback_data=f"admin:create:toggle:{key}",
+            )
+        ])
+    if active_keys:
+        rows.append([
+            InlineKeyboardButton(
+                text=f"📅 Выбрать дату ({calc['total_price']} ₽)",
+                callback_data="admin:create:go_day",
+            )
+        ])
+    rows.append([InlineKeyboardButton(text="⬅️ Отмена", callback_data="admin:menu")])
+    return text, InlineKeyboardMarkup(inline_keyboard=rows)
+
+
 # Manual appointment creation flow
 @router.callback_query(F.data == "admin:create:start")
 async def admin_create_start(callback: CallbackQuery):
@@ -714,76 +753,54 @@ async def admin_create_start(callback: CallbackQuery):
         await callback.answer("Нет доступа.", show_alert=True)
         return
 
-    opts = await asyncio.to_thread(get_service_options_for_creation)
     admin_create_drafts[callback.from_user.id] = {
         "step": "service",
-        "options": opts,
+        "services": {"hair"},
     }
-
-    rows = []
-    for idx, o in enumerate(opts):
-        rows.append([
-            InlineKeyboardButton(
-                text=f"{o['name']} ({o['price']} ₽)",
-                callback_data=f"admin:create:svc:{idx}",
-            )
-        ])
-    rows.append([InlineKeyboardButton(text="✏️ Другая услуга / своя цена", callback_data="admin:create:svc:custom")])
-    rows.append([InlineKeyboardButton(text="⬅️ Отмена", callback_data="admin:menu")])
-
+    text, kb = _render_admin_create_services_screen({"hair"})
     if callback.message:
-        await _edit_or_send(callback.message, 
-            "➕ <b>Создание новой записи мастером</b>\n\n"
-            "<b>Шаг 1 из 4:</b> Выберите услугу или введите другое название:",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
-            parse_mode="HTML",
-        )
+        await _edit_or_send(callback.message, text, reply_markup=kb, parse_mode="HTML")
     await callback.answer()
 
 
-@router.callback_query(F.data.startswith("admin:create:svc:"))
-async def admin_create_service_chosen(callback: CallbackQuery):
+@router.callback_query(F.data.startswith("admin:create:toggle:"))
+async def admin_create_service_toggle(callback: CallbackQuery):
     if not callback.from_user or not is_admin(callback.from_user.id):
         await callback.answer("Нет доступа.", show_alert=True)
         return
 
-    parts = callback.data.split(":")
-    svc_code = parts[3]
+    key = callback.data.split(":")[3]
+    draft = admin_create_drafts.setdefault(callback.from_user.id, {"step": "service", "services": {"hair"}})
+    current = set(draft.get("services", {"hair"}))
 
-    draft = admin_create_drafts.setdefault(callback.from_user.id, {})
-    if svc_code == "custom":
-        draft["step"] = "awaiting_custom_service"
-        if callback.message:
-            await _edit_or_send(callback.message, 
-                "✏️ <b>Введите название услуги</b> в чат (например: <code>Моделирование бороды VIP</code>):",
-                reply_markup=InlineKeyboardMarkup(
-                    inline_keyboard=[[InlineKeyboardButton(text="⬅️ Отмена", callback_data="admin:create:start")]]
-                ),
-                parse_mode="HTML",
-            )
-        await callback.answer()
+    alert_msg = None
+    if key in current:
+        if len(current) > 1:
+            current.remove(key)
+        else:
+            alert_msg = "Нужно выбрать хотя бы одну услугу"
+    else:
+        current.add(key)
+
+    draft["services"] = current
+    text, kb = _render_admin_create_services_screen(current)
+    if callback.message:
+        await _edit_or_send(callback.message, text, reply_markup=kb, parse_mode="HTML")
+    await callback.answer(alert_msg)
+
+
+@router.callback_query(F.data == "admin:create:go_day")
+async def admin_create_go_day(callback: CallbackQuery):
+    if not callback.from_user or not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа.", show_alert=True)
         return
 
-    opts = draft.get("options")
-    if not opts:
-        opts = await asyncio.to_thread(get_service_options_for_creation)
-        draft["options"] = opts
-
-    if svc_code.isdigit():
-        idx = int(svc_code)
-        if 0 <= idx < len(opts):
-            selected = opts[idx]
-            svc_name = selected["name"]
-            price = selected["price"]
-        else:
-            svc_name = "Стрижка (МУЖСКАЯ)"
-            price = 2300
-    else:
-        svc_name = svc_code
-        price = int(parts[4]) if len(parts) > 4 and parts[4].isdigit() else 2300
-
-    draft["service"] = svc_name
-    draft["price"] = price
+    draft = admin_create_drafts.setdefault(callback.from_user.id, {"step": "service", "services": {"hair"}})
+    current = set(draft.get("services", {"hair"}))
+    calc = calculate_services(current)
+    draft["service"] = " + ".join(calc["names"])
+    draft["price"] = calc["total_price"]
+    draft["duration_min"] = calc["duration_minutes"]
     draft["step"] = "day"
 
     await show_create_day_picker(callback)
@@ -935,12 +952,16 @@ async def admin_create_time_chosen(callback: CallbackQuery):
     if time_val == "custom":
         draft["step"] = "awaiting_custom_time"
         if callback.message:
-            await _edit_or_send(callback.message, 
-                f"✏️ <b>Введите любое время записи</b> на {draft.get('day_key')}\n\n"
-                "Напишите в ответном сообщении (например <code>08:30</code> или <code>22:15</code>):",
+            await _edit_or_send(
+                callback.message,
+                f"✏️ <b>Введите любое время записи на {draft.get('day_key')}</b>\n\n"
+                "Напишите в ответном сообщении время (например <code>16:00</code> или <code>16.00</code>).\n\n"
+                "💡 <i>Можно сразу отправить время вместе с телефоном и именем:</i>\n"
+                "<code>16.00 +7 (905) 380-72-54 Владимир</code>",
                 reply_markup=InlineKeyboardMarkup(
                     inline_keyboard=[[InlineKeyboardButton(text="⬅️ Отмена", callback_data="admin:create:start")]]
                 ),
+                parse_mode="HTML",
             )
         await callback.answer()
         return
@@ -949,21 +970,23 @@ async def admin_create_time_chosen(callback: CallbackQuery):
     draft["step"] = "awaiting_client_info"
 
     curr_price = draft.get("price", 2300)
-    curr_svc = draft.get("service", "Стрижка (МУЖСКАЯ)")
+    curr_svc = draft.get("service", "Мужская стрижка")
     day_key = draft.get("day_key", "")
 
     if callback.message:
-        await _edit_or_send(callback.message, 
+        await _edit_or_send(
+            callback.message,
             f"➕ <b>Шаг 4 из 4: Данные клиента и цена</b>\n\n"
             f"✂️ Услуга: <b>{curr_svc}</b>\n"
             f"⏰ Время: <b>{day_key} {time_val}</b>\n"
             f"💰 Цена: <b>{curr_price} ₽</b>\n\n"
-            "👉 <b>Отправьте в чат телефон и имя клиента:</b>\n"
-            "Например: <code>+79991234567 Иван</code> или просто номер <code>89991234567</code>.\n\n"
-            "<i>Если хотите изменить цену, укажите её в конце сообщения, например: <code>89991234567 Иван 1200</code></i>",
+            "👉 <b>Отправьте в чат номер телефона и имя клиента:</b>\n"
+            "Например: <code>+7 (905) 380-72-54 Иван</code> или <code>8 (000) 000-00-00 Иван</code>.\n\n"
+            "<i>Если хотите изменить цену, укажите её в конце: <code>+7 (905) 380-72-54 Иван 2000</code></i>",
             reply_markup=InlineKeyboardMarkup(
                 inline_keyboard=[[InlineKeyboardButton(text="⬅️ Отмена", callback_data="admin:menu")]]
             ),
+            parse_mode="HTML",
         )
     await callback.answer()
 
@@ -1791,70 +1814,81 @@ async def handle_admin_text_inputs(message: Message):
     if create_draft:
         step = create_draft.get("step")
 
-        if step == "awaiting_custom_service":
-            create_draft["service"] = raw_text
-            create_draft["price"] = 2300
-            create_draft["step"] = "day"
-            now = get_current_saratov_time()
-            rows = []
-            for i in range(7):
-                d = now + datetime.timedelta(days=i)
-                day_key = d.strftime("%Y-%m-%d")
-                title = f"{RU_WEEKDAYS[d.weekday()]}, {d.day} {RU_MONTHS[d.month]}"
-                rows.append([InlineKeyboardButton(text=title, callback_data=f"admin:create:day:{day_key}")])
-            rows.append([InlineKeyboardButton(text="⬅️ Отмена", callback_data="admin:menu")])
-            await message.answer(
-                f"✂️ Услуга: <b>{raw_text}</b>\n\n<b>Шаг 2 из 4:</b> Выберите дату записи:",
-                reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
-            )
-            return
-
         if step == "awaiting_custom_time":
-            m = re.match(r"^(\d{1,2})[:.-](\d{2})$", raw_text)
-            if not m:
-                await message.answer("⚠️ Неверный формат. Введите время в формате <code>08:30</code> или <code>22:00</code>:")
+            time_str, rest = parse_admin_custom_time(raw_text)
+            if not time_str:
+                await message.answer(
+                    "⚠️ Неверный формат времени. Введите время, например <code>16:00</code> или <code>16.00</code>\n"
+                    "<i>(можно сразу отправить с телефоном и именем: <code>16:00 +7 (905) 380-72-54 Владимир</code>)</i>",
+                    parse_mode="HTML",
+                )
                 return
-            h, mm = int(m.group(1)), int(m.group(2))
-            create_draft["time_str"] = f"{h:02d}:{mm:02d}"
+
+            create_draft["time_str"] = time_str
+            # Check if phone and name were supplied together with the time
+            phone, name, custom_price = parse_admin_client_info(rest, default_price=create_draft.get("price", 2300))
+            if phone:
+                create_draft["phone"] = phone
+                create_draft["name"] = name
+                create_draft["price"] = custom_price
+
+                day_key = create_draft["day_key"]
+                dt_obj = datetime.datetime.strptime(f"{day_key} {time_str}", "%Y-%m-%d %H:%M").replace(tzinfo=SARATOV_TZ)
+
+                ok, res_msg, appt_id = await asyncio.to_thread(
+                    create_manual_appointment,
+                    phone=phone,
+                    appointment_time=dt_obj,
+                    services=create_draft.get("service", "Мужская стрижка"),
+                    total_price=custom_price,
+                    client_name=name,
+                    platform="manual",
+                    duration_min=create_draft.get("duration_min", 75),
+                    allow_overbooking=True,
+                )
+
+                admin_create_drafts.pop(user_id, None)
+
+                if ok:
+                    await message.answer(
+                        f"🎉 {res_msg}\n\n"
+                        f"👤 Клиент: <b>{html.escape(name)}</b> (<code>{phone}</code>)\n"
+                        f"⏰ Дата и время: <b>{format_dt(dt_obj)}</b>\n"
+                        f"✂️ Услуга: <b>{create_draft.get('service', 'Мужская стрижка')}</b>\n"
+                        f"💰 Стоимость: <b>{custom_price} ₽</b>",
+                        reply_markup=InlineKeyboardMarkup(
+                            inline_keyboard=[
+                                [InlineKeyboardButton(text="📋 К календарю записей", callback_data="admin:appts:today:0")],
+                                [InlineKeyboardButton(text="➕ Создать ещё запись", callback_data="admin:create:start")],
+                                [InlineKeyboardButton(text="⬅️ Главное меню", callback_data="admin:menu")],
+                            ]
+                        ),
+                        parse_mode="HTML",
+                    )
+                else:
+                    await message.answer(f"❌ Ошибка создания записи: {res_msg}")
+                return
+
             create_draft["step"] = "awaiting_client_info"
             await message.answer(
-                f"⏰ Время установлено: <b>{create_draft['time_str']}</b>\n\n"
+                f"⏰ Время установлено: <b>{time_str}</b>\n\n"
                 "👉 <b>Теперь отправьте в чат телефон и имя клиента:</b>\n"
-                "Например: <code>+79991234567 Иван</code> или с ценой <code>89991234567 Иван 1200</code>",
+                "Например: <code>+7 (905) 380-72-54 Иван</code> или <code>8 (000) 000-00-00 Иван 2000</code>",
                 reply_markup=InlineKeyboardMarkup(
                     inline_keyboard=[[InlineKeyboardButton(text="⬅️ Отмена", callback_data="admin:menu")]]
                 ),
+                parse_mode="HTML",
             )
             return
 
         if step == "awaiting_client_info":
-            # Extract phone, optional name, optional price
-            tokens = raw_text.split()
-            phone = ""
-            custom_price = create_draft.get("price", 2300)
-
-            for token in tokens:
-                digits = re.sub(r"\D", "", token)
-                if len(digits) >= 10:
-                    phone = normalize_phone(token)
-                elif token.isdigit() and int(token) >= 100:
-                    custom_price = int(token)
-
+            phone, name, custom_price = parse_admin_client_info(raw_text, default_price=create_draft.get("price", 2300))
             if not phone:
-                await message.answer("⚠️ Пожалуйста, укажите номер телефона клиента (например: <code>+79991234567 Иван</code>):")
+                await message.answer(
+                    "⚠️ Пожалуйста, укажите номер телефона клиента в любом формате (например: <code>+7 (905) 380-72-54 Иван</code> или <code>8 (000) 000-00-00</code>):",
+                    parse_mode="HTML",
+                )
                 return
-
-            # Combine names: exclude phone tokens and price tokens
-            name_parts = []
-            for t in tokens:
-                digits = re.sub(r"\D", "", t)
-                if len(digits) >= 10:
-                    continue
-                if t.isdigit() and (int(t) >= 100 or int(t) == custom_price):
-                    continue
-                name_parts.append(t)
-
-            name = " ".join(name_parts) if name_parts else "Клиент"
 
             create_draft["phone"] = phone
             create_draft["name"] = name
@@ -1868,10 +1902,12 @@ async def handle_admin_text_inputs(message: Message):
                 create_manual_appointment,
                 phone=phone,
                 appointment_time=dt_obj,
-                services=create_draft["service"],
+                services=create_draft.get("service", "Мужская стрижка"),
                 total_price=custom_price,
                 client_name=name,
                 platform="manual",
+                duration_min=create_draft.get("duration_min", 75),
+                allow_overbooking=True,
             )
 
             admin_create_drafts.pop(user_id, None)
@@ -1879,9 +1915,9 @@ async def handle_admin_text_inputs(message: Message):
             if ok:
                 await message.answer(
                     f"🎉 {res_msg}\n\n"
-                    f"👤 Клиент: <b>{name}</b> (<code>{phone}</code>)\n"
+                    f"👤 Клиент: <b>{html.escape(name)}</b> (<code>{phone}</code>)\n"
                     f"⏰ Дата и время: <b>{format_dt(dt_obj)}</b>\n"
-                    f"✂️ Услуга: <b>{create_draft['service']}</b>\n"
+                    f"✂️ Услуга: <b>{create_draft.get('service', 'Мужская стрижка')}</b>\n"
                     f"💰 Стоимость: <b>{custom_price} ₽</b>",
                     reply_markup=InlineKeyboardMarkup(
                         inline_keyboard=[
@@ -1890,6 +1926,7 @@ async def handle_admin_text_inputs(message: Message):
                             [InlineKeyboardButton(text="⬅️ Главное меню", callback_data="admin:menu")],
                         ]
                     ),
+                    parse_mode="HTML",
                 )
             else:
                 await message.answer(f"❌ Ошибка создания записи: {res_msg}")

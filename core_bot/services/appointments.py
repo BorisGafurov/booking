@@ -56,6 +56,7 @@ def create_or_update_appointment(
     platform_user_id: int = 0,
     duration_min: int | None = None,
     validate_schedule: bool = False,
+    allow_overbooking: bool = False,
 ) -> int:
     """
     Creates a booking in the shared «Срез» database.
@@ -195,23 +196,24 @@ def create_or_update_appointment(
             conn.commit()
             return existing_row["id"]
 
-        if validate_schedule and platform in ("telegram", "vk", "max", "web") and platform != "manual":
-            from core_bot.services.booking import is_slot_available
-            avail, reason = is_slot_available(
-                appointment_time,
-                duration_min=duration,
-            )
-            if not avail:
-                if conn.is_pg:
-                    conn.raw_conn.rollback()
-                raise SlotUnavailableError(reason)
+        if not allow_overbooking and platform != "manual":
+            if validate_schedule and platform in ("telegram", "vk", "max", "web"):
+                from core_bot.services.booking import is_slot_available
+                avail, reason = is_slot_available(
+                    appointment_time,
+                    duration_min=duration,
+                )
+                if not avail:
+                    if conn.is_pg:
+                        conn.raw_conn.rollback()
+                    raise SlotUnavailableError(reason)
 
-        overlap = find_overlapping_appointment(conn, appointment_time, duration)
-        if overlap:
-            conn.raw_conn.rollback()
-            raise SlotUnavailableError(
-                "Это время уже занято. Пожалуйста, выберите другой слот."
-            )
+            overlap = find_overlapping_appointment(conn, appointment_time, duration)
+            if overlap:
+                conn.raw_conn.rollback()
+                raise SlotUnavailableError(
+                    "Это время уже занято. Пожалуйста, выберите другой слот."
+                )
 
         if conn.is_pg:
             res = conn.execute(
@@ -728,10 +730,11 @@ def create_manual_appointment(
     client_name: str | None = None,
     platform: str = "telegram",
     duration_min: int | None = None,
+    allow_overbooking: bool = False,
 ) -> tuple[bool, str, int | None]:
     """
     Creates an appointment directly by the master, with custom time/price.
-    Saves immediately to the shared «Срез» database and rejects overlaps.
+    Saves immediately to the shared «Срез» database and permits overbooking.
     """
     if appointment_time.tzinfo is None:
         appointment_time = appointment_time.replace(tzinfo=SARATOV_TZ)
@@ -747,6 +750,7 @@ def create_manual_appointment(
             client_name=client_name or "Клиент",
             platform=platform,
             duration_min=duration_min,
+            allow_overbooking=allow_overbooking,
         )
     except SlotUnavailableError as exc:
         return False, str(exc), None
