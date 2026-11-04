@@ -398,11 +398,17 @@ def get_user_upcoming_appointments(platform: str, platform_user_id: int) -> list
                 "))"
             )
             params.append(platform_user_id)
+            ownership += (
+                " OR (phone IS NOT NULL AND phone != '' AND phone = ("
+                f"SELECT phone FROM users WHERE {col} = %s AND phone IS NOT NULL AND phone != '' LIMIT 1"
+                "))"
+            )
+            params.append(platform_user_id)
 
         rows = conn.execute(
             f"""
             SELECT * FROM appointments
-            WHERE status = 'confirmed'
+            WHERE (status IS NULL OR (status != 'cancelled' AND status != 'completed'))
               AND appointment_time >= %s
               AND ({ownership})
             ORDER BY appointment_time ASC
