@@ -19,19 +19,6 @@ from core_bot.database.connection import get_connection
 
 logger = logging.getLogger(__name__)
 
-# Production bot tokens with environment variable override
-DEFAULT_TG_TOKEN = "8948829126:AAGFZV4EeCXbR9Hi7zPpq3NTouilLKkddfo"
-DEFAULT_VK_TOKEN = (
-    "vk1.a.Zzgfmnjb_qPiB64GDum3V3RVW8XeeYNJD0s4qSXTSFTBG6ANHX6Kkw32UHm9Trq1P2"
-    "fekHWo6zg9WSobNHJcAsZIFZP_19LXmSsJJH3K6rmHRzEmn5W8hXhCr5Y09qFVC5nMf7TJdi"
-    "WAjrjmvzUqZF5RpJ_IxkmV58-cniAq6tDhtHpqE05dePNOvMBk4bz_S62-2UTOOvLq_fnOL5"
-    "VfFw"
-)
-DEFAULT_MAX_TOKEN = (
-    "f9LHodD0cOJ9XVbcV3ZbI9_PJ46uhPE0uR0_khHPd97AmSlRhugg1m7ZAQEisoS2ROV0_"
-    "abFPvT9jExZUsYy"
-)
-
 # Insecure/permissive SSL context for environments lacking Ministry of Digital Development certs
 _INSECURE_SSL_CTX = ssl.create_default_context()
 _INSECURE_SSL_CTX.check_hostname = False
@@ -48,7 +35,7 @@ def strip_html(text: str) -> str:
 
 def send_telegram_direct(chat_id: int | str, text: str, parse_mode: str = "HTML") -> bool:
     """Directly dispatches a Telegram message via the Bot API."""
-    token = os.getenv("TELEGRAM_BOT_TOKEN", DEFAULT_TG_TOKEN).strip()
+    token = (os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("BOT_TOKEN") or "").strip()
     if not token or not chat_id:
         return False
     url = f"https://api.telegram.org/bot{token}/sendMessage"
@@ -74,8 +61,7 @@ def send_telegram_direct(chat_id: int | str, text: str, parse_mode: str = "HTML"
 
 def send_vk_direct(user_id: int | str, text: str) -> bool:
     """Directly dispatches a VK message via messages.send."""
-    token = os.getenv("VK_BOT_TOKEN") or os.getenv("VK_TOKEN") or DEFAULT_VK_TOKEN
-    token = token.strip()
+    token = (os.getenv("VK_BOT_TOKEN") or os.getenv("VK_TOKEN") or "").strip()
     if not token or not user_id:
         return False
     url = "https://api.vk.com/method/messages.send"
@@ -104,7 +90,7 @@ def send_vk_direct(user_id: int | str, text: str) -> bool:
 
 def send_max_direct(user_id: int | str, text: str) -> bool:
     """Directly dispatches a MAX messenger message via platform-api2."""
-    token = os.getenv("MAX_BOT_TOKEN", DEFAULT_MAX_TOKEN).strip()
+    token = (os.getenv("MAX_BOT_TOKEN") or "").strip()
     if not token or not user_id:
         return False
     url = f"https://platform-api2.max.ru/messages?user_id={urllib.parse.quote(str(user_id))}"
