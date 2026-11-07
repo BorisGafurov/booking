@@ -855,20 +855,57 @@ _REMINDER_FLAGS = {
     "retention": "retention_18d_sent",
 }
 
+# How many send attempts a single appointment/kind/platform may make before the
+# worker stops retrying. Blocked bots and dead VK/MAX recipients are permanent
+# failures, so without a cap the same reminder would be retried every cycle.
+MAX_REMINDER_ATTEMPTS = 5
+# Delays between attempts, indexed by attempts already made.
+RETRY_BACKOFF_MINUTES = (1, 5, 15, 60, 180)
 
-def _delivery_conditions(kind: str) -> str:
+
+def reminder_retry_delay_minutes(attempts: int) -> int:
+    """Delay before the next attempt after ``attempts`` failures."""
+    if attempts <= 0:
+        return 0
+    idx = min(attempts, len(RETRY_BACKOFF_MINUTES)) - 1
+    return RETRY_BACKOFF_MINUTES[idx]
+
+
+def _delivery_conditions(kind: str, is_pg: bool = False) -> str:
     """SQL for "this reminder was not yet delivered on the current platform".
 
     The legacy global flag is kept to avoid re-notifying historical visits
     after the upgrade: once at least one platform recorded a delivery, the
     remaining platforms may catch up on their own.
+
+    Rows in ``sending`` are excluded as well: another worker of the same
+    platform already claimed the reminder, so this one must not send a duplicate.
+    A stale claim (worker died mid-send) is not excluded, so it can be taken
+    over instead of blocking the reminder forever. Failed rows are retried only
+    after the backoff window and while attempts remain below
+    :data:`MAX_REMINDER_ATTEMPTS`.
     """
     flag = _REMINDER_FLAGS[kind]
+    stale_expr = (
+        "CURRENT_TIMESTAMP - INTERVAL '10 minutes'"
+        if is_pg
+        else "datetime('now', '-10 minutes')"
+    )
     return f"""
         AND NOT EXISTS (
             SELECT 1 FROM reminder_deliveries d
             WHERE d.appointment_id = appointments.id
               AND d.kind = %s AND d.platform = %s
+              AND (
+                  d.status IN ('sent', 'voice', 'skipped')
+                  OR (d.status = 'sending' AND (
+                      d.claimed_at IS NULL OR d.claimed_at > {stale_expr}
+                  ))
+                  OR (d.status = 'failed' AND (
+                      d.attempts >= {MAX_REMINDER_ATTEMPTS}
+                      OR d.next_attempt_at > CURRENT_TIMESTAMP
+                  ))
+              )
         )
         AND (
             {flag} = FALSE
@@ -909,6 +946,139 @@ def record_reminder_delivery(
                 """,
                 (appointment_id, reminder_type, platform, status, error),
             )
+        conn.commit()
+
+
+def claim_reminder_delivery(
+    appointment_id: int,
+    reminder_type: str,
+    platform: str,
+    worker_id: str = "",
+) -> bool:
+    """Atomically claims one appointment/kind/platform reminder for sending.
+
+    Returns True only for the single worker that won the claim, so two bot
+    processes sharing the database cannot send the same reminder twice. The
+    claim is scoped per platform on purpose: Telegram, VK and MAX must each
+    still deliver their own copy of the reminder.
+
+    A claim also renews after ``sending`` rows go stale, so a worker that died
+    mid-send does not block the reminder forever.
+    """
+    if not appointment_id or not reminder_type or not platform:
+        return False
+    stale_before_dt = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(minutes=10)
+    with get_connection() as conn:
+        stale_before = (
+            stale_before_dt
+            if conn.is_pg
+            else stale_before_dt.strftime("%Y-%m-%d %H:%M:%S")
+        )
+        row = conn.execute(
+            "SELECT id, status, attempts FROM reminder_deliveries "
+            "WHERE appointment_id = %s AND kind = %s AND platform = %s",
+            (appointment_id, reminder_type, platform),
+        ).fetchone()
+
+        if row is None:
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO reminder_deliveries
+                        (appointment_id, kind, platform, status, attempts, claimed_at, claimed_by)
+                    VALUES (%s, %s, %s, 'sending', 1, CURRENT_TIMESTAMP, %s)
+                    """,
+                    (appointment_id, reminder_type, platform, worker_id),
+                )
+                conn.commit()
+                return True
+            except Exception:
+                # Another worker inserted the row first.
+                conn.rollback()
+                return False
+
+        status = row["status"]
+        attempts = int(row["attempts"] or 0)
+
+        if status in ("sent", "voice", "skipped"):
+            return False
+        if status == "sending":
+            # Only take over a claim abandoned by a dead worker.
+            stale = conn.execute(
+                "SELECT id FROM reminder_deliveries "
+                "WHERE id = %s AND status = 'sending' "
+                "AND (claimed_at IS NULL OR claimed_at <= %s)",
+                (row["id"], stale_before),
+            ).fetchone()
+            if not stale:
+                return False
+        elif status == "failed":
+            if attempts >= MAX_REMINDER_ATTEMPTS:
+                return False
+            not_before = conn.execute(
+                "SELECT id FROM reminder_deliveries "
+                "WHERE id = %s AND (next_attempt_at IS NULL OR next_attempt_at <= CURRENT_TIMESTAMP)",
+                (row["id"],),
+            ).fetchone()
+            if not not_before:
+                return False
+
+        updated = conn.execute(
+            """
+            UPDATE reminder_deliveries
+            SET status = 'sending',
+                attempts = attempts + 1,
+                claimed_at = CURRENT_TIMESTAMP,
+                claimed_by = %s,
+                last_error = NULL
+            WHERE id = %s
+              AND status = %s
+            """,
+            (worker_id, row["id"], status),
+        )
+        conn.commit()
+        return updated.rowcount == 1
+
+
+def fail_reminder_delivery(
+    appointment_id: int,
+    reminder_type: str,
+    platform: str,
+    error: str | None = None,
+) -> None:
+    """Marks a claimed reminder as failed and schedules the retry backoff."""
+    if not appointment_id or not reminder_type or not platform:
+        return
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT id, attempts FROM reminder_deliveries "
+            "WHERE appointment_id = %s AND kind = %s AND platform = %s",
+            (appointment_id, reminder_type, platform),
+        ).fetchone()
+        if not row:
+            return
+        attempts = int(row["attempts"] or 1)
+        delay = reminder_retry_delay_minutes(attempts)
+        next_attempt_dt = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(
+            minutes=delay
+        )
+        next_attempt = (
+            next_attempt_dt
+            if conn.is_pg
+            else next_attempt_dt.strftime("%Y-%m-%d %H:%M:%S")
+        )
+        conn.execute(
+            """
+            UPDATE reminder_deliveries
+            SET status = 'failed',
+                last_error = %s,
+                next_attempt_at = %s,
+                claimed_at = NULL,
+                claimed_by = NULL
+            WHERE id = %s
+            """,
+            (error, next_attempt, row["id"]),
+        )
         conn.commit()
 
 
@@ -983,7 +1153,7 @@ def get_due_evening_reminders(platform: str | None = None) -> list[dict]:
         t_end = tomorrow_end if conn.is_pg else tomorrow_end.strftime("%Y-%m-%d %H:%M:%S")
         params = [t_start, t_end]
         if platform:
-            query += _delivery_conditions("evening")
+            query += _delivery_conditions("evening", conn.is_pg)
             params.extend(["evening", platform, "evening"])
         else:
             query += " AND reminder_evening_sent = FALSE"
@@ -1021,7 +1191,7 @@ def get_due_confirmation_followup_reminders(platform: str | None = None) -> list
         t_min = min_time if conn.is_pg else min_time.strftime("%Y-%m-%d %H:%M:%S")
         params = [t_start, t_end, t_min]
         if platform:
-            query += _delivery_conditions("morning")
+            query += _delivery_conditions("morning", conn.is_pg)
             params.extend(["morning", platform, "morning"])
         else:
             query += " AND reminder_morning_sent = FALSE"
@@ -1048,7 +1218,7 @@ def get_due_2h_reminders(platform: str | None = None) -> list[dict]:
         p_limit = limit if conn.is_pg else limit.strftime("%Y-%m-%d %H:%M:%S")
         params = [p_now, p_limit]
         if platform:
-            query += _delivery_conditions("2h")
+            query += _delivery_conditions("2h", conn.is_pg)
             params.extend(["2h", platform, "2h"])
         else:
             query += " AND reminder_2h_sent = FALSE"
@@ -1080,7 +1250,7 @@ def get_due_retention_reminders(platform: str | None = None) -> list[dict]:
         p_newer = newer_than if conn.is_pg else newer_than.strftime("%Y-%m-%d %H:%M:%S")
         params = [p_older, p_newer]
         if platform:
-            query += _delivery_conditions("retention")
+            query += _delivery_conditions("retention", conn.is_pg)
             params.extend(["retention", platform, "retention"])
         else:
             query += " AND retention_18d_sent = FALSE"

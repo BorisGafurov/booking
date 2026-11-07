@@ -10,6 +10,8 @@ from config import ADMIN_IDS
 from services.appointments import (
     SARATOV_TZ,
     check_and_queue_unconfirmed_2h_alerts,
+    claim_reminder_delivery,
+    fail_reminder_delivery,
     get_due_2h_reminders,
     get_due_confirmation_followup_reminders,
     get_due_evening_reminders,
@@ -185,16 +187,16 @@ def _resolve_platform_user_id(appt: dict, platform: str) -> int | None:
 
 async def run_reminder_worker(bot: Bot, platform: str = "telegram"):
     logger.info("Запущен фоновый воркер напоминаний (%s)", platform)
-    sync_counter = 0
+    worker_id = f"{platform}:{os.getpid()}"
 
     while True:
         try:
             # 1. Evening reminder (day before visit, >= 18:00)
             evening_due = get_due_evening_reminders(platform=platform)
             for appt in evening_due:
-                target_user_id = _resolve_platform_user_id(appt, platform)
-                if target_user_id == "reassigned":
+                if not claim_reminder_delivery(appt["id"], "evening", platform, worker_id):
                     continue
+                target_user_id = _resolve_platform_user_id(appt, platform)
                 if not target_user_id:
                     try:
                         from core_bot.services.voice import is_voice_configured, send_voice_reminder
@@ -236,14 +238,15 @@ async def run_reminder_worker(bot: Bot, platform: str = "telegram"):
                     mark_reminder_sent(appt["id"], "evening")
                     logger.info("Отправлено вечернее напоминание клиенту #%s (appt #%s)", target_user_id, appt["id"])
                 except Exception as send_err:
+                    fail_reminder_delivery(appt["id"], "evening", platform, str(send_err))
                     logger.warning("Ошибка отправки вечернего напоминания #%s: %s", appt["id"], send_err)
 
             # 2. Morning follow-up reminder (on visit day, >= 09:00, if not confirmed)
             morning_due = get_due_confirmation_followup_reminders(platform=platform)
             for appt in morning_due:
-                target_user_id = _resolve_platform_user_id(appt, platform)
-                if target_user_id == "reassigned":
+                if not claim_reminder_delivery(appt["id"], "morning", platform, worker_id):
                     continue
+                target_user_id = _resolve_platform_user_id(appt, platform)
                 if not target_user_id:
                     try:
                         from core_bot.services.voice import is_voice_configured, send_voice_reminder
@@ -296,9 +299,9 @@ async def run_reminder_worker(bot: Bot, platform: str = "telegram"):
             # 3. 2h express reminder
             two_h_due = get_due_2h_reminders(platform=platform)
             for appt in two_h_due:
-                target_user_id = _resolve_platform_user_id(appt, platform)
-                if target_user_id == "reassigned":
+                if not claim_reminder_delivery(appt["id"], "2h", platform, worker_id):
                     continue
+                target_user_id = _resolve_platform_user_id(appt, platform)
                 if not target_user_id:
                     record_reminder_delivery(appt["id"], "2h", platform, "skipped", "no_recipient")
                     continue
@@ -341,6 +344,7 @@ async def run_reminder_worker(bot: Bot, platform: str = "telegram"):
                     mark_reminder_sent(appt["id"], "2h")
                     logger.info("Отправлено 2ч напоминание клиенту #%s (appt #%s, confirmed=%s)", target_user_id, appt["id"], is_confirmed)
                 except Exception as send_err:
+                    fail_reminder_delivery(appt["id"], "2h", platform, str(send_err))
                     logger.warning("Ошибка отправки 2ч напоминания #%s: %s", appt["id"], send_err)
 
             # 3.1. Check for unconfirmed 2h reminders (15 min after reminder delivery) and queue master alerts
@@ -352,9 +356,9 @@ async def run_reminder_worker(bot: Bot, platform: str = "telegram"):
             # 4. 2.5 weeks retention reminder
             retention_due = get_due_retention_reminders(platform=platform)
             for appt in retention_due:
-                target_user_id = _resolve_platform_user_id(appt, platform)
-                if target_user_id == "reassigned":
+                if not claim_reminder_delivery(appt["id"], "retention", platform, worker_id):
                     continue
+                target_user_id = _resolve_platform_user_id(appt, platform)
                 if not target_user_id:
                     record_reminder_delivery(appt["id"], "retention", platform, "skipped", "no_recipient")
                     continue
@@ -375,6 +379,7 @@ async def run_reminder_worker(bot: Bot, platform: str = "telegram"):
                     mark_reminder_sent(appt["id"], "retention")
                     logger.info("Отправлено retention напоминание клиенту #%s (appt #%s)", target_user_id, appt["id"])
                 except Exception as send_err:
+                    fail_reminder_delivery(appt["id"], "retention", platform, str(send_err))
                     logger.warning("Ошибка отправки retention напоминания #%s: %s", appt["id"], send_err)
 
             # 5. Review invitations (sent when master confirms payment in CRM)

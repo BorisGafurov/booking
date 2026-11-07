@@ -1280,6 +1280,105 @@ class TestBookingBot(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(n3, "Иван")
         self.assertEqual(pr3, 1500)
 
+    def test_reminder_claim_is_per_platform_and_blocks_duplicates(self):
+        from services.appointments import (
+            SARATOV_TZ,
+            claim_reminder_delivery,
+            create_or_update_appointment,
+            get_due_2h_reminders,
+            record_reminder_delivery,
+        )
+
+        appt_id = create_or_update_appointment(
+            phone="+79995550001",
+            appointment_time=datetime.datetime.now(SARATOV_TZ) + datetime.timedelta(hours=1, minutes=30),
+            services="Стрижка",
+            total_price=2300,
+            platform="telegram",
+            platform_user_id=5001,
+        )
+
+        # First worker of a platform wins the claim, a second one is refused.
+        self.assertTrue(claim_reminder_delivery(appt_id, "2h", "telegram", "worker-a"))
+        self.assertFalse(claim_reminder_delivery(appt_id, "2h", "telegram", "worker-b"))
+
+        # Delivery on Telegram must not consume the VK/MAX reminders: every
+        # messenger still notifies its own copy of the client.
+        record_reminder_delivery(appt_id, "2h", "telegram")
+        due_tg = [a["id"] for a in get_due_2h_reminders(platform="telegram")]
+        due_vk = [a["id"] for a in get_due_2h_reminders(platform="vk")]
+        due_max = [a["id"] for a in get_due_2h_reminders(platform="max")]
+        self.assertNotIn(appt_id, due_tg)
+        self.assertIn(appt_id, due_vk)
+        self.assertIn(appt_id, due_max)
+
+    def test_reminder_failure_backoff_and_attempt_cap(self):
+        from services.appointments import (
+            MAX_REMINDER_ATTEMPTS,
+            SARATOV_TZ,
+            claim_reminder_delivery,
+            create_or_update_appointment,
+            fail_reminder_delivery,
+            get_due_2h_reminders,
+        )
+
+        appt_id = create_or_update_appointment(
+            phone="+79995550002",
+            appointment_time=datetime.datetime.now(SARATOV_TZ) + datetime.timedelta(hours=4),
+            services="Стрижка",
+            total_price=2300,
+            platform="telegram",
+            platform_user_id=5002,
+        )
+
+        self.assertTrue(claim_reminder_delivery(appt_id, "2h", "telegram", "worker-a"))
+        fail_reminder_delivery(appt_id, "2h", "telegram", "bot blocked by user")
+
+        # Inside the backoff window the reminder must not be retried...
+        self.assertFalse(claim_reminder_delivery(appt_id, "2h", "telegram", "worker-a"))
+
+        # ...and after the attempts are exhausted it stops being due at all.
+        with get_connection() as conn:
+            conn.execute(
+                "UPDATE reminder_deliveries SET attempts = %s, next_attempt_at = NULL "
+                "WHERE appointment_id = %s",
+                (MAX_REMINDER_ATTEMPTS, appt_id),
+            )
+            conn.commit()
+        self.assertFalse(claim_reminder_delivery(appt_id, "2h", "telegram", "worker-a"))
+        self.assertNotIn(
+            appt_id, [a["id"] for a in get_due_2h_reminders(platform="telegram")]
+        )
+
+    def test_stale_reminder_claim_can_be_taken_over(self):
+        from services.appointments import (
+            SARATOV_TZ,
+            claim_reminder_delivery,
+            create_or_update_appointment,
+        )
+
+        appt_id = create_or_update_appointment(
+            phone="+79995550003",
+            appointment_time=datetime.datetime.now(SARATOV_TZ) + datetime.timedelta(hours=7),
+            services="Стрижка",
+            total_price=2300,
+            platform="telegram",
+            platform_user_id=5003,
+        )
+
+        self.assertTrue(claim_reminder_delivery(appt_id, "2h", "telegram", "dead-worker"))
+        self.assertFalse(claim_reminder_delivery(appt_id, "2h", "telegram", "worker-b"))
+
+        # A worker that died mid-send must not block the reminder forever.
+        with get_connection() as conn:
+            conn.execute(
+                "UPDATE reminder_deliveries SET claimed_at = '2000-01-01 00:00:00' "
+                "WHERE appointment_id = %s",
+                (appt_id,),
+            )
+            conn.commit()
+        self.assertTrue(claim_reminder_delivery(appt_id, "2h", "telegram", "worker-b"))
+
 
 if __name__ == "__main__":
     unittest.main()
