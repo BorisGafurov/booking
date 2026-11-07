@@ -1,5 +1,6 @@
 """Client review handlers for Telegram bot."""
 
+import asyncio
 import html
 import logging
 from typing import Any
@@ -53,8 +54,8 @@ async def show_my_reviews(message: Message):
     if not message.from_user:
         return
     user_id = message.from_user.id
-    reviews = get_reviews_for_platform("telegram", user_id)
-    reviewable = get_reviewable_for_platform("telegram", user_id)
+    reviews = await asyncio.to_thread(get_reviews_for_platform, "telegram", user_id)
+    reviewable = await asyncio.to_thread(get_reviewable_for_platform, "telegram", user_id)
 
     lines = ["⭐ <b>Мои отзывы</b>\n"]
 
@@ -107,7 +108,9 @@ async def handle_review_start(callback: CallbackQuery):
         await callback.answer("Ошибка запроса.", show_alert=True)
         return
 
-    can, msg, appt = can_review_platform_appointment("telegram", user_id, appt_id)
+    can, msg, appt = await asyncio.to_thread(
+        can_review_platform_appointment, "telegram", user_id, appt_id
+    )
     if not can:
         await callback.answer(msg or "Отзыв за этот визит недоступен.", show_alert=True)
         return
@@ -136,7 +139,9 @@ async def handle_rating_selected(callback: CallbackQuery):
         await callback.answer("Ошибка параметров.", show_alert=True)
         return
 
-    can, msg, _ = can_review_platform_appointment("telegram", user_id, appt_id)
+    can, msg, _ = await asyncio.to_thread(
+        can_review_platform_appointment, "telegram", user_id, appt_id
+    )
     if not can:
         await callback.answer(msg or "Отзыв за этот визит недоступен.", show_alert=True)
         return
@@ -192,7 +197,8 @@ async def handle_review_comment_input(message: Message):
     appt_id = pending["appointment_id"]
     rating = pending["rating"]
 
-    ok, err_or_msg, created = create_review_from_platform(
+    ok, err_or_msg, created = await asyncio.to_thread(
+        create_review_from_platform,
         platform="telegram",
         platform_user_id=user_id,
         appointment_id=appt_id,

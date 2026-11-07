@@ -126,10 +126,7 @@ def admin_appts_keyboard(
     rows = []
 
     if counts is None:
-        try:
-            counts = get_appointments_counts()
-        except Exception:
-            counts = {"today": 0, "tomorrow": 0, "pending": 0, "all": total}
+        counts = {"today": 0, "tomorrow": 0, "pending": 0, "all": total}
 
     filters = [
         ("today", f"Сегодня ({counts['today']})"),
@@ -338,10 +335,12 @@ async def referrals(message: Message):
         return
 
     user = message.from_user
-    save_user(user.id, user.username, user.first_name, user.last_name)
+    await asyncio.to_thread(
+        save_user, user.id, user.username, user.first_name, user.last_name
+    )
 
     referral_link = await build_referral_link(message.bot, user.id)
-    stats = get_referral_stats(user.id)
+    stats = await asyncio.to_thread(get_referral_stats, user.id)
 
     await message.answer(
         "🎁 <b>Приглашай друзей и получай бонусы!</b>\n\n"
@@ -397,8 +396,10 @@ async def admin_appts_list(callback: CallbackQuery):
     current_filter = parts[2] if len(parts) > 2 else "all"
     offset = int(parts[3]) if len(parts) > 3 and parts[3].isdigit() else 0
 
-    counts = get_appointments_counts()
-    appts, total = get_master_appointments(date_filter=current_filter, limit=PAGE_SIZE, offset=offset)
+    counts = await asyncio.to_thread(get_appointments_counts)
+    appts, total = await asyncio.to_thread(
+        get_master_appointments, date_filter=current_filter, limit=PAGE_SIZE, offset=offset
+    )
 
     filter_names = {
         "today": "Сегодня",
@@ -441,7 +442,7 @@ async def admin_appt_detail(callback: CallbackQuery):
     current_filter = parts[3] if len(parts) > 3 else "today"
     offset = int(parts[4]) if len(parts) > 4 and parts[4].isdigit() else 0
 
-    appt = get_appointment(appt_id)
+    appt = await asyncio.to_thread(get_appointment, appt_id)
     if not appt:
         await callback.answer("Запись не найдена", show_alert=True)
         return
@@ -497,7 +498,7 @@ async def admin_complete_appt_handler(callback: CallbackQuery):
     current_filter = parts[3] if len(parts) > 3 else "today"
     offset = int(parts[4]) if len(parts) > 4 and parts[4].isdigit() else 0
 
-    ok, msg, appt, ref_notify = complete_appointment(appt_id)
+    ok, msg, appt, ref_notify = await asyncio.to_thread(complete_appointment, appt_id)
     if not ok:
         await callback.answer(msg, show_alert=True)
         return
@@ -511,7 +512,7 @@ async def admin_complete_appt_handler(callback: CallbackQuery):
 
     await callback.answer(msg[:200], show_alert=False)
     # Refresh card
-    updated_appt = get_appointment(appt_id)
+    updated_appt = await asyncio.to_thread(get_appointment, appt_id)
     if updated_appt and callback.message:
         await admin_appt_detail(callback)
 
@@ -526,11 +527,11 @@ async def admin_paid_appt_handler(callback: CallbackQuery):
     appt_id = int(parts[2])
 
     from services.reviews import mark_appointment_paid
-    ok, msg, appt, invite = mark_appointment_paid(appt_id)
+    ok, msg, appt, invite = await asyncio.to_thread(mark_appointment_paid, appt_id)
     await callback.answer(msg[:200], show_alert=not ok)
 
     # Refresh card
-    updated_appt = get_appointment(appt_id)
+    updated_appt = await asyncio.to_thread(get_appointment, appt_id)
     if updated_appt and callback.message:
         await admin_appt_detail(callback)
 
@@ -543,7 +544,7 @@ async def admin_confirm_appt_handler(callback: CallbackQuery):
 
     parts = callback.data.split(":")
     appt_id = int(parts[2])
-    ok, msg, appt = confirm_appointment_by_client(appt_id)
+    ok, msg, appt = await asyncio.to_thread(confirm_appointment_by_client, appt_id)
     await callback.answer(msg, show_alert=False)
     await admin_appt_detail(callback)
 
@@ -559,7 +560,7 @@ async def admin_cancel_appt_handler(callback: CallbackQuery):
     current_filter = parts[3] if len(parts) > 3 else "today"
     offset = int(parts[4]) if len(parts) > 4 and parts[4].isdigit() else 0
 
-    ok, msg, appt = cancel_appointment(appt_id)
+    ok, msg, appt = await asyncio.to_thread(cancel_appointment, appt_id)
     if ok and appt:
         try:
             from core_bot.services.notify import notify_appointment_cancelled_by_master
@@ -670,7 +671,7 @@ async def admin_resched_time_chosen(callback: CallbackQuery):
         await callback.answer("Ошибка формата времени", show_alert=True)
         return
 
-    ok, msg, appt = reschedule_appointment(appt_id, new_dt)
+    ok, msg, appt = await asyncio.to_thread(reschedule_appointment, appt_id, new_dt)
     if ok and appt:
         try:
             from core_bot.services.notify import notify_appointment_rescheduled_by_master
@@ -999,7 +1000,7 @@ async def admin_sched_list(callback: CallbackQuery):
         return
 
     offset = int(callback.data.split(":")[2])
-    all_days = get_upcoming_days_schedule(days_ahead=14)
+    all_days = await asyncio.to_thread(get_upcoming_days_schedule, days_ahead=14)
     slice_days = all_days[offset:offset+7]
 
     text = (
@@ -1021,7 +1022,7 @@ async def admin_sched_day_detail(callback: CallbackQuery):
         return
 
     day_key = callback.data.split(":")[2]
-    sched = get_master_day_schedule(day_key)
+    sched = await asyncio.to_thread(get_master_day_schedule, day_key)
 
     st_txt = "🟢 Рабочий день" if sched["is_working"] else "🔴 Выходной день"
     card_text = (
@@ -1046,9 +1047,11 @@ async def admin_sched_toggle(callback: CallbackQuery):
         return
 
     day_key = callback.data.split(":")[2]
-    sched = get_master_day_schedule(day_key)
+    sched = await asyncio.to_thread(get_master_day_schedule, day_key)
     new_work = not sched["is_working"]
-    set_master_day_schedule(day_key, new_work, sched["start_time"], sched["end_time"])
+    await asyncio.to_thread(
+        set_master_day_schedule, day_key, new_work, sched["start_time"], sched["end_time"]
+    )
 
     msg = "День отмечен как РАБОЧИЙ!" if new_work else "День отмечен как ВЫХОДНОЙ!"
     await callback.answer(msg, show_alert=False)
@@ -1067,9 +1070,13 @@ async def admin_sched_adj(callback: CallbackQuery):
     delta = int(parts[4])
 
     if which == "start":
-        adjust_master_day_hours(day_key, start_delta_hours=delta, end_delta_hours=0)
+        await asyncio.to_thread(
+            adjust_master_day_hours, day_key, start_delta_hours=delta, end_delta_hours=0
+        )
     else:
-        adjust_master_day_hours(day_key, start_delta_hours=0, end_delta_hours=delta)
+        await asyncio.to_thread(
+            adjust_master_day_hours, day_key, start_delta_hours=0, end_delta_hours=delta
+        )
 
     await callback.answer("Часы обновлены", show_alert=False)
     await admin_sched_day_detail(callback)
@@ -1085,12 +1092,12 @@ async def admin_pending(callback: CallbackQuery):
     parts = callback.data.split(":")
     offset = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 0
 
-    referrals_list, total = get_pending_referrals(limit=PAGE_SIZE, offset=offset)
+    referrals_list, total = await asyncio.to_thread(get_pending_referrals, limit=PAGE_SIZE, offset=offset)
 
     count_info = f" ({total} всего)" if total > 0 else ""
     try:
         if callback.message:
-            await _edit_or_send(callback.message, 
+            await _edit_or_send(callback.message,
                 f"⏳ <b>Ожидают подтверждения визита{count_info}:</b>\n"
                 "<i>(нажми на нужного клиента, чтобы подтвердить его визит и начислить бонус другу)</i>",
                 reply_markup=pending_referrals_keyboard(referrals_list, offset, total),
@@ -1109,7 +1116,7 @@ async def admin_rewards(callback: CallbackQuery):
     parts = callback.data.split(":")
     offset = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 0
 
-    rewards_list, total = get_active_rewards(limit=PAGE_SIZE, offset=offset)
+    rewards_list, total = await asyncio.to_thread(get_active_rewards, limit=PAGE_SIZE, offset=offset)
 
     count_info = f" ({total} всего)" if total > 0 else ""
     try:
@@ -1138,7 +1145,7 @@ async def confirm_visit(callback: CallbackQuery):
     referral_id = int(parts[1])
     offset = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 0
 
-    success, text, notify_data = mark_referral_visited(referral_id)
+    success, text, notify_data = await asyncio.to_thread(mark_referral_visited, referral_id)
 
     if success and notify_data:
         if notify_data.get("referrer_telegram_id"):
@@ -1167,7 +1174,7 @@ async def confirm_visit(callback: CallbackQuery):
             except Exception as e:
                 logger.warning("Не удалось отправить уведомление приглашенному другу: %s", e)
 
-    referrals_list, total = get_pending_referrals(limit=PAGE_SIZE, offset=offset)
+    referrals_list, total = await asyncio.to_thread(get_pending_referrals, limit=PAGE_SIZE, offset=offset)
 
     safe_text = html.escape(text)
     try:
@@ -1196,7 +1203,7 @@ async def use_reward(callback: CallbackQuery):
     reward_id = int(parts[1])
     offset = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 0
 
-    success, text, notify_data = mark_reward_used(reward_id)
+    success, text, notify_data = await asyncio.to_thread(mark_reward_used, reward_id)
 
     if success and notify_data:
         try:
@@ -1209,7 +1216,7 @@ async def use_reward(callback: CallbackQuery):
         except Exception as e:
             logger.warning("Не удалось отправить уведомление клиенту о списании: %s", e)
 
-    rewards_list, total = get_active_rewards(limit=PAGE_SIZE, offset=offset)
+    rewards_list, total = await asyncio.to_thread(get_active_rewards, limit=PAGE_SIZE, offset=offset)
 
     safe_text = html.escape(text)
     try:
@@ -1308,7 +1315,7 @@ async def admin_broadcast_send(callback: CallbackQuery):
         return
 
     text = draft["text"]
-    recipients = get_broadcast_recipients("telegram")
+    recipients = await asyncio.to_thread(get_broadcast_recipients, "telegram")
     total = len(recipients)
 
     if callback.message:
@@ -1395,8 +1402,8 @@ async def admin_clients_list(callback: CallbackQuery):
         return
 
     offset = int(action) if action.isdigit() else 0
-    stats = get_clients_stats()
-    clients, total = get_clients_page(offset=offset, limit=PAGE_SIZE)
+    stats = await asyncio.to_thread(get_clients_stats)
+    clients, total = await asyncio.to_thread(get_clients_page, offset=offset, limit=PAGE_SIZE)
 
     text = (
         f"👥 <b>База клиентов</b> ({stats['total']} всего, с телефонами: {stats['with_phone']}):\n\n"
@@ -1442,7 +1449,7 @@ async def admin_edit_client_start(callback: CallbackQuery):
     current_filter = parts[3] if len(parts) > 3 else "today"
     offset = int(parts[4]) if len(parts) > 4 and parts[4].isdigit() else 0
 
-    appt = get_appointment(appt_id)
+    appt = await asyncio.to_thread(get_appointment, appt_id)
     if not appt:
         await callback.answer("Запись не найдена", show_alert=True)
         return
@@ -1483,7 +1490,7 @@ async def admin_edit_price_start(callback: CallbackQuery):
     current_filter = parts[3] if len(parts) > 3 else "today"
     offset = int(parts[4]) if len(parts) > 4 and parts[4].isdigit() else 0
 
-    appt = get_appointment(appt_id)
+    appt = await asyncio.to_thread(get_appointment, appt_id)
     if not appt:
         await callback.answer("Запись не найдена", show_alert=True)
         return
@@ -1533,7 +1540,9 @@ async def admin_set_price_quick(callback: CallbackQuery):
     }
     svc_name = svc_map.get(svc_code, "Стрижка")
 
-    ok, msg, appt = update_appointment_price_and_service(appt_id, price, svc_name)
+    ok, msg, appt = await asyncio.to_thread(
+        update_appointment_price_and_service, appt_id, price, svc_name
+    )
     await callback.answer(f"Стоимость обновлена: {price} ₽", show_alert=False)
 
     if callback.message:
@@ -1591,7 +1600,7 @@ async def admin_document_handler(message: Message):
         await message.bot.download_file(file.file_path, file_io)
         file_bytes = file_io.getvalue()
 
-        added, updated, msg = import_clients_from_file(fn, file_bytes)
+        added, updated, msg = await asyncio.to_thread(import_clients_from_file, fn, file_bytes)
         admin_clients_state.pop(user_id, None)
 
         await status_msg.edit_text(
@@ -1657,8 +1666,10 @@ async def handle_admin_text_inputs(message: Message):
         if not client_name:
             client_name = "Клиент"
 
-        ok, msg = update_appointment_client_details(appt_id, client_name, client_phone)
-        appt = get_appointment(appt_id) or {}
+        ok, msg = await asyncio.to_thread(
+            update_appointment_client_details, appt_id, client_name, client_phone
+        )
+        appt = await asyncio.to_thread(get_appointment, appt_id) or {}
         fresh_name = appt.get("client_name") or client_name
         fresh_phone = appt.get("phone") or "—"
 
@@ -1690,7 +1701,9 @@ async def handle_admin_text_inputs(message: Message):
             return
 
         new_price = int(price_digits)
-        ok, res_msg, updated_appt = update_appointment_price_and_service(appt_id, new_price)
+        ok, res_msg, updated_appt = await asyncio.to_thread(
+            update_appointment_price_and_service, appt_id, new_price
+        )
 
         kb = InlineKeyboardMarkup(
             inline_keyboard=[
@@ -1711,7 +1724,9 @@ async def handle_admin_text_inputs(message: Message):
         action = c_state.get("action")
         if action == "awaiting_search":
             admin_clients_state.pop(user_id, None)
-            clients, total = get_clients_page(offset=0, limit=PAGE_SIZE, search=raw_text)
+            clients, total = await asyncio.to_thread(
+                get_clients_page, offset=0, limit=PAGE_SIZE, search=raw_text
+            )
             text = f"🔍 <b>Результаты поиска «{html.escape(raw_text)}»</b> (найдено: {total}):\n\n"
             if not clients:
                 text += "<i>Клиенты не найдены.</i>"
@@ -1730,7 +1745,7 @@ async def handle_admin_text_inputs(message: Message):
 
         if action == "awaiting_import":
             admin_clients_state.pop(user_id, None)
-            added, updated, msg = import_clients_from_text(raw_text)
+            added, updated, msg = await asyncio.to_thread(import_clients_from_text, raw_text)
             await message.answer(
                 f"✅ <b>Импорт клиентов завершён!</b>\n\n"
                 f"• Добавлено новых клиентов: <b>{added}</b>\n"
@@ -1748,7 +1763,7 @@ async def handle_admin_text_inputs(message: Message):
 
     # 5. Broadcast text
     if admin_broadcast_drafts.get(user_id, {}).get("step") == "awaiting_text":
-        recipients = get_broadcast_recipients("telegram")
+        recipients = await asyncio.to_thread(get_broadcast_recipients, "telegram")
         count = len(recipients)
         admin_broadcast_drafts[user_id] = {
             "step": "confirm",
@@ -1793,7 +1808,7 @@ async def handle_admin_text_inputs(message: Message):
             await message.answer("Некорректная дата/время")
             return
 
-        ok, msg, appt = reschedule_appointment(appt_id, new_dt)
+        ok, msg, appt = await asyncio.to_thread(reschedule_appointment, appt_id, new_dt)
         if ok and appt:
             try:
                 from core_bot.services.notify import notify_appointment_rescheduled_by_master

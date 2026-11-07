@@ -1,3 +1,4 @@
+import asyncio
 import html
 import logging
 from aiogram import F, Router
@@ -37,7 +38,8 @@ async def start(message: Message, command: CommandObject | None = None):
 
     user_db_id, is_new = None, False
     try:
-        user_db_id, is_new = save_user(
+        user_db_id, is_new = await asyncio.to_thread(
+            save_user,
             telegram_id=user.id,
             username=user.username,
             first_name=user.first_name,
@@ -67,7 +69,8 @@ async def start(message: Message, command: CommandObject | None = None):
                     "Реферальный бонус начисляется только за приглашение новых пользователей."
                 )
             else:
-                success, result_text, notify_data = register_referral(
+                success, result_text, notify_data = await asyncio.to_thread(
+                    register_referral,
                     new_user_telegram_id=user.id,
                     referrer_telegram_id=referrer_telegram_id,
                 )

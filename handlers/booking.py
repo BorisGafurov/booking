@@ -339,7 +339,7 @@ async def initiate_slot_booking(callback: CallbackQuery):
     user_id = callback.from_user.id
     timestamp = int(callback.data.split(":")[2])
     user_selected_slot[user_id] = timestamp
-    phone = get_user_phone(user_id, platform="telegram")
+    phone = await asyncio.to_thread(get_user_phone, user_id, platform="telegram")
 
     if not phone:
         if callback.message:
@@ -386,14 +386,18 @@ async def _process_phone_provided(message: Message, user_id: int, phone_raw: str
     if _has_active_admin_draft(message):
         return
 
-    success, link_msg = link_user_phone(user_id, phone_raw, platform="telegram")
+    success, link_msg = await asyncio.to_thread(
+        link_user_phone, user_id, phone_raw, platform="telegram"
+    )
     if not success:
         await message.answer(link_msg or "Пожалуйста, введите корректный номер телефона (например, +79991234567).")
         return
 
     pending_ts = user_selected_slot.pop(user_id, None)
     if pending_ts:
-        eff_phone = get_user_phone(user_id, platform="telegram") or normalize_phone(phone_raw)
+        eff_phone = (
+            await asyncio.to_thread(get_user_phone, user_id, platform="telegram")
+        ) or normalize_phone(phone_raw)
         current_services = user_selected_services.get(user_id, {"hair"})
         dt = datetime.datetime.fromtimestamp(pending_ts, tz=SARATOV_TZ)
 
@@ -450,8 +454,11 @@ async def handle_confirm_appointment(callback: CallbackQuery):
         return
 
     appt_id = int(parts[2])
-    success, msg, appt = confirm_appointment_by_client(
-        appt_id, platform="telegram", platform_user_id=callback.from_user.id
+    success, msg, appt = await asyncio.to_thread(
+        confirm_appointment_by_client,
+        appt_id,
+        platform="telegram",
+        platform_user_id=callback.from_user.id,
     )
 
     if not success:
@@ -532,8 +539,11 @@ async def handle_cancel_appointment(callback: CallbackQuery):
         return
 
     appt_id = int(parts[2])
-    success, msg, appt = cancel_appointment(
-        appt_id, platform="telegram", platform_user_id=callback.from_user.id
+    success, msg, appt = await asyncio.to_thread(
+        cancel_appointment,
+        appt_id,
+        platform="telegram",
+        platform_user_id=callback.from_user.id,
     )
 
     if not success:
