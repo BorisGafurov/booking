@@ -1379,6 +1379,98 @@ class TestBookingBot(unittest.IsolatedAsyncioTestCase):
             conn.commit()
         self.assertTrue(claim_reminder_delivery(appt_id, "2h", "telegram", "worker-b"))
 
+    def test_day_lock_serializes_booking_writers(self):
+        """The SQLite day lock must block a competing writer, not let it pass."""
+        import sqlite3
+
+        from core_bot.services.booking import acquire_day_lock
+        from database import DB_PATH
+
+        day_key = (
+            datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=30)
+        ).date().isoformat()
+
+        # First writer takes the lock and does not commit yet: SQLite keeps the
+        # RESERVED lock for the whole transaction.
+        holder = get_connection()
+        holder_conn = holder.__enter__()
+        try:
+            acquire_day_lock(holder_conn, day_key, holder="first")
+
+            # A competing writer must be blocked. A short busy timeout keeps the
+            # test fast; in production the default 20s timeout applies.
+            rival = sqlite3.connect(DB_PATH, timeout=0.2)
+            try:
+                with self.assertRaises(sqlite3.OperationalError):
+                    rival.execute(
+                        "INSERT INTO booking_locks (lock_key, holder) "
+                        "VALUES ('appointments:rival', 'rival')"
+                    )
+                    rival.commit()
+            finally:
+                rival.close()
+        finally:
+            holder.__exit__(None, None, None)
+
+        # After the holder commits, the lock is free again.
+        with get_connection() as conn:
+            acquire_day_lock(conn, day_key, holder="third")
+            conn.commit()
+
+    def test_concurrent_bookings_of_same_slot_leave_one_row(self):
+        """Two overlapping bookings for one slot must not both be stored."""
+        from services.appointments import (
+            SARATOV_TZ,
+            SlotUnavailableError,
+            create_or_update_appointment,
+            set_master_day_schedule,
+        )
+
+        day = (datetime.datetime.now(SARATOV_TZ) + datetime.timedelta(days=14)).date()
+        day_key = day.isoformat()
+        set_master_day_schedule(day_key, True, "10:00", "20:00")
+        slot = datetime.datetime.combine(day, datetime.time(12, 0), tzinfo=SARATOV_TZ)
+
+        with get_connection() as conn:
+            conn.execute(
+                "DELETE FROM appointments WHERE appointment_time = %s",
+                (slot.strftime("%Y-%m-%d %H:%M:%S"),),
+            )
+            conn.commit()
+
+        first_id = create_or_update_appointment(
+            phone="+79998880001",
+            appointment_time=slot,
+            services="Стрижка",
+            total_price=2300,
+            platform="telegram",
+            platform_user_id=8001,
+            duration_min=75,
+            validate_schedule=True,
+        )
+        self.assertIsNotNone(first_id)
+
+        # A different client for the same slot is rejected.
+        with self.assertRaises(SlotUnavailableError):
+            create_or_update_appointment(
+                phone="+79998880002",
+                appointment_time=slot,
+                services="Стрижка",
+                total_price=2300,
+                platform="telegram",
+                platform_user_id=8002,
+                duration_min=75,
+                validate_schedule=True,
+            )
+
+        with get_connection() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) AS c FROM appointments "
+                "WHERE appointment_time = %s AND (status IS NULL OR status != 'cancelled')",
+                (slot.strftime("%Y-%m-%d %H:%M:%S"),),
+            ).fetchone()
+        self.assertEqual(row["c"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()

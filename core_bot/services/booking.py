@@ -61,6 +61,35 @@ DEFAULT_START_TIME = "10:00"
 DEFAULT_END_TIME = "19:00"
 
 
+def acquire_day_lock(conn, day_key: str, holder: str = "") -> None:
+    """Serializes bookings for one date across processes.
+
+    PostgreSQL uses a transaction-scoped advisory lock. SQLite has no advisory
+    locks, so a row in ``booking_locks`` is written instead: SQLite allows only
+    one writer at a time, which gives us the RESERVED lock for the rest of the
+    transaction. A competing process blocks in ``sqlite3`` (busy_timeout) until
+    the winner commits, and then re-runs its overlap check on fresh data.
+
+    The lock is released automatically when the transaction commits or rolls
+    back — callers must not commit between acquiring it and inserting.
+    """
+    key = f"appointments:{day_key}"
+    if conn.is_pg:
+        conn.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (key,))
+        return
+
+    conn.execute(
+        """
+        INSERT INTO booking_locks (lock_key, holder)
+        VALUES (%s, %s)
+        ON CONFLICT(lock_key) DO UPDATE SET
+            holder = excluded.holder,
+            acquired_at = CURRENT_TIMESTAMP
+        """,
+        (key, holder),
+    )
+
+
 def generate_day_slots(
     start_time: str,
     end_time: str,

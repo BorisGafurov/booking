@@ -81,11 +81,13 @@ def create_or_update_appointment(
 
     with get_connection() as conn:
         # Serialize all writers for this date across bots and the website.
-        if conn.is_pg:
-            conn.execute(
-                "SELECT pg_advisory_xact_lock(hashtext(%s))",
-                (f"appointments:{appointment_time.date().isoformat()}",),
-            )
+        from core_bot.services.booking import acquire_day_lock
+
+        acquire_day_lock(
+            conn,
+            appointment_time.date().isoformat(),
+            holder=f"{platform}:{platform_user_id}",
+        )
 
         dt_value = appointment_time if conn.is_pg else appointment_time.strftime("%Y-%m-%d %H:%M:%S")
 
@@ -536,6 +538,10 @@ def reschedule_appointment(
                 "SELECT pg_advisory_xact_lock(hashtext(%s))",
                 (f"appointments:{day_key}",),
             )
+        else:
+            from core_bot.services.booking import acquire_day_lock
+
+            acquire_day_lock(conn, day_key, holder=f"reschedule:{appointment_id}")
 
         overlap = find_overlapping_appointment(
             conn, new_datetime, duration, exclude_appointment_id=appointment_id
