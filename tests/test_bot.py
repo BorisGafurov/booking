@@ -1417,6 +1417,126 @@ class TestBookingBot(unittest.IsolatedAsyncioTestCase):
             acquire_day_lock(conn, day_key, holder="third")
             conn.commit()
 
+    def test_data_errors_are_not_reported_as_database_outage(self):
+        """A caller's own error must propagate unchanged, not as "PG is down"."""
+        from contextlib import contextmanager
+        from unittest.mock import patch
+
+        import core_bot.database.connection as conn_mod
+
+        class DataErrorConn:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def execute(self, *args, **kwargs):
+                raise ValueError("duplicate key value violates unique constraint")
+
+            def commit(self):
+                pass
+
+            def rollback(self):
+                pass
+
+            def close(self):
+                pass
+
+        @contextmanager
+        def fake_pool_cm():
+            yield DataErrorConn()
+
+        class FakePool:
+            def connection(self, timeout=None):
+                return fake_pool_cm()
+
+        prev_unreachable = conn_mod._pg_unreachable
+        try:
+            with patch.object(conn_mod, "IS_POSTGRES", True), \
+                 patch.object(conn_mod, "ALLOW_SQLITE_FALLBACK", False), \
+                 patch.object(conn_mod, "get_pg_pool", return_value=FakePool()):
+                conn_mod._pg_unreachable = False
+                with self.assertRaises(ValueError):
+                    with conn_mod.get_connection() as conn:
+                        conn.execute("INSERT ...")
+                # The database is healthy: it must not be marked unreachable.
+                self.assertFalse(conn_mod._pg_unreachable)
+        finally:
+            conn_mod._pg_unreachable = prev_unreachable
+
+    def test_data_errors_do_not_trigger_sqlite_fallback(self):
+        """With fallback enabled, a data error must not replay into SQLite."""
+        from contextlib import contextmanager
+        from unittest.mock import patch
+
+        import core_bot.database.connection as conn_mod
+
+        class DataErrorConn:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def execute(self, *args, **kwargs):
+                raise ValueError("unique violation")
+
+            def commit(self):
+                pass
+
+            def rollback(self):
+                pass
+
+            def close(self):
+                pass
+
+        @contextmanager
+        def fake_pool_cm():
+            yield DataErrorConn()
+
+        class FakePool:
+            def connection(self, timeout=None):
+                return fake_pool_cm()
+
+        prev_unreachable = conn_mod._pg_unreachable
+        try:
+            with patch.object(conn_mod, "IS_POSTGRES", True), \
+                 patch.object(conn_mod, "ALLOW_SQLITE_FALLBACK", True), \
+                 patch.object(conn_mod, "get_pg_pool", return_value=FakePool()), \
+                 patch.object(conn_mod, "_get_sqlite_connection") as sqlite_spy:
+                conn_mod._pg_unreachable = False
+                with self.assertRaises(ValueError):
+                    with conn_mod.get_connection() as conn:
+                        conn.execute("INSERT ...")
+                sqlite_spy.assert_not_called()
+                self.assertFalse(conn_mod._pg_unreachable)
+        finally:
+            conn_mod._pg_unreachable = prev_unreachable
+
+    def test_real_connection_failure_still_fails_closed(self):
+        """An actual outage must still be detected and reported."""
+        from unittest.mock import patch
+
+        import core_bot.database.connection as conn_mod
+
+        prev_unreachable = conn_mod._pg_unreachable
+        prev_check = conn_mod._last_pg_check
+        try:
+            with patch.object(conn_mod, "IS_POSTGRES", True), \
+                 patch.object(conn_mod, "ALLOW_SQLITE_FALLBACK", False), \
+                 patch.object(conn_mod, "get_pg_pool", return_value=None), \
+                 patch("psycopg.connect", side_effect=ConnectionError("connection refused")):
+                conn_mod._pg_unreachable = False
+                with self.assertRaises(RuntimeError) as ctx:
+                    with conn_mod.get_connection():
+                        pass
+                self.assertIn("SQLite fallback disabled", str(ctx.exception))
+                self.assertTrue(conn_mod._pg_unreachable)
+        finally:
+            conn_mod._pg_unreachable = prev_unreachable
+            conn_mod._last_pg_check = prev_check
+
     def test_concurrent_bookings_of_same_slot_leave_one_row(self):
         """Two overlapping bookings for one slot must not both be stored."""
         from services.appointments import (

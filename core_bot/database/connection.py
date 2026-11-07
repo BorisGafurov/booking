@@ -153,6 +153,35 @@ def _get_sqlite_connection() -> Generator[DBConnection, None, None]:
         conn.close()
 
 
+def _is_connection_error(exc: BaseException) -> bool:
+    """True only for errors that mean "the database is unreachable".
+
+    Everything raised inside the caller's ``with get_connection()`` body
+    (integrity errors, bad SQL, application exceptions) must propagate
+    unchanged instead of being reported as a database outage — otherwise a
+    duplicate-key conflict looks like "PostgreSQL is down" and, with
+    ``ALLOW_SQLITE_FALLBACK`` enabled, the same statement is retried against a
+    different database.
+    """
+    if psycopg is not None:
+        operational = getattr(psycopg, "OperationalError", None)
+        interface = getattr(psycopg, "InterfaceError", None)
+        if operational and isinstance(exc, operational):
+            return True
+        if interface and isinstance(exc, interface):
+            return True
+        pool_errors = getattr(globals().get("ConnectionPool"), "PoolTimeout", None)
+        if pool_errors and isinstance(exc, pool_errors):
+            return True
+    # psycopg_pool raises its own timeout/closed errors.
+    exc_name = type(exc).__name__
+    if exc_name in ("PoolTimeout", "PoolClosed", "TooManyRequests"):
+        return True
+    if isinstance(exc, (ConnectionError, TimeoutError, OSError)):
+        return True
+    return False
+
+
 @contextmanager
 def get_connection() -> Generator[DBConnection, None, None]:
     global _pg_unreachable, _last_pg_check
@@ -175,11 +204,19 @@ def get_connection() -> Generator[DBConnection, None, None]:
     if IS_POSTGRES and not _pg_unreachable:
         pool = get_pg_pool()
         if pool is not None:
+            acquired = False
             try:
                 with pool.connection(timeout=5.0) as conn:
+                    acquired = True
                     yield DBConnection(conn, is_pg=True)
                     return
             except Exception as pe:
+                # An error raised while acquiring the connection is always an
+                # outage. An error from the caller's body is an outage only if
+                # it is a connection-level failure; everything else (integrity
+                # errors, bad SQL) must propagate unchanged.
+                if acquired and not _is_connection_error(pe):
+                    raise
                 _pg_unreachable = True
                 _last_pg_check = now
                 if not ALLOW_SQLITE_FALLBACK:
@@ -187,12 +224,14 @@ def get_connection() -> Generator[DBConnection, None, None]:
                     raise RuntimeError(f"Database connection error: PostgreSQL unavailable and SQLite fallback disabled: {pe}") from pe
                 logger.warning("PostgreSQL pool connection failed: %s; falling back to SQLite", pe)
         else:
+            acquired = False
             try:
                 conn = psycopg.connect(
                     DATABASE_URL,
                     row_factory=dict_row,
                     connect_timeout=5,
                 )
+                acquired = True
                 try:
                     with conn:
                         yield DBConnection(conn, is_pg=True)
@@ -200,6 +239,8 @@ def get_connection() -> Generator[DBConnection, None, None]:
                 finally:
                     conn.close()
             except Exception as pe:
+                if acquired and not _is_connection_error(pe):
+                    raise
                 _pg_unreachable = True
                 _last_pg_check = now
                 if not ALLOW_SQLITE_FALLBACK:
